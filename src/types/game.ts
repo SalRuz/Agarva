@@ -1,0 +1,84 @@
+export interface Position {
+  x: number;
+  y: number;
+}
+
+export interface Cell {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  visualRadius: number;
+  targetRadius: number;
+  color: string;
+  velocityX: number;
+  velocityY: number;
+  splitDirX: number;
+  splitDirY: number;
+  splitMaxSpeed: number;
+}
+
+export interface Player {
+  id: string;
+  name: string;
+  cells: Cell[];
+  color: string;
+  score: number;
+  isBot: boolean;
+  targetX: number;
+  targetY: number;
+  lastSplit: number;
+  lastEject: number;
+}
+
+export interface Food {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  color: string;
+}
+
+export interface Virus {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  charge: number;
+  velocityX: number;
+  velocityY: number;
+  splitDirX: number;
+  splitDirY: number;
+  splitMaxSpeed: number;
+}
+
+export interface EjectedMass {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  color: string;
+  velocityX: number;
+  velocityY: number;
+  dirX: number; // начальное направление выстрела
+  dirY: number;
+  ownerId: string;
+  createdAt: number;
+}
+
+export interface GameState {
+  players: Player[];
+  food: Food[];
+  viruses: Virus[];
+  ejectedMass: EjectedMass[];
+  worldWidth: number;
+  worldHeight: number;
+}
+
+export interface BotBehavior {
+  aggressiveness: number;
+  caution: number;
+  foodPriority: number;
+  splitThreshold: number;
+  virusAwareness: number;
+}
