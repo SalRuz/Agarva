@@ -1,26 +1,33 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "agarwa",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "server": "tsx server/index.ts",
+    "start": "tsx server/index.ts",
+    "start:prod": "NODE_ENV=production tsx server/index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "clsx": "2.1.1",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "tailwind-merge": "3.4.0"
+    "tailwind-merge": "3.4.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "^22.0.0",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "5.1.1",
     "tailwindcss": "4.1.17",
+    "tsx": "^4.20.3",
     "typescript": "5.9.3",
     "vite": "7.2.4",
     "vite-plugin-singlefile": "2.3.0"

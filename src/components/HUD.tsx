@@ -3,12 +3,14 @@ import { getTotalMass } from '../utils/gameUtils';
 
 interface HUDProps {
   player?: Player;
+  fps?: number | null;
+  pingMs?: number | null;
   onRespawn: () => void;
   onSpectate?: () => void;
   onBackToMenu?: () => void;
 }
 
-export function HUD({ player, onRespawn, onSpectate, onBackToMenu }: HUDProps) {
+export function HUD({ player, fps, pingMs, onRespawn, onSpectate, onBackToMenu }: HUDProps) {
   const isDead = player && player.cells.length === 0;
   const mass = player ? getTotalMass(player) : 0;
 
@@ -21,6 +23,10 @@ export function HUD({ player, onRespawn, onSpectate, onBackToMenu }: HUDProps) {
           </div>
           <div className="text-gray-400 text-sm">
             Клетки: {player.cells.length}
+          </div>
+          <div className="text-gray-400 text-xs mt-1 flex gap-3">
+            <span>FPS: <span className="text-sky-300">{fps ?? '--'}</span></span>
+            <span>Ping: <span className="text-amber-300">{pingMs ?? '--'}</span> ms</span>
           </div>
         </div>
       )}

@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+*.md
+.env
+.env.*
+!.env.example
+skins
+src
+index.html
+vite.config.ts
+deploy
+ecosystem.config.cjs
+scripts

@@ -1,0 +1,477 @@
+import type { GameState, Player, Cell, Food, Virus, EjectedMass } from '../../shared/types';
+import type {
+  ClientMessage,
+  ServerMessage,
+  StateMessage,
+  NetPlayer,
+  ChatBroadcastMessage,
+  LeaderboardEntry,
+} from '../../shared/protocol';
+import { getFoodRadius, WORLD_WIDTH, WORLD_HEIGHT } from '../../shared/physics';
+import { ADMIN_TOKEN, DEFAULT_WS_URL, WS_PATH } from '../../shared/constants';
+import type { GameplayConfig } from '../../shared/gameConfig';
+import { defaultGameplayConfig, sanitizeGameplayConfig } from '../../shared/gameConfig';
+
+export type MultiplayerStatus = 'connecting' | 'connected' | 'disconnected' | 'error' | 'died';
+
+export interface MultiplayerCallbacks {
+  onWelcome?: (id: string, world: { w: number; h: number }, isAdmin?: boolean) => void;
+  onState?: (state: GameState, you: Player | undefined, leaderboard: StateMessage['leaderboard']) => void;
+  onDied?: () => void;
+  onError?: (message: string) => void;
+  onStatus?: (status: MultiplayerStatus) => void;
+  onWorld?: (w: number, h: number) => void;
+  onAdminStatus?: (ok: boolean) => void;
+  onChat?: (msg: ChatBroadcastMessage) => void;
+  onSettings?: (settings: GameplayConfig) => void;
+}
+
+interface Snap {
+  localT: number;
+  state: GameState;
+  you: Player | undefined;
+  leaderboard: LeaderboardEntry[];
+}
+
+function netPlayerToPlayer(np: NetPlayer): Player {
+  const cells: Cell[] = np.cells.map((c) => ({
+    id: c.id,
+    x: c.x,
+    y: c.y,
+    radius: c.r,
+    visualRadius: c.r,
+    targetRadius: c.r,
+    color: c.c,
+    velocityX: 0,
+    velocityY: 0,
+    splitDirX: 0,
+    splitDirY: 0,
+    splitMaxSpeed: 0,
+  }));
+
+  return {
+    id: np.id,
+    name: np.name,
+    cells,
+    color: np.color,
+    score: np.score,
+    isBot: false,
+    targetX: cells[0]?.x ?? 0,
+    targetY: cells[0]?.y ?? 0,
+    lastSplit: 0,
+    lastEject: 0,
+  };
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function lerpPlayers(from: GameState, to: GameState, t: number): Player[] {
+  return to.players.map((tp) => {
+    const fp = from.players.find((p) => p.id === tp.id);
+    const cells = tp.cells.map((tc) => {
+      const fc = fp?.cells.find((c) => c.id === tc.id);
+      const x = fc ? lerp(fc.x, tc.x, t) : tc.x;
+      const y = fc ? lerp(fc.y, tc.y, t) : tc.y;
+      const radius = fc ? lerp(fc.radius, tc.radius, t) : tc.radius;
+      const visualRadius = fc?.visualRadius ?? radius;
+      return {
+        ...tc,
+        x,
+        y,
+        radius,
+        targetRadius: tc.radius,
+        visualRadius,
+      };
+    });
+    return {
+      ...tp,
+      cells,
+      targetX: cells[0]?.x ?? tp.targetX,
+      targetY: cells[0]?.y ?? tp.targetY,
+    };
+  });
+}
+
+function lerpById<T extends { id: string; x: number; y: number }>(
+  fromList: T[],
+  toList: T[],
+  t: number,
+  merge: (f: T | undefined, cur: T, x: number, y: number) => T
+): T[] {
+  const fromMap = new Map(fromList.map((e) => [e.id, e]));
+  return toList.map((cur) => {
+    const prev = fromMap.get(cur.id);
+    if (!prev) return merge(undefined, cur, cur.x, cur.y);
+    return merge(prev, cur, lerp(prev.x, cur.x, t), lerp(prev.y, cur.y, t));
+  });
+}
+
+function interpolateStates(from: Snap, to: Snap, t: number): { state: GameState; you: Player | undefined } {
+  const players = lerpPlayers(from.state, to.state, t);
+  const food = lerpById(from.state.food, to.state.food, t, (_f, cur, x, y) => ({ ...cur, x, y }));
+  const viruses = lerpById(from.state.viruses, to.state.viruses, t, (f, cur, x, y) => ({
+    ...cur,
+    x,
+    y,
+    radius: f ? lerp(f.radius, cur.radius, t) : cur.radius,
+  }));
+  const ejectedMass = lerpById(from.state.ejectedMass, to.state.ejectedMass, t, (f, cur, x, y) => ({
+    ...cur,
+    x,
+    y,
+    radius: f ? lerp(f.radius, cur.radius, t) : cur.radius,
+  }));
+
+  const state: GameState = {
+    players,
+    food,
+    viruses,
+    ejectedMass,
+    worldWidth: to.state.worldWidth,
+    worldHeight: to.state.worldHeight,
+  };
+
+  const youId = to.you?.id;
+  const you = youId ? players.find((p) => p.id === youId) : undefined;
+  return { state, you };
+}
+
+/** Same-origin WS URL for nginx/Vite proxy at `/ws` (WSS when page is HTTPS). */
+export function sameOriginWsUrl(path: string = WS_PATH): string {
+  if (typeof window === 'undefined' || !window.location?.host) {
+    return DEFAULT_WS_URL;
+  }
+  const { protocol, host } = window.location;
+  if (protocol === 'file:') return DEFAULT_WS_URL;
+  const wsProto = protocol === 'https:' ? 'wss:' : 'ws:';
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return `${wsProto}//${host}${normalized}`;
+}
+
+/**
+ * Resolve multiplayer WS URL:
+ * 1) explicit override
+ * 2) localStorage.agarServerUrl
+ * 3) build-time VITE_WS_URL
+ * 4) production / non-localhost page → same-origin `/ws`
+ * 5) DEFAULT_WS_URL (local Node on :3001)
+ */
+export function resolveServerUrl(override?: string): string {
+  if (override?.trim()) return override.trim();
+  try {
+    const stored = localStorage.getItem('agarServerUrl');
+    if (stored?.trim()) return stored.trim();
+  } catch {
+    // ignore
+  }
+
+  const fromEnv = import.meta.env.VITE_WS_URL;
+  if (typeof fromEnv === 'string' && fromEnv.trim()) {
+    return fromEnv.trim();
+  }
+
+  if (typeof window !== 'undefined' && window.location?.host) {
+    const { protocol, hostname } = window.location;
+    const isLocalHost =
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '[::1]';
+    // Production build or any non-local page: use same-origin /ws (nginx / Vite proxy)
+    if (import.meta.env.PROD || (!isLocalHost && protocol !== 'file:')) {
+      return sameOriginWsUrl();
+    }
+  }
+
+  return DEFAULT_WS_URL;
+}
+
+export function resolveAdminToken(): string {
+  try {
+    const stored = localStorage.getItem('agarAdminToken');
+    if (stored?.trim()) return stored.trim();
+  } catch {
+    // ignore
+  }
+  return ADMIN_TOKEN;
+}
+
+export class MultiplayerClient {
+  private ws: WebSocket | null = null;
+  private callbacks: MultiplayerCallbacks;
+  private playerId: string | null = null;
+  private name: string;
+  private snapPrev: Snap | null = null;
+  private snapCurr: Snap | null = null;
+  private worldW = WORLD_WIDTH;
+  private worldH = WORLD_HEIGHT;
+  private isAdmin = false;
+  private lastPingMs: number | null = null;
+  /** Render ~half a tick behind latest snap so we can interpolate smoothly */
+  private interpDelayMs = 35;
+  private config: GameplayConfig = defaultGameplayConfig;
+
+  constructor(name: string, callbacks: MultiplayerCallbacks = {}) {
+    this.name = name;
+    this.callbacks = callbacks;
+  }
+
+  getPlayerId() {
+    return this.playerId;
+  }
+
+  getIsAdmin() {
+    return this.isAdmin;
+  }
+
+  getWorldSize() {
+    return { w: this.worldW, h: this.worldH };
+  }
+
+  getPingMs() {
+    return this.lastPingMs;
+  }
+
+  /**
+   * Smooth state for rendering (call every frame).
+   * Solo-like feel: lerp between the last two server snapshots.
+   */
+  getRenderState(): { state: GameState; you: Player | undefined } | null {
+    if (!this.snapCurr) return null;
+    if (!this.snapPrev) {
+      return { state: this.snapCurr.state, you: this.snapCurr.you };
+    }
+
+    const span = Math.max(1, this.snapCurr.localT - this.snapPrev.localT);
+    const renderT = performance.now() - this.interpDelayMs;
+    let alpha = (renderT - this.snapPrev.localT) / span;
+    if (alpha < 0) alpha = 0;
+    if (alpha > 1) alpha = 1;
+
+    return interpolateStates(this.snapPrev, this.snapCurr, alpha);
+  }
+
+  connect(url: string) {
+    this.callbacks.onStatus?.('connecting');
+    this.ws = new WebSocket(url);
+
+    this.ws.onopen = () => {
+      this.callbacks.onStatus?.('connected');
+      this.send({ type: 'adminAuth', token: resolveAdminToken() });
+      this.send({ type: 'join', name: this.name });
+    };
+
+    this.ws.onmessage = (ev) => {
+      let msg: ServerMessage;
+      try {
+        msg = JSON.parse(String(ev.data)) as ServerMessage;
+      } catch {
+        return;
+      }
+      this.handleMessage(msg);
+    };
+
+    this.ws.onclose = () => {
+      this.callbacks.onStatus?.('disconnected');
+    };
+
+    this.ws.onerror = () => {
+      this.callbacks.onError?.('Ошибка WebSocket соединения');
+      this.callbacks.onStatus?.('error');
+    };
+  }
+
+  private buildStateFromMsg(msg: StateMessage): { state: GameState; you: Player | undefined } {
+    const foodR = getFoodRadius(this.config);
+    const food: Food[] = msg.food.map((f) => ({
+      id: f.id,
+      x: f.x,
+      y: f.y,
+      radius: foodR,
+      color: f.c,
+    }));
+    const viruses: Virus[] = msg.viruses.map((v) => ({
+      id: v.id,
+      x: v.x,
+      y: v.y,
+      radius: v.r,
+      charge: v.ch,
+      velocityX: 0,
+      velocityY: 0,
+      splitDirX: 0,
+      splitDirY: 0,
+      splitMaxSpeed: 0,
+    }));
+    const ejected: EjectedMass[] = msg.ejected.map((e) => ({
+      id: e.id,
+      x: e.x,
+      y: e.y,
+      radius: e.r,
+      color: e.c,
+      velocityX: 0,
+      velocityY: 0,
+      dirX: 0,
+      dirY: 0,
+      ownerId: '',
+      ownerCellId: '',
+      createdAt: 0,
+    }));
+
+    const you = msg.you ? netPlayerToPlayer(msg.you) : undefined;
+    const others = msg.players.map((p) => netPlayerToPlayer(p));
+    const players = you ? [you, ...others.filter((p) => p.id !== you.id)] : others;
+
+    return {
+      state: {
+        players,
+        food,
+        viruses,
+        ejectedMass: ejected,
+        worldWidth: this.worldW,
+        worldHeight: this.worldH,
+      },
+      you,
+    };
+  }
+
+  private handleMessage(msg: ServerMessage) {
+    switch (msg.type) {
+      case 'welcome':
+        this.playerId = msg.id;
+        this.worldW = msg.world.w;
+        this.worldH = msg.world.h;
+        if (msg.isAdmin !== undefined) this.isAdmin = msg.isAdmin;
+        this.callbacks.onWelcome?.(msg.id, msg.world, msg.isAdmin);
+        break;
+      case 'adminStatus':
+        this.isAdmin = msg.ok;
+        this.callbacks.onAdminStatus?.(msg.ok);
+        break;
+      case 'world':
+        this.worldW = msg.w;
+        this.worldH = msg.h;
+        if (this.snapCurr) {
+          this.snapCurr.state.worldWidth = msg.w;
+          this.snapCurr.state.worldHeight = msg.h;
+        }
+        if (this.snapPrev) {
+          this.snapPrev.state.worldWidth = msg.w;
+          this.snapPrev.state.worldHeight = msg.h;
+        }
+        this.callbacks.onWorld?.(msg.w, msg.h);
+        break;
+      case 'chat':
+        this.callbacks.onChat?.(msg);
+        break;
+      case 'settings':
+        this.config = sanitizeGameplayConfig(msg.settings);
+        this.callbacks.onSettings?.(msg.settings);
+        break;
+      case 'state': {
+        const { state, you } = this.buildStateFromMsg(msg);
+        // Adapt delay to measured tick spacing
+        if (this.snapCurr) {
+          const gap = performance.now() - this.snapCurr.localT;
+          if (gap > 10 && gap < 120) {
+            this.interpDelayMs = Math.min(50, Math.max(20, gap * 0.55));
+          }
+        }
+        this.snapPrev = this.snapCurr;
+        this.snapCurr = {
+          localT: performance.now(),
+          state,
+          you,
+          leaderboard: msg.leaderboard,
+        };
+        this.callbacks.onState?.(state, you, msg.leaderboard);
+        break;
+      }
+      case 'died':
+        this.callbacks.onStatus?.('died');
+        this.callbacks.onDied?.();
+        break;
+      case 'error':
+        this.callbacks.onError?.(msg.message);
+        break;
+      case 'pong':
+        this.lastPingMs = Math.max(0, Date.now() - msg.t);
+        break;
+    }
+  }
+
+  send(msg: ClientMessage) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
+  sendInput(mx: number, my: number) {
+    this.send({ type: 'input', mx, my });
+  }
+
+  split() {
+    this.send({ type: 'split' });
+  }
+
+  eject() {
+    this.send({ type: 'eject' });
+  }
+
+  rename(name: string) {
+    this.name = name;
+    this.send({ type: 'rename', name });
+  }
+
+  sendChat(text: string) {
+    this.send({ type: 'chat', text });
+  }
+
+  adminAddMass(amount?: number) {
+    this.send({ type: 'adminAddMass', amount });
+  }
+
+  adminIdentify(name: string) {
+    this.send({ type: 'adminIdentify', name });
+  }
+
+  adminGetSettings() {
+    this.send({ type: 'adminGetSettings' });
+  }
+
+  adminUpdateSettings(settings: GameplayConfig) {
+    this.send({ type: 'adminUpdateSettings', settings });
+  }
+
+  adminSpawnVirus(x: number, y: number) {
+    this.send({ type: 'adminSpawnVirus', x, y });
+  }
+
+  adminTeleport(x: number, y: number) {
+    this.send({ type: 'adminTeleport', x, y });
+  }
+
+  resetStarter() {
+    this.send({ type: 'resetStarter' });
+  }
+
+  respawn(name?: string) {
+    if (name) this.name = name;
+    this.send({ type: 'join', name: this.name });
+  }
+
+  ping() {
+    this.send({ type: 'ping', t: Date.now() });
+  }
+
+  disconnect() {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.snapPrev = null;
+    this.snapCurr = null;
+    this.playerId = null;
+    this.isAdmin = false;
+  }
+}

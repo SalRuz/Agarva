@@ -14,6 +14,20 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),
+      "@shared": path.resolve(__dirname, "shared"),
+    },
+  },
+  server: {
+    port: 5173,
+    host: true,
+    // Optional: same-origin /ws during `npm run dev` (set localStorage or use VITE_WS_URL otherwise)
+    proxy: {
+      "/ws": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+        ws: true,
+        rewrite: (p) => p.replace(/^\/ws/, "") || "/",
+      },
     },
   },
 });

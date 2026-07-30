@@ -1,0 +1,30 @@
+# Optional: run WS server in Docker; nginx on host (or add web service below)
+services:
+  game-server:
+    build: .
+    container_name: agarwa-server
+    restart: unless-stopped
+    ports:
+      # Prefer binding only to localhost when nginx is on the same host
+      - "127.0.0.1:3001:3001"
+    environment:
+      PORT: "3001"
+      NODE_ENV: production
+    # Uncomment to expose publicly without nginx (not recommended):
+    # ports:
+    #   - "3001:3001"
+
+  # Optional full stack: build client first (`npm run build`), then:
+  # docker compose --profile full up -d
+  web:
+    profiles: ["full"]
+    image: nginx:1.27-alpine
+    container_name: agarwa-web
+    restart: unless-stopped
+    depends_on:
+      - game-server
+    ports:
+      - "80:80"
+    volumes:
+      - ./dist:/usr/share/nginx/html:ro
+      - ./deploy/nginx.docker.conf:/etc/nginx/conf.d/default.conf:ro
