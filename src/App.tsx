@@ -3,15 +3,15 @@ import { GameEngine } from './engine/GameEngine';
 import { GameCanvas } from './components/GameCanvas';
 import { Leaderboard } from './components/Leaderboard';
 import { Minimap } from './components/Minimap';
-import { StartScreen } from './components/StartScreen';
-import { PauseMenu } from './components/PauseMenu';
+import { StartScreen, useRoomStats } from './components/StartScreen';
 import { HUD } from './components/HUD';
 import { ChatPanel, type ChatLine } from './components/ChatPanel';
 import { AdminSettingsPanel } from './components/AdminSettingsPanel';
+import { PlayerSettingsPanel } from './components/PlayerSettingsPanel';
 import { SkinPicker } from './components/SkinPicker';
 import { GameState, Player } from './types/game';
 import { MultiplayerClient, resolveServerUrl } from './net/MultiplayerClient';
-import { BOT_COUNT_SOLO, HUD_HZ } from '../shared/constants';
+import { HUD_HZ } from '../shared/constants';
 import { cloneGameplayConfig, defaultGameplayConfig, sanitizeGameplayConfig, type GameplayConfig } from '../shared/gameConfig';
 import { isAdminName } from '../shared/physics';
 import { requestRemoteAdminSettings } from './net/adminSettings';
@@ -21,6 +21,12 @@ import {
   saveSelectedSkinId,
   type SkinInfo,
 } from './skins/loadSkins';
+import {
+  hudSizeScale,
+  loadPlayerPrefs,
+  savePlayerPrefs,
+  type PlayerPrefs,
+} from './settings/playerPrefs';
 
 type GameMode = 'menu' | 'playing' | 'dead' | 'spectating';
 type SessionKind = 'solo' | 'multiplayer';
@@ -32,8 +38,7 @@ export function App() {
   const [hudState, setHudState] = useState<GameState | null>(null);
   const [currentPlayer, setCurrentPlayer] = useState<Player | undefined>();
   const [leaderboard, setLeaderboard] = useState<{ name: string; score: number; isBot: boolean }[]>([]);
-  const [isWPressed, setIsWPressed] = useState(false);
-  const [showPauseMenu, setShowPauseMenu] = useState(false);
+  const [showEscapeMenu, setShowEscapeMenu] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [ready, setReady] = useState(false);
@@ -47,13 +52,17 @@ export function App() {
   const [gameConfig, setGameConfig] = useState<GameplayConfig>(() => cloneGameplayConfig(defaultGameplayConfig));
   const [draftConfig, setDraftConfig] = useState<GameplayConfig>(() => cloneGameplayConfig(defaultGameplayConfig));
   const [showAdminSettings, setShowAdminSettings] = useState(false);
+  const [showPlayerSettings, setShowPlayerSettings] = useState(false);
+  const [playerPrefs, setPlayerPrefs] = useState<PlayerPrefs>(() => loadPlayerPrefs());
   const [adminSettingsError, setAdminSettingsError] = useState<string | null>(null);
   const [adminSettingsSaving, setAdminSettingsSaving] = useState(false);
-  const [adminSettingsSource, setAdminSettingsSource] = useState<'solo' | 'multiplayer'>('solo');
   const [adminSaveNotice, setAdminSaveNotice] = useState<string | null>(null);
   const [showSkinPicker, setShowSkinPicker] = useState(false);
   const [selectedSkinId, setSelectedSkinId] = useState<string | null>(() => loadSelectedSkinId());
   const selectedSkinUrl = resolveSkinUrl(selectedSkinId);
+  const [menuName, setMenuName] = useState('');
+  const [menuPassword, setMenuPassword] = useState('');
+  const [frozen, setFrozen] = useState(false);
 
   const engineRef = useRef<GameEngine | null>(null);
   const playerIdRef = useRef<string | null>(null);
@@ -63,7 +72,7 @@ export function App() {
   const gameStateRef = useRef<GameState | null>(null);
   const currentPlayerRef = useRef<Player | undefined>(undefined);
   const modeRef = useRef<GameMode>('menu');
-  const showPauseMenuRef = useRef(false);
+  const showEscapeMenuRef = useRef(false);
   const playerNameRef = useRef('Player');
   const chatOpenRef = useRef(false);
   const isAdminRef = useRef(false);
@@ -76,14 +85,17 @@ export function App() {
     (() => { state: GameState; you: Player | undefined } | null) | null
   >(null);
   const adminSettingsNameRef = useRef('salruz');
+  const adminPasswordRef = useRef<string | undefined>(undefined);
+  const peakMassRef = useRef(0);
+  const frozenRef = useRef(false);
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
 
   useEffect(() => {
-    showPauseMenuRef.current = showPauseMenu;
-  }, [showPauseMenu]);
+    showEscapeMenuRef.current = showEscapeMenu;
+  }, [showEscapeMenu]);
 
   useEffect(() => {
     chatOpenRef.current = chatOpen;
@@ -93,10 +105,14 @@ export function App() {
     isAdminRef.current = isAdmin;
   }, [isAdmin]);
 
-  const startSoloEngine = useCallback(() => {
+  useEffect(() => {
+    frozenRef.current = frozen;
+  }, [frozen]);
+
+  const startMenuEngine = useCallback(() => {
     const engine = new GameEngine({
-      botCount: gameConfig.botCountSolo || BOT_COUNT_SOLO,
-      foodCount: gameConfig.foodCountSolo,
+      botCount: gameConfig.botCountMp,
+      foodCount: gameConfig.foodCountMp,
       virusCount: gameConfig.virusCount,
       worldWidth: gameConfig.worldWidth,
       worldHeight: gameConfig.worldHeight,
@@ -114,7 +130,7 @@ export function App() {
   }, [gameConfig]);
 
   useEffect(() => {
-    startSoloEngine();
+    startMenuEngine();
     return () => {
       mpRef.current?.disconnect();
       engineRef.current = null;
@@ -136,6 +152,7 @@ export function App() {
           : currentPlayerRef.current;
         currentPlayerRef.current = player;
         setCurrentPlayer(player);
+        if (player) setFrozen(!!player.frozen);
 
         if (player && player.cells.length > 0) {
           let sx = 0;
@@ -154,9 +171,10 @@ export function App() {
           if (lastAliveCenterRef.current) {
             spectateTargetRef.current = { ...lastAliveCenterRef.current };
           }
-          setLastScore(player.score);
+          setLastScore(Math.floor(peakMassRef.current));
           setMode('dead');
-          setShowPauseMenu(false);
+          setShowEscapeMenu(false);
+          setFrozen(false);
         }
         setPingMs(null);
       } else {
@@ -165,6 +183,7 @@ export function App() {
         setHudState(state);
         const player = currentPlayerRef.current;
         setCurrentPlayer(player);
+        if (player) setFrozen(!!player.frozen);
         setPingMs(mpRef.current?.getPingMs() ?? null);
       }
     }, 1000 / HUD_HZ);
@@ -182,38 +201,25 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (chatOpenRef.current) return;
-      if (e.code === 'KeyW' && mode === 'playing' && !showPauseMenu) {
-        e.preventDefault();
-        setIsWPressed(true);
-      }
-    };
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.code === 'KeyW') {
-        setIsWPressed(false);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, [mode, showPauseMenu]);
-
-  useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
       if (e.code !== 'Escape') return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       if (chatOpenRef.current) {
         e.preventDefault();
         setChatOpen(false);
         setChatFocused(false);
         return;
       }
+      if (showAdminSettings || showSkinPicker || showPlayerSettings) return;
       if (modeRef.current === 'playing') {
         e.preventDefault();
-        setShowPauseMenu((prev) => !prev);
+        setShowEscapeMenu((prev) => {
+          if (!prev) {
+            setMenuName(playerNameRef.current || menuName);
+          }
+          return !prev;
+        });
         return;
       }
       if (modeRef.current === 'spectating') {
@@ -233,13 +239,14 @@ export function App() {
         if (spectateReturnModeRef.current === 'dead') {
           setMode('dead');
         } else {
-          setMode('menu');
+          // Leave MP spectate back to menu
+          handleBackToMenuRef.current();
         }
       }
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, []);
+  }, [showAdminSettings, showSkinPicker, showPlayerSettings, menuName]);
 
   // Enter toggles chat in multiplayer (playing, dead, or spectating)
   useEffect(() => {
@@ -248,8 +255,7 @@ export function App() {
       if (sessionKindRef.current !== 'multiplayer') return;
       const m = modeRef.current;
       if (m !== 'playing' && m !== 'dead' && m !== 'spectating') return;
-      if (showPauseMenuRef.current) return;
-      // If chat input is focused, form submit handles send — ignore here
+      if (showEscapeMenuRef.current) return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
@@ -268,82 +274,58 @@ export function App() {
     setChatOpen(false);
     setIsAdmin(false);
     setPingMs(null);
+    setFrozen(false);
     isAdminRef.current = false;
   }, []);
 
-  const handleStartSolo = useCallback((name: string) => {
-    disconnectMultiplayer();
-    setConnectionError(null);
-    setIsConnecting(false);
-    setSessionKind('solo');
-    sessionKindRef.current = 'solo';
-    playerNameRef.current = name;
-
-    startSoloEngine();
-    const player = engineRef.current!.addPlayer(name);
-    playerIdRef.current = player.id;
-    currentPlayerRef.current = player;
-    gameStateRef.current = engineRef.current!.getState();
-    setCurrentPlayer(player);
-    setHudState(engineRef.current!.getState());
-    const admin = isAdminName(name);
-    setIsAdmin(admin);
-    isAdminRef.current = admin;
-    setMode('playing');
-    setShowPauseMenu(false);
-  }, [disconnectMultiplayer, startSoloEngine]);
-
-  const handleStartMultiplayer = useCallback((name: string, serverUrl: string) => {
-    setConnectionError(null);
-    setIsConnecting(true);
-    engineRef.current = null;
-    disconnectMultiplayer();
-
-    setSessionKind('multiplayer');
-    sessionKindRef.current = 'multiplayer';
-    serverUrlRef.current = serverUrl || resolveServerUrl();
-    playerNameRef.current = name;
-    setIsAdmin(false);
-    isAdminRef.current = false;
-    setChatMessages([]);
-
-    const client = new MultiplayerClient(name, {
-      onWelcome: (id, _world, adminFlag) => {
-        playerIdRef.current = id;
+  const attachMpCallbacks = useCallback(
+    (opts?: { spectate?: boolean }) => ({
+      onWelcome: (id: string, _world: { w: number; h: number }, adminFlag?: boolean) => {
+        playerIdRef.current = opts?.spectate ? null : id;
         setIsConnecting(false);
-        setMode('playing');
-        setShowPauseMenu(false);
-        const admin = adminFlag ?? isAdminName(playerNameRef.current);
-        setIsAdmin(admin);
-        isAdminRef.current = admin;
+        if (opts?.spectate) {
+          setMode('spectating');
+          setIsAdmin(false);
+          isAdminRef.current = false;
+        } else {
+          setMode('playing');
+          const admin = adminFlag ?? isAdminName(playerNameRef.current);
+          setIsAdmin(admin);
+          isAdminRef.current = admin;
+        }
+        setShowEscapeMenu(false);
+        setFrozen(false);
       },
-      onAdminStatus: (ok) => {
+      onAdminStatus: (ok: boolean) => {
         setIsAdmin(ok);
         isAdminRef.current = ok;
       },
-      onWorld: (w, h) => {
+      onWorld: (w: number, h: number) => {
         if (gameStateRef.current) {
           gameStateRef.current.worldWidth = w;
           gameStateRef.current.worldHeight = h;
         }
       },
-      onChat: (msg) => {
+      onChat: (msg: ChatLine) => {
         setChatMessages((prev) => [
           ...prev.slice(-79),
           { name: msg.name, text: msg.text, t: msg.t, color: msg.color },
         ]);
       },
-      onSettings: (settings) => {
+      onSettings: (settings: GameplayConfig) => {
         const clean = sanitizeGameplayConfig(settings);
         setGameConfig(clean);
         setDraftConfig(clean);
       },
-      onState: (state, you, lb) => {
+      onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[]) => {
         gameStateRef.current = state;
         if (you) {
           currentPlayerRef.current = you;
           playerNameRef.current = you.name;
-          setLastScore(you.score);
+          setFrozen(!!you.frozen);
+          if (you.score > peakMassRef.current) {
+            peakMassRef.current = you.score;
+          }
           if (you.cells.length > 0) {
             let sx = 0;
             let sy = 0;
@@ -358,6 +340,8 @@ export function App() {
           } else if (modeRef.current === 'playing' && lastAliveCenterRef.current) {
             spectateTargetRef.current = { ...lastAliveCenterRef.current };
           }
+        } else if (modeRef.current !== 'playing') {
+          currentPlayerRef.current = undefined;
         }
         setLeaderboard(lb);
       },
@@ -365,40 +349,100 @@ export function App() {
         if (lastAliveCenterRef.current) {
           spectateTargetRef.current = { ...lastAliveCenterRef.current };
         }
+        setLastScore(Math.floor(peakMassRef.current));
         setMode('dead');
-        setShowPauseMenu(false);
-        // Keep chat usable after death
+        setShowEscapeMenu(false);
+        setFrozen(false);
         currentPlayerRef.current = undefined;
         setCurrentPlayer(undefined);
       },
-      onError: (message) => {
+      onError: (message: string) => {
         setConnectionError(message);
         setIsConnecting(false);
       },
-      onStatus: (status) => {
+      onStatus: (status: string) => {
         if (status === 'error' || status === 'disconnected') {
           setIsConnecting(false);
         }
       },
-    });
+    }),
+    []
+  );
 
+  const handleStartMultiplayer = useCallback((name: string, serverUrl: string, password?: string) => {
+    setConnectionError(null);
+    setIsConnecting(true);
+    engineRef.current = null;
+    disconnectMultiplayer();
+    setShowEscapeMenu(false);
+
+    setSessionKind('multiplayer');
+    sessionKindRef.current = 'multiplayer';
+    serverUrlRef.current = serverUrl || resolveServerUrl();
+    playerNameRef.current = name;
+    setMenuName(name);
+    if (password) setMenuPassword(password);
+    adminPasswordRef.current = password;
+    peakMassRef.current = 0;
+    setLastScore(0);
+    setIsAdmin(false);
+    isAdminRef.current = false;
+    setChatMessages([]);
+    setFrozen(false);
+
+    const client = new MultiplayerClient(name, attachMpCallbacks(), password);
     mpRef.current = client;
     mpRenderRef.current = () => client.getRenderState();
     client.connect(serverUrlRef.current);
-  }, [disconnectMultiplayer]);
+  }, [disconnectMultiplayer, attachMpCallbacks]);
+
+  const handleSpectateClassic = useCallback(() => {
+    setConnectionError(null);
+    setIsConnecting(true);
+    engineRef.current = null;
+    disconnectMultiplayer();
+    setShowEscapeMenu(false);
+    setSessionKind('multiplayer');
+    sessionKindRef.current = 'multiplayer';
+    serverUrlRef.current = resolveServerUrl();
+    spectateReturnModeRef.current = 'menu';
+    spectateReturnPlayerIdRef.current = null;
+    setFrozen(false);
+
+    const ww = gameConfig.worldWidth;
+    const wh = gameConfig.worldHeight;
+    if (!spectateTargetRef.current) {
+      if (lastAliveCenterRef.current) {
+        spectateTargetRef.current = { ...lastAliveCenterRef.current };
+      } else {
+        spectateTargetRef.current = { x: ww / 2, y: wh / 2 };
+      }
+    }
+
+    const client = new MultiplayerClient(
+      playerNameRef.current || menuName || 'Spectator',
+      attachMpCallbacks({ spectate: true })
+    );
+    mpRef.current = client;
+    mpRenderRef.current = () => client.getRenderState();
+    client.connect(serverUrlRef.current, { spectate: true });
+  }, [disconnectMultiplayer, attachMpCallbacks, gameConfig.worldWidth, gameConfig.worldHeight, menuName]);
 
   const handleMouseMove = useCallback((x: number, y: number) => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
     if (sessionKindRef.current === 'multiplayer') {
+      // Always send view center (playing target OR spectate FOV)
       mpRef.current?.sendInput(x, y);
       return;
     }
     if (!engineRef.current || !playerIdRef.current) return;
+    if (frozenRef.current) return;
     engineRef.current.updatePlayerTarget(playerIdRef.current, x, y);
   }, []);
 
   const handleSplit = useCallback(() => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (frozenRef.current) return;
     if (sessionKindRef.current === 'multiplayer') {
       mpRef.current?.split();
       return;
@@ -408,7 +452,8 @@ export function App() {
   }, []);
 
   const handleEject = useCallback(() => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (frozenRef.current) return;
     if (sessionKindRef.current === 'multiplayer') {
       mpRef.current?.eject();
       return;
@@ -417,8 +462,21 @@ export function App() {
     engineRef.current.ejectMass(playerIdRef.current);
   }, []);
 
+  const handleFreeze = useCallback(() => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (modeRef.current !== 'playing') return;
+    if (sessionKindRef.current === 'multiplayer') {
+      mpRef.current?.freeze();
+      setFrozen((prev) => !prev);
+      return;
+    }
+    if (!engineRef.current || !playerIdRef.current) return;
+    const next = engineRef.current.togglePlayerFrozen(playerIdRef.current);
+    setFrozen(next);
+  }, []);
+
   const handleAddMass = useCallback(() => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
     if (!isAdminRef.current) return;
     if (sessionKindRef.current === 'multiplayer') {
       mpRef.current?.adminAddMass(gameConfig.adminMassBoost);
@@ -429,7 +487,7 @@ export function App() {
   }, [gameConfig.adminMassBoost]);
 
   const handleSpawnVirus = useCallback((x: number, y: number) => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
     if (!isAdminRef.current) return;
     if (modeRef.current !== 'playing') return;
     if (sessionKindRef.current === 'multiplayer') {
@@ -440,7 +498,7 @@ export function App() {
   }, []);
 
   const handleMinimapTeleport = useCallback(() => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
     if (!isAdminRef.current) return;
     if (modeRef.current !== 'playing') return;
     const pos = minimapHoverRef.current;
@@ -454,7 +512,8 @@ export function App() {
   }, []);
 
   const handleResetStarter = useCallback(() => {
-    if (showPauseMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (!isAdminRef.current) return;
     if (modeRef.current !== 'playing') return;
     if (sessionKindRef.current === 'multiplayer') {
       mpRef.current?.resetStarter();
@@ -462,6 +521,40 @@ export function App() {
     }
     if (!engineRef.current || !playerIdRef.current) return;
     engineRef.current.resetToStarter(playerIdRef.current);
+  }, []);
+
+  const handleForceMerge = useCallback(() => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (!isAdminRef.current) return;
+    if (modeRef.current !== 'playing') return;
+    if (sessionKindRef.current === 'multiplayer') {
+      mpRef.current?.adminForceMerge();
+      return;
+    }
+    if (!engineRef.current || !playerIdRef.current) return;
+    engineRef.current.forceMergePlayer(playerIdRef.current);
+  }, []);
+
+  const handleKickAt = useCallback((x: number, y: number) => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (!isAdminRef.current) return;
+    if (modeRef.current !== 'playing') return;
+    if (sessionKindRef.current === 'multiplayer') {
+      mpRef.current?.adminKickAt(x, y);
+      return;
+    }
+    engineRef.current?.removePlayerAt(x, y, playerIdRef.current);
+  }, []);
+
+  const handleSpawnBot = useCallback((x: number, y: number) => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (!isAdminRef.current) return;
+    if (modeRef.current !== 'playing') return;
+    if (sessionKindRef.current === 'multiplayer') {
+      mpRef.current?.adminSpawnBot(x, y, 500);
+      return;
+    }
+    engineRef.current?.spawnBotAt(x, y, 500);
   }, []);
 
   const handleUpdateName = useCallback((newName: string) => {
@@ -472,7 +565,7 @@ export function App() {
     setIsAdmin(admin);
     isAdminRef.current = admin;
     if (sessionKindRef.current === 'multiplayer') {
-      mpRef.current?.rename(trimmed);
+      mpRef.current?.rename(trimmed, adminPasswordRef.current);
       if (currentPlayerRef.current) {
         currentPlayerRef.current.name = trimmed;
         setCurrentPlayer({ ...currentPlayerRef.current });
@@ -485,13 +578,15 @@ export function App() {
 
   const handleRespawn = useCallback(() => {
     const name = playerNameRef.current || currentPlayer?.name || 'Player';
+    peakMassRef.current = 0;
+    setFrozen(false);
     if (sessionKind === 'multiplayer') {
       const client = mpRef.current;
       if (client) {
         client.respawn(name);
         setMode('playing');
       } else {
-        handleStartMultiplayer(name, serverUrlRef.current);
+        handleStartMultiplayer(name, serverUrlRef.current, adminPasswordRef.current);
       }
       return;
     }
@@ -530,15 +625,32 @@ export function App() {
             massSum += m;
           }
           spectateTargetRef.current = { x: sx / massSum, y: sy / massSum };
+        } else {
+          const state = gameStateRef.current;
+          spectateTargetRef.current = {
+            x: (state?.worldWidth ?? gameConfig.worldWidth) / 2,
+            y: (state?.worldHeight ?? gameConfig.worldHeight) / 2,
+          };
         }
       }
+    }
+    // Seed camera immediately for mouse follow
+    if (spectateTargetRef.current) {
+      // no-op: GameCanvas reads spectateTargetRef
     }
     playerIdRef.current = null;
     currentPlayerRef.current = undefined;
     setCurrentPlayer(undefined);
     setMode('spectating');
-    setShowPauseMenu(false);
-  }, []);
+    setShowEscapeMenu(false);
+    setFrozen(false);
+
+    // If already on MP after death, keep connection and ensure view inputs flow
+    if (sessionKindRef.current === 'multiplayer' && mpRef.current) {
+      const st = spectateTargetRef.current;
+      if (st) mpRef.current.sendInput(st.x, st.y);
+    }
+  }, [gameConfig.worldWidth, gameConfig.worldHeight]);
 
   const handleSpectatePick = useCallback((xOrPos: number | { x: number; y: number }, y?: number) => {
     const pos =
@@ -553,14 +665,19 @@ export function App() {
       y: Math.max(0, Math.min(worldH, pos.y)),
     };
     if (modeRef.current === 'menu' || modeRef.current === 'dead') {
-      handleSpectate();
+      if (modeRef.current === 'menu') {
+        handleSpectateClassic();
+      } else {
+        handleSpectate();
+      }
     }
-  }, [handleSpectate, gameConfig.worldWidth, gameConfig.worldHeight]);
+  }, [handleSpectate, handleSpectateClassic, gameConfig.worldWidth, gameConfig.worldHeight]);
 
   const handleBackToMenu = useCallback(() => {
+    const keptName = playerNameRef.current || menuName;
     if (sessionKindRef.current === 'multiplayer') {
       disconnectMultiplayer();
-      startSoloEngine();
+      startMenuEngine();
     } else if (playerIdRef.current && engineRef.current) {
       const state = engineRef.current.getState();
       const playerIndex = state.players.findIndex((p) => p.id === playerIdRef.current);
@@ -572,45 +689,52 @@ export function App() {
     currentPlayerRef.current = undefined;
     setCurrentPlayer(undefined);
     setMode('menu');
-    setShowPauseMenu(false);
+    setShowEscapeMenu(false);
     setConnectionError(null);
     setIsConnecting(false);
     setSessionKind('solo');
     sessionKindRef.current = 'solo';
+    setMenuName(keptName);
+    playerNameRef.current = keptName;
+    peakMassRef.current = 0;
     setChatOpen(false);
-  }, [disconnectMultiplayer, startSoloEngine]);
+    setFrozen(false);
+    spectateTargetRef.current = null;
+  }, [disconnectMultiplayer, startMenuEngine, menuName]);
+
+  const handleBackToMenuRef = useRef(handleBackToMenu);
+  handleBackToMenuRef.current = handleBackToMenu;
 
   const handleResume = useCallback(() => {
-    setShowPauseMenu(false);
-  }, []);
+    const trimmed = menuName.trim().slice(0, 15);
+    if (trimmed) {
+      handleUpdateName(trimmed);
+    }
+    setShowEscapeMenu(false);
+  }, [menuName, handleUpdateName]);
 
   const handleSendChat = useCallback((text: string) => {
     mpRef.current?.sendChat(text);
   }, []);
 
-  const handleOpenAdminSettings = useCallback(async ({ name, mode }: { name: string; mode: 'solo' | 'multiplayer' }) => {
+  const handleOpenAdminSettings = useCallback(async ({ name, password }: { name: string; password: string }) => {
     adminSettingsNameRef.current = name;
+    adminPasswordRef.current = password;
     setAdminSettingsError(null);
     setAdminSaveNotice(null);
-    setAdminSettingsSource(mode);
-    if (mode === 'multiplayer') {
-      setAdminSettingsSaving(true);
-      try {
-        const settings = await requestRemoteAdminSettings(resolveServerUrl(), name, 'get');
-        const clean = sanitizeGameplayConfig(settings);
-        setGameConfig(clean);
-        setDraftConfig(clean);
-      } catch (error) {
-        setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось загрузить настройки сервера');
-      } finally {
-        setAdminSettingsSaving(false);
-      }
-    } else {
-      const local = engineRef.current?.getConfig() ?? gameConfig;
-      setDraftConfig(sanitizeGameplayConfig(local));
+    setAdminSettingsSaving(true);
+    try {
+      const settings = await requestRemoteAdminSettings(resolveServerUrl(), name, 'get', undefined, password);
+      const clean = sanitizeGameplayConfig(settings);
+      setGameConfig(clean);
+      setDraftConfig(clean);
+    } catch (error) {
+      setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось загрузить настройки сервера');
+    } finally {
+      setAdminSettingsSaving(false);
     }
     setShowAdminSettings(true);
-  }, [gameConfig]);
+  }, []);
 
   const handleDraftConfigChange = useCallback((key: keyof GameplayConfig, value: number) => {
     setDraftConfig((prev) => ({ ...prev, [key]: value }));
@@ -643,28 +767,23 @@ export function App() {
     setAdminSettingsError(null);
     setAdminSaveNotice(null);
     try {
-      if (adminSettingsSource === 'multiplayer') {
-        const settings = await requestRemoteAdminSettings(resolveServerUrl(), adminSettingsNameRef.current, 'update', clean);
-        const synced = sanitizeGameplayConfig(settings);
-        setGameConfig(synced);
-        setDraftConfig(synced);
-      } else {
-        engineRef.current?.setConfig(clean);
-        setGameConfig(clean);
-        setDraftConfig(clean);
-        const state = engineRef.current?.getState();
-        if (state) {
-          gameStateRef.current = state;
-          setHudState(state);
-        }
-      }
+      const settings = await requestRemoteAdminSettings(
+        resolveServerUrl(),
+        adminSettingsNameRef.current,
+        'update',
+        clean,
+        adminPasswordRef.current
+      );
+      const synced = sanitizeGameplayConfig(settings);
+      setGameConfig(synced);
+      setDraftConfig(synced);
       setAdminSaveNotice('Сохранено. Панель остаётся открытой — можно править дальше.');
     } catch (error) {
       setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось сохранить настройки');
     } finally {
       setAdminSettingsSaving(false);
     }
-  }, [adminSettingsSource, draftConfig]);
+  }, [draftConfig]);
 
   const handleSelectSkin = useCallback((skin: SkinInfo | null) => {
     const id = skin?.id ?? null;
@@ -672,6 +791,17 @@ export function App() {
     saveSelectedSkinId(id);
     setShowSkinPicker(false);
   }, []);
+
+  const handlePlayerPrefsChange = useCallback((next: PlayerPrefs) => {
+    setPlayerPrefs(next);
+    savePlayerPrefs(next);
+  }, []);
+
+  const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
+  const roomStats = useRoomStats(showMenuOverlay);
+  const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
+  const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
+  const hudScale = hudSizeScale(playerPrefs.hudSize);
 
   if (!ready || !hudState) {
     return (
@@ -708,38 +838,69 @@ export function App() {
         mpRenderRef={mpRenderRef}
         spectateTargetRef={spectateTargetRef}
         isSpectating={mode === 'spectating'}
-        isPaused={showPauseMenu}
-        inputBlocked={chatFocused || chatOpen || showAdminSettings || showSkinPicker}
+        isPaused={showEscapeMenu}
+        inputBlocked={
+          chatFocused ||
+          chatOpen ||
+          showAdminSettings ||
+          showSkinPicker ||
+          showPlayerSettings ||
+          showEscapeMenu ||
+          mode === 'menu'
+        }
         onMouseMove={handleMouseMove}
         onSplit={handleSplit}
         onEject={handleEject}
+        onFreeze={handleFreeze}
         onAddMass={handleAddMass}
         onSpawnVirus={handleSpawnVirus}
         onMinimapTeleport={handleMinimapTeleport}
         onResetStarter={handleResetStarter}
+        onForceMerge={handleForceMerge}
+        onKickAt={handleKickAt}
+        onSpawnBot={handleSpawnBot}
+        adminKeysEnabled={adminKeysEnabled}
+        gameplayKeysEnabled={gameplayKeysEnabled}
         onSpectateMove={mode === 'spectating' ? handleSpectatePick : undefined}
         onPerfSample={setFps}
-        isWPressed={isWPressed}
         config={gameConfig}
         skinUrl={selectedSkinUrl}
+        prefs={playerPrefs}
+        frozen={frozen && mode === 'playing'}
       />
 
-      {mode === 'menu' && (
+      {showMenuOverlay && (
         <StartScreen
-          onStartSolo={handleStartSolo}
-          onStartMultiplayer={handleStartMultiplayer}
-          onSpectate={handleSpectate}
+          name={menuName}
+          onNameChange={setMenuName}
+          password={menuPassword}
+          onPasswordChange={setMenuPassword}
+          onStart={handleStartMultiplayer}
+          onSpectate={mode === 'menu' ? handleSpectateClassic : undefined}
+          spectateDisabled={mode === 'playing'}
+          escapeOverlay={mode === 'playing' && showEscapeMenu}
+          onResume={handleResume}
           onAdminSettings={handleOpenAdminSettings}
           onOpenSkins={() => setShowSkinPicker(true)}
+          onOpenSettings={() => setShowPlayerSettings(true)}
           connectionError={connectionError}
           isConnecting={isConnecting}
+          roomPlayers={roomStats.players}
+          roomLobby={roomStats.lobby}
         />
       )}
+
+      <PlayerSettingsPanel
+        open={showPlayerSettings}
+        prefs={playerPrefs}
+        onChange={handlePlayerPrefsChange}
+        onClose={() => setShowPlayerSettings(false)}
+      />
 
       <AdminSettingsPanel
         open={showAdminSettings}
         settings={draftConfig}
-        sourceLabel={adminSettingsSource === 'multiplayer' ? 'multiplayer server' : 'solo engine'}
+        sourceLabel="multiplayer server"
         isSaving={adminSettingsSaving}
         error={adminSettingsError}
         saveNotice={adminSaveNotice}
@@ -760,50 +921,62 @@ export function App() {
         onClose={() => setShowSkinPicker(false)}
       />
 
-      {mode !== 'menu' && (
-        <>
-          <Leaderboard entries={leaderboard} currentPlayerName={currentPlayer?.name || playerNameRef.current} />
+      {mode !== 'menu' && !showEscapeMenu && (
+        <div
+          className="contents"
+          style={{
+            // scale applied via child wrappers
+          }}
+        >
+          <div style={{ zoom: hudScale } as React.CSSProperties}>
+            <Leaderboard entries={leaderboard} currentPlayerName={currentPlayer?.name || playerNameRef.current} />
+          </div>
           {hudState && (
-            <Minimap
-              gameState={hudState}
-              currentPlayer={currentPlayer}
-              canTeleport={isAdmin}
-              spectateTarget={mode === 'spectating' ? spectateTargetRef.current : null}
-              onHoverWorld={(pos) => {
-                minimapHoverRef.current = pos;
-              }}
-              onPickWorld={mode === 'spectating' || mode === 'dead' ? handleSpectatePick : undefined}
-            />
-          )}
-          {sessionKind === 'multiplayer' && (
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-sky-900/70 text-sky-200 text-xs px-3 py-1 rounded flex gap-2 items-center">
-              <span>ONLINE</span>
-              {isAdmin && <span className="text-amber-300">ADMIN</span>}
+            <div style={{ zoom: hudScale } as React.CSSProperties}>
+              <Minimap
+                gameState={hudState}
+                currentPlayer={currentPlayer}
+                canTeleport={isAdmin && mode === 'playing'}
+                spectateTarget={mode === 'spectating' ? spectateTargetRef.current : null}
+                onHoverWorld={(pos) => {
+                  minimapHoverRef.current = pos;
+                }}
+                onPickWorld={mode === 'spectating' || mode === 'dead' ? handleSpectatePick : undefined}
+              />
             </div>
           )}
-        </>
+          {sessionKind === 'multiplayer' && isAdmin && mode === 'playing' && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-amber-900/70 text-amber-200 text-xs px-3 py-1 rounded select-none">
+              ADMIN
+            </div>
+          )}
+        </div>
       )}
 
-      {sessionKind === 'multiplayer' && mode !== 'menu' && (
-        <ChatPanel
-          messages={chatMessages}
-          visible={mode === 'playing' || mode === 'dead' || mode === 'spectating'}
-          inputOpen={
-            chatOpen &&
-            (mode === 'playing' || mode === 'dead' || mode === 'spectating') &&
-            !showPauseMenu
-          }
-          onCloseInput={() => {
-            setChatOpen(false);
-            setChatFocused(false);
-          }}
-          onSend={handleSendChat}
-          onInputFocusChange={setChatFocused}
-        />
+      {sessionKind === 'multiplayer' && mode !== 'menu' && !showEscapeMenu && (
+        <div style={{ zoom: hudScale } as React.CSSProperties}>
+          <ChatPanel
+            messages={chatMessages}
+            visible={mode === 'playing' || mode === 'dead' || mode === 'spectating'}
+            inputOpen={
+              chatOpen &&
+              (mode === 'playing' || mode === 'dead' || mode === 'spectating') &&
+              !showEscapeMenu
+            }
+            onCloseInput={() => {
+              setChatOpen(false);
+              setChatFocused(false);
+            }}
+            onSend={handleSendChat}
+            onInputFocusChange={setChatFocused}
+          />
+        </div>
       )}
 
-      {mode === 'playing' && !showPauseMenu && (
-        <HUD player={currentPlayer} fps={fps} pingMs={pingMs} onRespawn={handleRespawn} />
+      {mode === 'playing' && !showEscapeMenu && (
+        <div style={{ zoom: hudScale } as React.CSSProperties}>
+          <HUD player={currentPlayer} fps={fps} pingMs={pingMs} onRespawn={handleRespawn} />
+        </div>
       )}
 
       {mode === 'dead' && (
@@ -818,21 +991,10 @@ export function App() {
       )}
 
       {mode === 'spectating' && (
-        <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2">
+        <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2 select-none">
           <div className="text-white font-bold text-lg">Режим наблюдения</div>
-          <div className="text-gray-400 text-sm">
-            {hudState.players.filter((p) => p.cells.length > 0).length} игроков в игре
-          </div>
+          <div className="text-gray-400 text-xs">Классик · ESC — выход</div>
         </div>
-      )}
-
-      {showPauseMenu && mode === 'playing' && (
-        <PauseMenu
-          currentName={currentPlayer?.name || playerNameRef.current}
-          onUpdateName={handleUpdateName}
-          onResume={handleResume}
-          onBackToMenu={handleBackToMenu}
-        />
       )}
     </div>
   );

@@ -73,6 +73,7 @@ export {
   getSectorSize,
   getEntityViewRadius,
   isWithinViewRadius,
+  isEntityNearView,
   isVisibleFromSector,
   SECTOR_COLS,
   SECTOR_ROWS,

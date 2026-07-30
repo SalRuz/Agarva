@@ -1,5 +1,6 @@
 import { Player } from '../types/game';
 import { getTotalMass } from '../utils/gameUtils';
+import { HudPanel } from './HudPanel';
 
 interface HUDProps {
   player?: Player;
@@ -17,25 +18,31 @@ export function HUD({ player, fps, pingMs, onRespawn, onSpectate, onBackToMenu }
   return (
     <>
       {player && !isDead && (
-        <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2">
-          <div className="text-white font-bold text-lg">
-            Масса: <span className="text-green-400">{Math.floor(mass)}</span>
-          </div>
-          <div className="text-gray-400 text-sm">
-            Клетки: {player.cells.length}
-          </div>
-          <div className="text-gray-400 text-xs mt-1 flex gap-3">
-            <span>FPS: <span className="text-sky-300">{fps ?? '--'}</span></span>
-            <span>Ping: <span className="text-amber-300">{pingMs ?? '--'}</span> ms</span>
-          </div>
+        <div className="absolute top-4 left-4 z-30">
+          <HudPanel id="status" title="Статус" className="bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2">
+            <div className="text-white font-bold text-lg">
+              Масса: <span className="text-green-400">{Math.floor(mass)}</span>
+            </div>
+            <div className="text-gray-400 text-sm">Клетки: {player.cells.length}</div>
+            <div className="text-gray-400 text-xs mt-1 flex gap-3">
+              <span>
+                FPS: <span className="text-sky-300">{fps ?? '--'}</span>
+              </span>
+              <span>
+                Ping: <span className="text-amber-300">{pingMs ?? '--'}</span> ms
+              </span>
+            </div>
+          </HudPanel>
         </div>
       )}
 
       {isDead && (
-        <div className="absolute inset-0 bg-black/60 flex items-center justify-center pointer-events-none">
-          <div className="text-center pointer-events-auto">
-            <h2 className="text-4xl font-bold text-red-500 mb-4">Вас съели! 💀</h2>
-            <p className="text-gray-400 mb-6">Финальная масса: {player?.score}</p>
+        <div className="absolute inset-0 bg-black/60 flex items-center justify-center pointer-events-none z-40">
+          <div className="text-center pointer-events-auto select-none">
+            <h2 className="text-4xl font-bold text-white mb-6">
+              Максимальная масса:{' '}
+              <span className="text-green-400">{Math.floor(player?.score ?? 0)}</span>
+            </h2>
             <div className="flex gap-3 justify-center">
               <button
                 onClick={onRespawn}

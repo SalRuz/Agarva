@@ -29,6 +29,8 @@ export interface Player {
   targetY: number;
   lastSplit: number;
   lastEject: number;
+  /** When true, cells stay put (ignore mouse target) */
+  frozen?: boolean;
 }
 
 export interface Food {

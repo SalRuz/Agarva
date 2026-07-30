@@ -59,6 +59,7 @@ const SECTIONS: SectionDef[] = [
       { key: 'eatCoverage', label: 'Порог съедания', help: 'Какая доля цели должна зайти внутрь для поглощения.', step: 0.01 },
       { key: 'separationStiffness', label: 'Жёсткость разделения', help: 'Сила расталкивания своих частей до merge.', step: 0.01 },
       { key: 'separationIterations', label: 'Итерации разделения', help: 'Сколько проходов коллизий своих частей делается за тик.', step: 1 },
+      { key: 'squeezeThroughEnabled', label: 'Протискивание мелких (0/1)', help: '1 = мелкие свои клетки могут постепенно протискиваться между крупными, слегка раздвигая их.', step: 1 },
       { key: 'autoSplitEnabled', label: 'Автосплит при большой массе (0/1)', help: '1 = включено: если одна клетка достигла порога массы, она автоматически делится на 2 части в сторону курсора.', step: 1 },
       { key: 'autoSplitMassThreshold', label: 'Порог автосплита', help: 'Масса одной клетки, при которой срабатывает автосплит (по умолчанию 22500).', step: 100 },
     ],
@@ -67,8 +68,7 @@ const SECTIONS: SectionDef[] = [
     title: 'Еда',
     fields: [
       { key: 'foodMass', label: 'Масса еды', help: 'Сколько массы даёт одна маленькая частица.', step: 0.1 },
-      { key: 'foodCountSolo', label: 'Еда в solo', help: 'Целевое количество еды для solo.', step: 1 },
-      { key: 'foodCountMp', label: 'Еда в multiplayer', help: 'Целевое количество еды для сервера.', step: 1 },
+      { key: 'foodCountMp', label: 'Еда на карте', help: 'Целевое количество еды на сервере.', step: 1 },
       { key: 'foodRespawnThreshold', label: 'Порог респавна еды', help: 'Когда еды меньше этого числа, сервер добавляет новую.', step: 1 },
       { key: 'foodRespawnBatch', label: 'Пачка респавна еды', help: 'Сколько еды добавляется за один респавн.', step: 1 },
       { key: 'foodViewRadius', label: 'Базовый FOV еды', help: 'Базовая дальность видимости еды.', step: 10 },
@@ -89,6 +89,7 @@ const SECTIONS: SectionDef[] = [
       { key: 'virusSplitSpeed', label: 'Скорость вылета колючки', help: 'Скорость новой летящей колючки после перекорма.', step: 0.1 },
       { key: 'virusFriction', label: 'Трение летящей колючки', help: 'Как быстро затухает скорость летящей колючки.', step: 0.001 },
       { key: 'virusEjectCoverage', label: 'Порог кормления колючки', help: 'Насколько глубоко W должна войти в колючку.', step: 0.01 },
+      { key: 'virusAbsorbCoverage', label: 'Порог поглощения колючки', help: 'Какая доля колючки должна войти в клетку, чтобы она поглотилась / взорвала игрока.', step: 0.01 },
     ],
   },
   {
@@ -103,7 +104,7 @@ const SECTIONS: SectionDef[] = [
       { key: 'ejectCooldown', label: 'Кулдаун W', help: 'Пауза между выстрелами W в миллисекундах.', step: 1 },
       { key: 'ejectGracePeriod', label: 'Grace период W', help: 'Сколько миллисекунд родная клетка не может подобрать свою W.', step: 1 },
       { key: 'ejectFriction', label: 'Трение W', help: 'Как быстро замедляется W.', step: 0.001 },
-      { key: 'ejectMaxCount', label: 'Максимум W на карте', help: 'Мягкий предел количества W на карте.', step: 1 },
+      { key: 'ejectMaxCount', label: 'Максимум W на карте', help: 'Мягкий предел количества W на карте (по умолчанию 3000).', step: 1 },
     ],
   },
   {
@@ -112,17 +113,21 @@ const SECTIONS: SectionDef[] = [
       { key: 'massDecayPerSec', label: 'Распад массы в секунду', help: 'Какой процент массы теряется в секунду.', step: 0.0001 },
       { key: 'massDecayMin', label: 'Порог распада', help: 'Ниже этой массы распад не применяется.', step: 1 },
       { key: 'botAiIntervalMs', label: 'Интервал ИИ ботов', help: 'Как часто боты пересчитывают решение.', step: 1 },
-      { key: 'botCountSolo', label: 'Боты в solo', help: 'Стартовое число ботов в solo.', step: 1 },
       { key: 'botCountMp', label: 'Боты на сервере', help: 'Целевое число ботов на сервере.', step: 1 },
       { key: 'adminMassBoost', label: 'Q: сколько массы добавить', help: 'Сколько массы даёт админская кнопка Q.', step: 1 },
+      { key: 'cursorSlowdownEnabled', label: 'Замедление у курсора (0/1)', help: '1 = клетка чуть ползёт, когда курсор на ней / рядом (стелс).', step: 1 },
+      { key: 'cursorSlowdownFactor', label: 'Сила замедления у курсора', help: 'Множитель скорости в центре зоны (0.55 ≈ чуть медленнее).', step: 0.01 },
+      { key: 'cursorSlowdownRadiusMult', label: 'Радиус зоны замедления', help: 'Во сколько радиусов клетки действует замедление (1.05 ≈ до края).', step: 0.01 },
     ],
   },
   {
-    title: 'Наблюдение',
+    title: 'Обзор и наблюдение',
     fields: [
+      { key: 'playViewRadiusMult', label: 'FOV в игре (множитель)', help: 'Множитель радиуса видимости клеток/колючек во время игры (баз. = размер сектора).', step: 0.05 },
+      { key: 'spectateViewRadiusMult', label: 'FOV в наблюдении (множитель)', help: 'Множитель радиуса видимости при spectate / после смерти.', step: 0.05 },
       { key: 'spectatePanSpeed', label: 'Скорость панорамы', help: 'Как быстро камера едет за курсором в режиме наблюдения.', step: 1 },
-      { key: 'spectateMinZoom', label: 'Мин. зум наблюдения', help: 'Минимальный zoom колёсиком в spectate.', step: 0.01 },
-      { key: 'spectateMaxZoom', label: 'Макс. зум наблюдения', help: 'Максимальный zoom колёсиком в spectate.', step: 0.1 },
+      { key: 'spectateMinZoom', label: 'Мин. зум наблюдения', help: 'Минимальный zoom колёсиком в spectate (игроки ограничены ~0.4–2.2).', step: 0.01 },
+      { key: 'spectateMaxZoom', label: 'Макс. зум наблюдения', help: 'Максимальный zoom колёсиком в spectate (выше, чем у игрока).', step: 0.1 },
       { key: 'cameraBaseScale', label: 'Базовый масштаб камеры', help: 'Общий множитель масштаба камеры (и в игре, и в наблюдении).', step: 0.01 },
     ],
   },
@@ -229,8 +234,12 @@ export function AdminSettingsPanel({
       className="absolute inset-0 z-50 bg-black/85 backdrop-blur-sm p-4 md:p-6"
       onKeyDown={(e) => e.stopPropagation()}
       onKeyUp={(e) => e.stopPropagation()}
+      onWheel={(e) => e.stopPropagation()}
     >
-      <div className="h-full w-full rounded-3xl border border-white/15 bg-slate-950/95 shadow-2xl flex flex-col overflow-hidden">
+      <div
+        className="h-full w-full rounded-3xl border border-white/15 bg-slate-950/95 shadow-2xl flex flex-col overflow-hidden"
+        onWheel={(e) => e.stopPropagation()}
+      >
         <div className="border-b border-white/10 px-6 py-5 flex items-start justify-between gap-4">
           <div>
             <h2 className="text-3xl font-bold text-white">Админские настройки</h2>

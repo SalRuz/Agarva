@@ -17,7 +17,6 @@ import {
   lineCircleIntersect,
   createFood,
   createVirus,
-  createBot,
   splitCell,
   clamp,
   applyMass,
@@ -86,9 +85,7 @@ export class GameEngine {
     };
 
     for (let i = 0; i < botCount; i++) {
-      const bot = createBot(getRandomBotName(), worldW, worldH, this.config);
-      this.state.players.push(bot);
-      this.markCellBirth(bot.cells[0].id, Date.now(), getMass(bot.cells[0].radius));
+      this.addPlayer(getRandomBotName(), true);
     }
     this.rebuildFoodHash();
   }
@@ -198,15 +195,25 @@ export class GameEngine {
     let spawnX = Math.random() * this.WW;
     let spawnY = Math.random() * this.WH;
     let spawnColor = color;
+    let usedEjectSpawn = false;
 
     if (!isBot && this.state.ejectedMass.length > 0 && Math.random() < 0.5) {
       const idx = Math.floor(Math.random() * this.state.ejectedMass.length);
       const picked = this.state.ejectedMass[idx];
-      spawnX = picked.x;
-      spawnY = picked.y;
-      spawnColor = picked.color;
-      this.previousMassPositions.delete(picked.id);
-      this.state.ejectedMass.splice(idx, 1);
+      if (!this.isSpawnBlocked(picked.x, picked.y, r)) {
+        spawnX = picked.x;
+        spawnY = picked.y;
+        spawnColor = picked.color;
+        this.previousMassPositions.delete(picked.id);
+        this.state.ejectedMass.splice(idx, 1);
+        usedEjectSpawn = true;
+      }
+    }
+
+    if (!usedEjectSpawn) {
+      const safe = this.findSafeSpawn(r);
+      spawnX = safe.x;
+      spawnY = safe.y;
     }
 
     const player: Player = {
@@ -235,10 +242,68 @@ export class GameEngine {
       targetY: this.WH / 2,
       lastSplit: 0,
       lastEject: 0,
+      frozen: false,
     };
     this.markCellBirth(player.cells[0].id, Date.now(), this.config.initialMass);
     this.state.players.push(player);
     return player;
+  }
+
+  /** True if (x,y) would spawn inside/near an existing player cell. */
+  private isSpawnBlocked(x: number, y: number, radius: number, margin = 1.35): boolean {
+    const minDist = radius * margin;
+    for (const other of this.state.players) {
+      for (const cell of other.cells) {
+        if (distance({ x, y }, cell) < cell.radius + minDist) return true;
+      }
+    }
+    return false;
+  }
+
+  private findSafeSpawn(radius: number, attempts = 48): { x: number; y: number } {
+    const pad = radius + 2;
+    for (let i = 0; i < attempts; i++) {
+      const x = pad + Math.random() * Math.max(1, this.WW - pad * 2);
+      const y = pad + Math.random() * Math.max(1, this.WH - pad * 2);
+      if (!this.isSpawnBlocked(x, y, radius)) return { x, y };
+    }
+    // Fallback: pick the least-overlapping random candidate
+    let best = { x: this.WW / 2, y: this.WH / 2 };
+    let bestClearance = -Infinity;
+    for (let i = 0; i < 16; i++) {
+      const x = pad + Math.random() * Math.max(1, this.WW - pad * 2);
+      const y = pad + Math.random() * Math.max(1, this.WH - pad * 2);
+      let clearance = Infinity;
+      for (const other of this.state.players) {
+        for (const cell of other.cells) {
+          clearance = Math.min(clearance, distance({ x, y }, cell) - cell.radius - radius);
+        }
+      }
+      if (clearance > bestClearance) {
+        bestClearance = clearance;
+        best = { x, y };
+      }
+    }
+    return best;
+  }
+
+  setPlayerFrozen(playerId: string, frozen: boolean) {
+    const player = this.state.players.find((p) => p.id === playerId);
+    if (!player) return;
+    player.frozen = frozen;
+    if (frozen && player.cells.length > 0) {
+      const c = getPlayerCenter(player);
+      player.targetX = c.x;
+      player.targetY = c.y;
+    }
+  }
+
+  togglePlayerFrozen(playerId: string): boolean {
+    const player = this.state.players.find((p) => p.id === playerId);
+    if (!player) return false;
+    const next = !player.frozen;
+    this.setPlayerFrozen(playerId, next);
+    return next;
   }
 
   updatePlayerName(playerId: string, newName: string) {
@@ -274,9 +339,113 @@ export class GameEngine {
     player.targetY = clamp(y, 0, this.WH);
   }
 
+  /** Admin: instantly merge all pieces into one cell (ignores merge timer). */
+  forceMergePlayer(playerId: string) {
+    const player = this.state.players.find((p) => p.id === playerId);
+    if (!player || player.cells.length <= 1) return;
+
+    const center = getPlayerCenter(player);
+    let totalMass = 0;
+    const color = player.cells[0].color;
+    for (const cell of player.cells) {
+      totalMass += getMass(cell.radius);
+      this.clearCellBirth(cell.id);
+    }
+    const r = getRadius(totalMass);
+    const id = generateId();
+    const x = clamp(center.x, r, this.WW - r);
+    const y = clamp(center.y, r, this.WH - r);
+    player.cells = [
+      {
+        id,
+        x,
+        y,
+        radius: r,
+        visualRadius: r,
+        targetRadius: r,
+        color,
+        velocityX: 0,
+        velocityY: 0,
+        splitDirX: 0,
+        splitDirY: 0,
+        splitMaxSpeed: 0,
+      },
+    ];
+    this.markCellBirth(id, Date.now(), totalMass);
+    player.score = Math.floor(totalMass);
+  }
+
+  /** Player/bot whose cell covers world point (x, y), preferring the topmost (largest) cell. */
+  findPlayerAt(x: number, y: number): Player | null {
+    let best: Player | null = null;
+    let bestR = -1;
+    for (const player of this.state.players) {
+      for (const cell of player.cells) {
+        const dx = cell.x - x;
+        const dy = cell.y - y;
+        if (dx * dx + dy * dy > cell.radius * cell.radius) continue;
+        if (cell.radius >= bestR) {
+          bestR = cell.radius;
+          best = player;
+        }
+      }
+    }
+    return best;
+  }
+
+  /** Admin: remove player or bot under a world point. Returns removed id or null. */
+  removePlayerAt(x: number, y: number, exceptPlayerId?: string | null): string | null {
+    const target = this.findPlayerAt(x, y);
+    if (!target) return null;
+    if (exceptPlayerId && target.id === exceptPlayerId) return null;
+    this.removePlayer(target.id);
+    return target.id;
+  }
+
+  /** Admin: spawn a one-shot bot at (x, y) with given starting mass. */
+  spawnBotAt(x: number, y: number, mass = 500): Player {
+    const startMass = Math.max(10, mass);
+    const r = getRadius(startMass);
+    const px = clamp(x, r, this.WW - r);
+    const py = clamp(y, r, this.WH - r);
+    const color = randomColor();
+    const cellId = generateId();
+    const bot: Player = {
+      id: generateId(),
+      name: `Bot${Math.floor(Math.random() * 9999)}`,
+      cells: [
+        {
+          id: cellId,
+          x: px,
+          y: py,
+          radius: r,
+          visualRadius: r,
+          targetRadius: r,
+          color,
+          velocityX: 0,
+          velocityY: 0,
+          splitDirX: 0,
+          splitDirY: 0,
+          splitMaxSpeed: 0,
+        },
+      ],
+      color,
+      score: Math.floor(startMass),
+      isBot: true,
+      targetX: px,
+      targetY: py,
+      lastSplit: 0,
+      lastEject: 0,
+      frozen: false,
+    };
+    this.markCellBirth(cellId, Date.now(), startMass);
+    this.state.players.push(bot);
+    return bot;
+  }
+
   splitPlayer(playerId: string) {
     const player = this.state.players.find((p) => p.id === playerId);
-    if (!player || player.cells.length >= this.config.maxCellsPerPlayer) return;
+    if (!player || player.frozen || player.cells.length >= this.config.maxCellsPerPlayer) return;
     const now = Date.now();
 
     const newCells: Cell[] = [];
@@ -294,29 +463,103 @@ export class GameEngine {
     player.lastSplit = now;
   }
 
+  /**
+   * Auto-split oversized cells by halving their *current* (true) mass.
+   * Uses strict `>` so halves that land exactly on the threshold stay stable
+   * (e.g. 45k merge → two 22.5k pieces, not an immediate re-split).
+   */
   private applyAutoSplit(player: Player, now: number) {
     if (!(this.config.autoSplitEnabled > 0)) return;
-    if (player.cells.length >= this.config.maxCellsPerPlayer) return;
     const threshold = this.config.autoSplitMassThreshold;
-    // Trigger when a single cell reaches the threshold (not total mass),
-    // otherwise after one split the player would keep splitting forever.
-    let best: Cell | null = null;
-    for (const cell of player.cells) {
-      if (getMass(cell.radius) < threshold) continue;
-      if (!best || cell.radius > best.radius) best = cell;
+    // Keep splitting while any cell exceeds the threshold and we have room.
+    while (player.cells.length < this.config.maxCellsPerPlayer) {
+      let best: Cell | null = null;
+      let bestMass = 0;
+      for (const cell of player.cells) {
+        const m = getMass(cell.radius);
+        if (!(m > threshold)) continue;
+        if (!best || m > bestMass) {
+          best = cell;
+          bestMass = m;
+        }
+      }
+      if (!best) break;
+      const half = bestMass / 2;
+      // Bypass maxCellMass clamp so true halves are preserved for further splits.
+      this.setCellMassRaw(best, half);
+      const newCell = this.createAutoSplitPiece(best, half, player.targetX, player.targetY);
+      player.cells.push(newCell);
+      this.markCellBirth(newCell.id, now, half);
+      this.markCellBirth(best.id, now, half);
+      player.lastSplit = now;
     }
-    if (!best) return;
-    const newCell = splitCell(best, player.targetX, player.targetY, this.config);
-    if (!newCell) return;
-    player.cells.push(newCell);
-    this.markCellBirth(newCell.id, now, getMass(newCell.radius));
-    this.markCellBirth(best.id, now, getMass(best.radius));
-    player.lastSplit = now;
+    // If still over max with no room to split, clamp leftovers.
+    for (const cell of player.cells) {
+      applyMass(cell, getMass(cell.radius), this.config);
+    }
+  }
+
+  /** Set logical mass without maxCellMass clamp (auto-split path). */
+  private setCellMassRaw(cell: Cell, mass: number) {
+    const m = Math.max(0, mass);
+    cell.radius = getRadius(m);
+    cell.targetRadius = cell.radius;
+  }
+
+  /** Spawn the sister piece for an auto-split (mass already known). */
+  private createAutoSplitPiece(parent: Cell, halfMass: number, targetX: number, targetY: number): Cell {
+    const newRadius = getRadius(halfMass);
+    const angle = Math.atan2(targetY - parent.y, targetX - parent.x);
+    const dirX = Math.cos(angle);
+    const dirY = Math.sin(angle);
+    const offset = Math.max(
+      parent.radius * 0.65,
+      newRadius * Math.max(this.config.splitSpawnOffset, 0.9)
+    );
+    return {
+      id: generateId(),
+      x: parent.x + dirX * offset,
+      y: parent.y + dirY * offset,
+      radius: newRadius,
+      visualRadius: newRadius * 0.62,
+      targetRadius: newRadius,
+      color: parent.color,
+      velocityX: dirX * this.config.splitBoost,
+      velocityY: dirY * this.config.splitBoost,
+      splitDirX: dirX,
+      splitDirY: dirY,
+      splitMaxSpeed: 0,
+    };
+  }
+
+  /**
+   * Add mass to a cell; if the combined mass reaches the auto-split
+   * threshold, immediately become two halves of that combined mass.
+   */
+  private addMassWithAutoSplit(player: Player, cell: Cell, addedMass: number, now: number) {
+    const total = getMass(cell.radius) + addedMass;
+    const threshold = this.config.autoSplitMassThreshold;
+    if (
+      this.config.autoSplitEnabled > 0 &&
+      total >= threshold &&
+      player.cells.length < this.config.maxCellsPerPlayer
+    ) {
+      const half = total / 2;
+      this.setCellMassRaw(cell, half);
+      const newCell = this.createAutoSplitPiece(cell, half, player.targetX, player.targetY);
+      player.cells.push(newCell);
+      this.markCellBirth(newCell.id, now, half);
+      this.markCellBirth(cell.id, now, half);
+      player.lastSplit = now;
+      // Further oversized halves (half still > threshold) are handled by applyAutoSplit.
+      return;
+    }
+    applyMass(cell, total, this.config);
   }
 
   ejectMass(playerId: string) {
     const player = this.state.players.find((p) => p.id === playerId);
-    if (!player) return;
+    if (!player || player.frozen) return;
 
     const now = Date.now();
     if (now - player.lastEject < this.config.ejectCooldown) return;
@@ -390,7 +633,7 @@ export class GameEngine {
       player.cells[0]
     );
 
-    applyMass(largestCell, getMass(largestCell.radius) + amount, this.config);
+    this.addMassWithAutoSplit(player, largestCell, amount, Date.now());
   }
 
   /** Destroy all mass and become a single starter cell (keep name/color). */
@@ -544,7 +787,18 @@ export class GameEngine {
       return;
     }
 
-    const speed = maxSpeed * delta;
+    let speedMult = 1;
+    if (this.config.cursorSlowdownEnabled >= 0.5) {
+      const slowR = cell.radius * this.config.cursorSlowdownRadiusMult;
+      if (dist < slowR) {
+        // Full creep near center → normal speed near outer edge of the zone
+        const t = dist / Math.max(slowR, 1);
+        const slow = this.config.cursorSlowdownFactor;
+        speedMult = slow + (1 - slow) * t;
+      }
+    }
+
+    const speed = maxSpeed * delta * speedMult;
     cell.x += (dx / dist) * speed;
     cell.y += (dy / dist) * speed;
   }
@@ -581,7 +835,15 @@ export class GameEngine {
     // Movement
     for (const player of this.state.players) {
       for (const cell of player.cells) {
-        this.moveCell(cell, player.targetX, player.targetY, delta);
+        if (!player.frozen) {
+          this.moveCell(cell, player.targetX, player.targetY, delta);
+        } else {
+          // Still decay leftover split momentum while frozen
+          cell.x += cell.velocityX * delta;
+          cell.y += cell.velocityY * delta;
+          cell.velocityX *= Math.pow(this.config.splitFriction, delta);
+          cell.velocityY *= Math.pow(this.config.splitFriction, delta);
+        }
 
         // Bounce off walls (especially important for split momentum into a wall)
         bounceOffWalls(cell, WW, WH);
@@ -622,10 +884,11 @@ export class GameEngine {
               const mergeHit = coversCell(larger, smaller, this.config.mergeCoverage);
               if (mergeHit) {
                 const smallerIndex = a.radius >= b.radius ? j : i;
-                applyMass(larger, getMass(a.radius) + getMass(b.radius), this.config);
                 const removedCell = player.cells[smallerIndex];
+                const added = getMass(removedCell.radius);
                 player.cells.splice(smallerIndex, 1);
                 this.clearCellBirth(removedCell.id);
+                this.addMassWithAutoSplit(player, larger, added, now);
                 j--;
               }
               continue;
@@ -662,6 +925,32 @@ export class GameEngine {
             shareA = invA / invSum;
             shareB = invB / invSum;
 
+            // Soft squeeze: smaller pieces can nest into gaps between larger ones
+            // and only gently part the heavy cells (not shove them hard).
+            let effectiveMinDist = minDist;
+            if (this.config.squeezeThroughEnabled >= 0.5) {
+              const heavy = massA >= massB ? a : b;
+              const light = massA >= massB ? b : a;
+              const heavyMass = Math.max(massA, massB);
+              const lightMass = Math.min(massA, massB);
+              const ratio = heavyMass / Math.max(lightMass, 1);
+              if (ratio >= 3.5 && light.radius < heavy.radius * 0.72) {
+                // Allow deeper overlap for the small piece
+                const allow = Math.min(light.radius * 0.92, heavy.radius * 0.35);
+                effectiveMinDist = Math.max(heavy.radius + light.radius * 0.15, minDist - allow);
+                if (dist >= effectiveMinDist) continue;
+                // Almost all displacement goes to the light cell; heavy barely moves
+                const heavyShare = Math.min(0.08, 0.35 / ratio);
+                if (massA >= massB) {
+                  shareA = heavyShare;
+                  shareB = 1 - heavyShare;
+                } else {
+                  shareB = heavyShare;
+                  shareA = 1 - heavyShare;
+                }
+              }
+            }
+
             // If one of the cells is pinned (virus-pop main piece), keep it fixed
             // and push the other cell outward.
             const aPinned = now < (this.cellPinnedUntil.get(a.id) || 0);
@@ -676,7 +965,8 @@ export class GameEngine {
             }
 
             const safeDist = dist < 0.01 ? 0.01 : dist;
-            const overlap = minDist - safeDist;
+            const overlap = effectiveMinDist - safeDist;
+            if (overlap <= 0) continue;
             const push = overlap * this.config.separationStiffness;
             const nx = (b.x - a.x) / safeDist;
             const ny = (b.y - a.y) / safeDist;
@@ -713,7 +1003,7 @@ export class GameEngine {
           if (eatenFoodIds.has(food.id)) continue;
           // Classic pellet pickup: food center inside the cell
           if (distance(cell, food) < cell.radius) {
-            applyMass(cell, getMass(cell.radius) + this.config.foodMass, this.config);
+            this.addMassWithAutoSplit(player, cell, this.config.foodMass, now);
             eatenFoodIds.add(food.id);
           }
         }
@@ -734,7 +1024,7 @@ export class GameEngine {
           for (let k = prey.cells.length - 1; k >= 0; k--) {
             const preyCell = prey.cells[k];
             if (canEat(hunterCell, preyCell, this.config)) {
-              applyMass(hunterCell, getMass(hunterCell.radius) + getMass(preyCell.radius), this.config);
+              this.addMassWithAutoSplit(hunter, hunterCell, getMass(preyCell.radius), now);
               prey.cells.splice(k, 1);
               this.clearCellBirth(preyCell.id);
             }
@@ -753,7 +1043,7 @@ export class GameEngine {
 
         for (const virus of this.state.viruses) {
           if (virusesToRemove.has(virus.id)) continue;
-          if (coversCell(cell, virus)) {
+          if (coversCell(cell, virus, this.config.virusAbsorbCoverage)) {
             this.popCellFromVirus(player, cell, this.config.virusBonusMass, now);
             virusesToRemove.add(virus.id);
             break;
@@ -846,7 +1136,7 @@ export class GameEngine {
               ));
 
           if (hit) {
-            applyMass(cell, getMass(cell.radius) + this.config.ejectGain, this.config);
+            this.addMassWithAutoSplit(player, cell, this.config.ejectGain, now);
             this.state.ejectedMass.splice(i, 1);
             this.previousMassPositions.delete(mass.id);
             eaten = true;
@@ -885,7 +1175,7 @@ export class GameEngine {
           const cell = player.cells[i];
           if (getMass(cell.radius) < this.config.virusMinEatMass) continue;
 
-          if (coversCell(cell, virus)) {
+          if (coversCell(cell, virus, this.config.virusAbsorbCoverage)) {
             this.popCellFromVirus(player, cell, this.config.virusBonusMass, now);
             virusesToRemove.add(virus.id);
             hit = true;
@@ -909,10 +1199,11 @@ export class GameEngine {
         if (player.isBot) {
           this.botAI.cleanup(player.id);
           const r = getRadius(this.config.initialMass);
+          const safe = this.findSafeSpawn(r);
           player.cells.push({
             id: generateId(),
-            x: Math.random() * WW,
-            y: Math.random() * WH,
+            x: safe.x,
+            y: safe.y,
             radius: r,
             visualRadius: r,
             targetRadius: r,

@@ -11,6 +11,7 @@ import { getFoodRadius, WORLD_WIDTH, WORLD_HEIGHT } from '../../shared/physics';
 import { ADMIN_TOKEN, DEFAULT_WS_URL, WS_PATH } from '../../shared/constants';
 import type { GameplayConfig } from '../../shared/gameConfig';
 import { defaultGameplayConfig, sanitizeGameplayConfig } from '../../shared/gameConfig';
+import { isAdminName } from '../../shared/physics';
 
 export type MultiplayerStatus = 'connecting' | 'connected' | 'disconnected' | 'error' | 'died';
 
@@ -60,6 +61,7 @@ function netPlayerToPlayer(np: NetPlayer): Player {
     targetY: cells[0]?.y ?? 0,
     lastSplit: 0,
     lastEject: 0,
+    frozen: np.fr === 1,
   };
 }
 
@@ -68,10 +70,12 @@ function lerp(a: number, b: number, t: number): number {
 }
 
 function lerpPlayers(from: GameState, to: GameState, t: number): Player[] {
+  const fromMap = new Map(from.players.map((p) => [p.id, p]));
   return to.players.map((tp) => {
-    const fp = from.players.find((p) => p.id === tp.id);
+    const fp = fromMap.get(tp.id);
+    const fromCells = fp ? new Map(fp.cells.map((c) => [c.id, c])) : null;
     const cells = tp.cells.map((tc) => {
-      const fc = fp?.cells.find((c) => c.id === tc.id);
+      const fc = fromCells?.get(tc.id);
       const x = fc ? lerp(fc.x, tc.x, t) : tc.x;
       const y = fc ? lerp(fc.y, tc.y, t) : tc.y;
       const radius = fc ? lerp(fc.radius, tc.radius, t) : tc.radius;
@@ -88,6 +92,7 @@ function lerpPlayers(from: GameState, to: GameState, t: number): Player[] {
     return {
       ...tp,
       cells,
+      frozen: tp.frozen ?? fp?.frozen,
       targetX: cells[0]?.x ?? tp.targetX,
       targetY: cells[0]?.y ?? tp.targetY,
     };
@@ -202,6 +207,7 @@ export class MultiplayerClient {
   private callbacks: MultiplayerCallbacks;
   private playerId: string | null = null;
   private name: string;
+  private password: string | undefined;
   private snapPrev: Snap | null = null;
   private snapCurr: Snap | null = null;
   private worldW = WORLD_WIDTH;
@@ -211,10 +217,22 @@ export class MultiplayerClient {
   /** Render ~half a tick behind latest snap so we can interpolate smoothly */
   private interpDelayMs = 35;
   private config: GameplayConfig = defaultGameplayConfig;
+  private spectateOnly = false;
 
-  constructor(name: string, callbacks: MultiplayerCallbacks = {}) {
+  constructor(name: string, callbacks: MultiplayerCallbacks = {}, password?: string) {
     this.name = name;
     this.callbacks = callbacks;
+    this.password = password;
+  }
+
+  setPassword(password: string | undefined) {
+    this.password = password;
+  }
+
+  private joinPayload(name = this.name) {
+    const msg: { type: 'join'; name: string; password?: string } = { type: 'join', name };
+    if (isAdminName(name) && this.password) msg.password = this.password;
+    return msg;
   }
 
   getPlayerId() {
@@ -231,6 +249,10 @@ export class MultiplayerClient {
 
   getPingMs() {
     return this.lastPingMs;
+  }
+
+  isSpectateOnly() {
+    return this.spectateOnly;
   }
 
   /**
@@ -252,14 +274,19 @@ export class MultiplayerClient {
     return interpolateStates(this.snapPrev, this.snapCurr, alpha);
   }
 
-  connect(url: string) {
+  connect(url: string, opts?: { spectate?: boolean }) {
+    this.spectateOnly = !!opts?.spectate;
     this.callbacks.onStatus?.('connecting');
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {
       this.callbacks.onStatus?.('connected');
       this.send({ type: 'adminAuth', token: resolveAdminToken() });
-      this.send({ type: 'join', name: this.name });
+      if (this.spectateOnly) {
+        this.send({ type: 'spectate' });
+      } else {
+        this.send(this.joinPayload());
+      }
     };
 
     this.ws.onmessage = (ev) => {
@@ -418,9 +445,25 @@ export class MultiplayerClient {
     this.send({ type: 'eject' });
   }
 
-  rename(name: string) {
+  freeze(frozen?: boolean) {
+    if (typeof frozen === 'boolean') {
+      this.send({ type: 'freeze', frozen });
+    } else {
+      this.send({ type: 'freeze' });
+    }
+  }
+
+  enterSpectate() {
+    this.spectateOnly = true;
+    this.send({ type: 'spectate' });
+  }
+
+  rename(name: string, password?: string) {
     this.name = name;
-    this.send({ type: 'rename', name });
+    if (password !== undefined) this.password = password;
+    const msg: { type: 'rename'; name: string; password?: string } = { type: 'rename', name };
+    if (isAdminName(name) && this.password) msg.password = this.password;
+    this.send(msg);
   }
 
   sendChat(text: string) {
@@ -431,8 +474,11 @@ export class MultiplayerClient {
     this.send({ type: 'adminAddMass', amount });
   }
 
-  adminIdentify(name: string) {
-    this.send({ type: 'adminIdentify', name });
+  adminIdentify(name: string, password?: string) {
+    const msg: { type: 'adminIdentify'; name: string; password?: string } = { type: 'adminIdentify', name };
+    if (password) msg.password = password;
+    else if (this.password) msg.password = this.password;
+    this.send(msg);
   }
 
   adminGetSettings() {
@@ -451,13 +497,26 @@ export class MultiplayerClient {
     this.send({ type: 'adminTeleport', x, y });
   }
 
+  adminForceMerge() {
+    this.send({ type: 'adminForceMerge' });
+  }
+
+  adminKickAt(x: number, y: number) {
+    this.send({ type: 'adminKickAt', x, y });
+  }
+
+  adminSpawnBot(x: number, y: number, mass = 500) {
+    this.send({ type: 'adminSpawnBot', x, y, mass });
+  }
+
   resetStarter() {
     this.send({ type: 'resetStarter' });
   }
 
   respawn(name?: string) {
     if (name) this.name = name;
-    this.send({ type: 'join', name: this.name });
+    this.spectateOnly = false;
+    this.send(this.joinPayload());
   }
 
   ping() {
@@ -473,5 +532,6 @@ export class MultiplayerClient {
     this.snapCurr = null;
     this.playerId = null;
     this.isAdmin = false;
+    this.spectateOnly = false;
   }
 }

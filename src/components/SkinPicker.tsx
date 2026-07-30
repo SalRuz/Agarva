@@ -15,8 +15,12 @@ export function SkinPicker({ open, selectedId, onSelect, onClose }: SkinPickerPr
     <div
       className="absolute inset-0 z-50 bg-black/85 backdrop-blur-sm p-4 md:p-6 flex items-center justify-center"
       onKeyDown={(e) => e.stopPropagation()}
+      onWheel={(e) => e.stopPropagation()}
     >
-      <div className="w-full max-w-3xl max-h-[90vh] rounded-3xl border border-white/15 bg-slate-950/95 shadow-2xl flex flex-col overflow-hidden">
+      <div
+        className="w-full max-w-3xl max-h-[90vh] rounded-3xl border border-white/15 bg-slate-950/95 shadow-2xl flex flex-col overflow-hidden"
+        onWheel={(e) => e.stopPropagation()}
+      >
         <div className="border-b border-white/10 px-6 py-5 flex items-start justify-between gap-4">
           <div>
             <h2 className="text-3xl font-bold text-white">Скины</h2>

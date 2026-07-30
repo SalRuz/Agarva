@@ -6,7 +6,8 @@ export function requestRemoteAdminSettings(
   url: string,
   name: string,
   action: AdminSettingsAction,
-  settings?: GameplayConfig
+  settings?: GameplayConfig,
+  password?: string
 ): Promise<GameplayConfig> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
@@ -30,7 +31,12 @@ export function requestRemoteAdminSettings(
       }
     };
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'adminIdentify', name }));
+      const identify: { type: 'adminIdentify'; name: string; password?: string } = {
+        type: 'adminIdentify',
+        name,
+      };
+      if (password) identify.password = password;
+      ws.send(JSON.stringify(identify));
     };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data)) as
@@ -45,10 +51,14 @@ export function requestRemoteAdminSettings(
       if (msg.type === 'adminStatus') {
         isAdmin = msg.ok;
         if (!isAdmin) {
-          finish(() => reject(new Error('Эта вкладка доступна только для salruz / салруз')));
+          finish(() => reject(new Error('Неверный пароль или ник не salruz')));
           return;
         }
-        ws.send(JSON.stringify(action === 'get' ? { type: 'adminGetSettings' } : { type: 'adminUpdateSettings', settings }));
+        ws.send(
+          JSON.stringify(
+            action === 'get' ? { type: 'adminGetSettings' } : { type: 'adminUpdateSettings', settings }
+          )
+        );
         return;
       }
       if (msg.type === 'settings') {

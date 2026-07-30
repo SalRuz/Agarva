@@ -4,6 +4,8 @@ import type { GameplayConfig } from './gameConfig';
 export interface JoinMessage {
   type: 'join';
   name: string;
+  /** Required when joining as an admin nickname */
+  password?: string;
 }
 
 export interface InputMessage {
@@ -18,6 +20,16 @@ export interface SplitMessage {
 
 export interface EjectMessage {
   type: 'eject';
+}
+
+export interface FreezeMessage {
+  type: 'freeze';
+  /** If omitted, server toggles */
+  frozen?: boolean;
+}
+
+export interface SpectateMessage {
+  type: 'spectate';
 }
 
 export interface PingMessage {
@@ -38,6 +50,7 @@ export interface AdminAddMassMessage {
 export interface AdminIdentifyMessage {
   type: 'adminIdentify';
   name: string;
+  password?: string;
 }
 
 export interface AdminGetSettingsMessage {
@@ -61,6 +74,23 @@ export interface AdminTeleportMessage {
   y: number;
 }
 
+export interface AdminForceMergeMessage {
+  type: 'adminForceMerge';
+}
+
+export interface AdminKickAtMessage {
+  type: 'adminKickAt';
+  x: number;
+  y: number;
+}
+
+export interface AdminSpawnBotMessage {
+  type: 'adminSpawnBot';
+  x: number;
+  y: number;
+  mass?: number;
+}
+
 export interface ResetStarterMessage {
   type: 'resetStarter';
 }
@@ -68,6 +98,7 @@ export interface ResetStarterMessage {
 export interface RenameMessage {
   type: 'rename';
   name: string;
+  password?: string;
 }
 
 export interface ChatSendMessage {
@@ -75,11 +106,17 @@ export interface ChatSendMessage {
   text: string;
 }
 
+export interface LobbyMessage {
+  type: 'lobby';
+}
+
 export type ClientMessage =
   | JoinMessage
   | InputMessage
   | SplitMessage
   | EjectMessage
+  | FreezeMessage
+  | SpectateMessage
   | PingMessage
   | AdminAuthMessage
   | AdminIdentifyMessage
@@ -88,9 +125,13 @@ export type ClientMessage =
   | AdminUpdateSettingsMessage
   | AdminSpawnVirusMessage
   | AdminTeleportMessage
+  | AdminForceMergeMessage
+  | AdminKickAtMessage
+  | AdminSpawnBotMessage
   | ResetStarterMessage
   | RenameMessage
-  | ChatSendMessage;
+  | ChatSendMessage
+  | LobbyMessage;
 
 export interface WelcomeMessage {
   type: 'welcome';
@@ -113,6 +154,8 @@ export interface NetPlayer {
   color: string;
   score: number;
   cells: NetCell[];
+  /** 1 = frozen in place */
+  fr?: number;
 }
 
 export interface NetFood {
@@ -193,6 +236,14 @@ export interface SettingsMessage {
   settings: GameplayConfig;
 }
 
+export interface RoomInfoMessage {
+  type: 'roomInfo';
+  /** Human players currently alive in the match */
+  players: number;
+  /** Connected clients in menu / spectating / dead (not actively playing) */
+  lobby: number;
+}
+
 export type ServerMessage =
   | WelcomeMessage
   | StateMessage
@@ -202,4 +253,5 @@ export type ServerMessage =
   | WorldMessage
   | AdminStatusMessage
   | SettingsMessage
-  | ChatBroadcastMessage;
+  | ChatBroadcastMessage
+  | RoomInfoMessage;

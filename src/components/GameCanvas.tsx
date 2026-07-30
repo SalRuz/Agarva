@@ -9,8 +9,11 @@ import {
   WORLD_HEIGHT,
   getEntityViewRadius,
   isWithinViewRadius,
+  isEntityNearView,
 } from '../utils/gameUtils';
 import type { GameplayConfig } from '../../shared/gameConfig';
+import type { PlayerPrefs } from '../settings/playerPrefs';
+import { DEFAULT_PLAYER_PREFS } from '../settings/playerPrefs';
 
 export type SessionKind = 'solo' | 'multiplayer';
 
@@ -32,15 +35,24 @@ interface GameCanvasProps {
   onMouseMove: (x: number, y: number) => void;
   onSplit: () => void;
   onEject: () => void;
+  onFreeze?: () => void;
   onAddMass: () => void;
   onSpawnVirus?: (x: number, y: number) => void;
   onMinimapTeleport?: () => void;
   onResetStarter?: () => void;
+  onForceMerge?: () => void;
+  onKickAt?: (x: number, y: number) => void;
+  onSpawnBot?: (x: number, y: number) => void;
+  /** Admin hotkeys (1–6, Q) only when true — must be in-game as salruz */
+  adminKeysEnabled?: boolean;
+  /** Gameplay keys (Space split) only when actively playing */
+  gameplayKeysEnabled?: boolean;
   onSpectateMove?: (x: number, y: number) => void;
   onPerfSample?: (fps: number) => void;
-  isWPressed: boolean;
   config: GameplayConfig;
   skinUrl?: string | null;
+  prefs?: PlayerPrefs;
+  frozen?: boolean;
 }
 
 export function GameCanvas({
@@ -57,15 +69,22 @@ export function GameCanvas({
   onMouseMove,
   onSplit,
   onEject,
+  onFreeze,
   onAddMass,
   onSpawnVirus,
   onMinimapTeleport,
   onResetStarter,
+  onForceMerge,
+  onKickAt,
+  onSpawnBot,
+  adminKeysEnabled = false,
+  gameplayKeysEnabled = false,
   onSpectateMove,
   onPerfSample,
-  isWPressed,
   config,
   skinUrl = null,
+  prefs = DEFAULT_PLAYER_PREFS,
+  frozen = false,
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef({
@@ -90,19 +109,27 @@ export function GameCanvas({
   const onSpawnVirusRef = useRef(onSpawnVirus);
   const onMinimapTeleportRef = useRef(onMinimapTeleport);
   const onResetStarterRef = useRef(onResetStarter);
+  const onForceMergeRef = useRef(onForceMerge);
+  const onKickAtRef = useRef(onKickAt);
+  const onSpawnBotRef = useRef(onSpawnBot);
+  const onFreezeRef = useRef(onFreeze);
+  const adminKeysEnabledRef = useRef(adminKeysEnabled);
+  const gameplayKeysEnabledRef = useRef(gameplayKeysEnabled);
   const onPerfSampleRef = useRef(onPerfSample);
   const configRef = useRef(config);
+  const prefsRef = useRef(prefs);
   const skinUrlRef = useRef(skinUrl);
   const skinImageRef = useRef<HTMLImageElement | null>(null);
   const lastSpectateDragRef = useRef<{ x: number; y: number } | null>(null);
   const cellVisualsRef = useRef(
     new Map<
       string,
-      { x: number; y: number; r: number; color: string; name: string; isCurrentPlayer: boolean; lastSeen: number }
+      { x: number; y: number; r: number; color: string; name: string; isCurrentPlayer: boolean; isBot: boolean; lastSeen: number }
     >()
   );
   // Stable id->hash for deterministic z-order tie-breaking (prevents virus "flicker" when radii match)
   const idHashRef = useRef<Map<string, number>>(new Map());
+  const ejectKeyDownRef = useRef(false);
 
   useEffect(() => {
     onMouseMoveRef.current = onMouseMove;
@@ -125,6 +152,30 @@ export function GameCanvas({
   }, [onResetStarter]);
 
   useEffect(() => {
+    onForceMergeRef.current = onForceMerge;
+  }, [onForceMerge]);
+
+  useEffect(() => {
+    onKickAtRef.current = onKickAt;
+  }, [onKickAt]);
+
+  useEffect(() => {
+    onSpawnBotRef.current = onSpawnBot;
+  }, [onSpawnBot]);
+
+  useEffect(() => {
+    onFreezeRef.current = onFreeze;
+  }, [onFreeze]);
+
+  useEffect(() => {
+    adminKeysEnabledRef.current = adminKeysEnabled;
+  }, [adminKeysEnabled]);
+
+  useEffect(() => {
+    gameplayKeysEnabledRef.current = gameplayKeysEnabled;
+  }, [gameplayKeysEnabled]);
+
+  useEffect(() => {
     onPerfSampleRef.current = onPerfSample;
   }, [onPerfSample]);
 
@@ -133,8 +184,12 @@ export function GameCanvas({
   }, [config]);
 
   useEffect(() => {
+    prefsRef.current = prefs;
+  }, [prefs]);
+
+  useEffect(() => {
     skinUrlRef.current = skinUrl;
-    if (!skinUrl) {
+    if (!skinUrl || prefs.disableSkins) {
       skinImageRef.current = null;
       return;
     }
@@ -142,7 +197,7 @@ export function GameCanvas({
     img.decoding = 'async';
     img.src = skinUrl;
     skinImageRef.current = img;
-  }, [skinUrl]);
+  }, [skinUrl, prefs.disableSkins]);
 
   // Spectate: track mouse on window so view pans even after death / UI clicks
   useEffect(() => {
@@ -156,9 +211,9 @@ export function GameCanvas({
     }
     lastSpectateDragRef.current = null;
 
-    // Seed mouse to canvas center so first pan works immediately after entering spectate
+    // Always re-seed mouse so pan works immediately after death → spectate
     const canvas = canvasRef.current;
-    if (canvas && !mouseScreenRef.current.valid) {
+    if (canvas) {
       mouseScreenRef.current = {
         x: canvas.width / 2,
         y: canvas.height / 2,
@@ -385,11 +440,15 @@ export function GameCanvas({
         !spectating && currentPlayer && currentPlayer.cells.length > 0
           ? getPlayerCenter(currentPlayer)
           : { x: camera.x, y: camera.y };
-      const viewR = getEntityViewRadius(worldW, worldH);
+      const viewMult = spectating ? cfg.spectateViewRadiusMult : cfg.playViewRadiusMult;
+      const viewR = getEntityViewRadius(worldW, worldH, viewMult);
       const inView = (x: number, y: number) =>
         isWithinViewRadius(x, y, viewerCenter.x, viewerCenter.y, viewR);
+      const entityInView = (x: number, y: number, r: number) =>
+        isEntityNearView(x, y, r, viewerCenter.x, viewerCenter.y, viewR);
 
       const pad = 50;
+      // Food: fill only, no stroke — cheap path
       for (const food of gameState.food) {
         if (!inView(food.x, food.y)) continue;
         if (
@@ -420,9 +479,6 @@ export function GameCanvas({
         ctx.arc(mass.x, mass.y, mass.radius, 0, Math.PI * 2);
         ctx.fillStyle = mass.color;
         ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
       }
 
       // Draw cells + viruses sorted by radius (smaller first).
@@ -436,6 +492,7 @@ export function GameCanvas({
             cell: (typeof gameState.players)[0]['cells'][0];
             playerName: string;
             isCurrentPlayer: boolean;
+            isBot: boolean;
           }
         | {
             kind: 'virus';
@@ -449,11 +506,28 @@ export function GameCanvas({
       const cullPad = 80;
       const nowPerf = performance.now();
       const seenCellIds = new Set<string>();
+      const prefs = prefsRef.current;
+      let visibleCellCount = 0;
 
       for (const player of gameState.players) {
         const isMe = currentPlayer?.id === player.id;
         for (const cell of player.cells) {
-          // Smooth visual stretch (moderate lerp — keeps FPS)
+          const approxR = cell.visualRadius > 0 ? cell.visualRadius : cell.radius;
+          // Cheap screen+FOV cull BEFORE expensive visual lerp / map writes
+          if (!isMe && !entityInView(cell.x, cell.y, approxR)) {
+            cellVisualsRef.current.delete(cell.id);
+            continue;
+          }
+          if (
+            cell.x < viewLeft - approxR - cullPad ||
+            cell.x > viewRight + approxR + cullPad ||
+            cell.y < viewTop - approxR - cullPad ||
+            cell.y > viewBottom + approxR + cullPad
+          ) {
+            cellVisualsRef.current.delete(cell.id);
+            continue;
+          }
+
           if (sessionKindRef.current === 'multiplayer') {
             const lerp =
               cell.visualRadius < cell.radius
@@ -469,6 +543,7 @@ export function GameCanvas({
             color: cell.color,
             name: player.name,
             isCurrentPlayer: isMe,
+            isBot: !!player.isBot,
             lastSeen: nowPerf,
           };
           const posLerp = sessionKindRef.current === 'multiplayer' ? 0.35 : 0.28;
@@ -479,20 +554,13 @@ export function GameCanvas({
           visual.color = cell.color;
           visual.name = player.name;
           visual.isCurrentPlayer = isMe;
+          visual.isBot = !!player.isBot;
           visual.lastSeen = nowPerf;
           cellVisualsRef.current.set(cell.id, visual);
           seenCellIds.add(cell.id);
 
           const r = visual.r > 0 ? visual.r : targetR;
-          if (!isMe && !inView(visual.x, visual.y)) continue;
-          if (
-            visual.x < viewLeft - r - cullPad ||
-            visual.x > viewRight + r + cullPad ||
-            visual.y < viewTop - r - cullPad ||
-            visual.y > viewBottom + r + cullPad
-          ) {
-            continue;
-          }
+          visibleCellCount++;
           drawItems.push({
             kind: 'cell',
             x: visual.x,
@@ -501,6 +569,7 @@ export function GameCanvas({
             cell,
             playerName: visual.name,
             isCurrentPlayer: isMe,
+            isBot: visual.isBot,
           });
         }
       }
@@ -511,7 +580,7 @@ export function GameCanvas({
 
       for (const virus of gameState.viruses) {
         const r = virus.radius;
-        if (!inView(virus.x, virus.y)) continue;
+        if (!entityInView(virus.x, virus.y, r)) continue;
         if (
           virus.x < viewLeft - r - cullPad ||
           virus.x > viewRight + r + cullPad ||
@@ -554,6 +623,17 @@ export function GameCanvas({
         return getHash(idA) - getHash(idB);
       });
 
+      const heavyScene = visibleCellCount > 40;
+      // Skins stay on whenever enabled — never thrash with cell-count thresholds.
+      const allowSkins = !prefs.disableSkins;
+      const skinReady =
+        allowSkins &&
+        skinImageRef.current &&
+        skinImageRef.current.complete &&
+        skinImageRef.current.naturalWidth > 0
+          ? skinImageRef.current
+          : null;
+
       for (const item of drawItems) {
         if (item.kind === 'virus') {
           const { virus } = item;
@@ -561,9 +641,9 @@ export function GameCanvas({
           ctx.fillStyle = colors.fill;
           ctx.strokeStyle = colors.stroke;
           ctx.lineWidth = 3;
-          // Classic spiky virus (ИСХОДНИК) — only drawn for culled-visible set
+          // Classic spiky virus — only drawn for culled-visible set
           ctx.beginPath();
-          const spikes = 18;
+          const spikes = heavyScene ? 12 : 18;
           for (let i = 0; i < spikes * 2; i++) {
             const angle = (i / (spikes * 2)) * Math.PI * 2;
             const rr = i % 2 === 0 ? virus.radius : virus.radius * 0.85;
@@ -578,45 +658,56 @@ export function GameCanvas({
           continue;
         }
 
-        const { cell, playerName, isCurrentPlayer, x, y, r } = item;
+        const { cell, playerName, isCurrentPlayer, isBot, x, y, r } = item;
 
-        ctx.save();
+        // Always paint base color first so skin load / clip never flickers to empty.
         ctx.beginPath();
         ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.closePath();
-        ctx.clip();
+        ctx.fillStyle = cell.color;
+        ctx.fill();
 
-        const skinImg = isCurrentPlayer ? skinImageRef.current : null;
-        if (skinImg && skinImg.complete && skinImg.naturalWidth > 0) {
-          ctx.drawImage(skinImg, x - r, y - r, r * 2, r * 2);
-        } else {
-          ctx.fillStyle = cell.color;
-          ctx.fill();
+        if (skinReady && isCurrentPlayer && r > 8) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.closePath();
+          ctx.clip();
+          ctx.drawImage(skinReady, x - r, y - r, r * 2, r * 2);
+          ctx.restore();
         }
-        ctx.restore();
 
         ctx.beginPath();
         ctx.arc(x, y, r, 0, Math.PI * 2);
         ctx.strokeStyle = isCurrentPlayer ? '#ffffff' : 'rgba(0,0,0,0.3)';
-        ctx.lineWidth = isCurrentPlayer ? 4 : 2;
+        ctx.lineWidth = isCurrentPlayer ? 3 : 1.5;
         ctx.stroke();
 
-        if (r > 16) {
-          const fontSize = Math.max(12, r * 0.38);
-          ctx.font = `bold ${fontSize}px Arial`;
-          ctx.fillStyle = '#ffffff';
+        // Names: readable minimum size, draw even on small cells
+        const textMinR = 6;
+        if (r > textMinR) {
+          const showMass =
+            (isCurrentPlayer && prefs.showMassSelf) ||
+            (!isCurrentPlayer && isBot && prefs.showMassBots) ||
+            (!isCurrentPlayer && !isBot && prefs.showMassOthers);
+
+          const fontSize = Math.max(14, Math.min(r * 0.45, heavyScene ? 32 : 52));
+          ctx.font = `bold ${fontSize}px Arial, sans-serif`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          ctx.strokeStyle = 'rgba(0,0,0,0.45)';
-          ctx.lineWidth = 3;
+          ctx.lineJoin = 'round';
+          ctx.miterLimit = 2;
+          ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+          ctx.lineWidth = Math.max(2.5, fontSize * 0.18);
           ctx.strokeText(playerName, x, y);
+          ctx.fillStyle = '#ffffff';
           ctx.fillText(playerName, x, y);
-          if (r > 32) {
+          if (showMass && r > 14) {
             const mass = Math.floor(getMass(cell.radius));
-            const massFont = fontSize * 0.55;
-            ctx.font = `${massFont}px Arial`;
-            ctx.strokeText(String(mass), x, y + fontSize * 0.75);
-            ctx.fillText(String(mass), x, y + fontSize * 0.75);
+            const massFont = Math.max(11, fontSize * 0.55);
+            ctx.font = `bold ${massFont}px Arial, sans-serif`;
+            ctx.lineWidth = Math.max(2, massFont * 0.18);
+            ctx.strokeText(String(mass), x, y + fontSize * 0.72);
+            ctx.fillText(String(mass), x, y + fontSize * 0.72);
           }
         }
       }
@@ -650,6 +741,11 @@ export function GameCanvas({
           mouseWorldRef.current = { x: worldX, y: worldY };
           onMouseMoveRef.current(worldX, worldY);
         }
+      } else if (isSpectatingRef.current && spectateTargetRef?.current) {
+        // Tell server our spectate FOV center (also works after death)
+        const st = spectateTargetRef.current;
+        onMouseMoveRef.current(st.x, st.y);
+        onSpectateMoveRef.current?.(st.x, st.y);
       }
 
       // Solo: GameCanvas owns update + draw (no React setState per frame)
@@ -730,11 +826,14 @@ export function GameCanvas({
   );
 
   const handleWheel = useCallback((e: WheelEvent) => {
+    // Don't steal wheel from settings / menus / other UI overlays
+    if (inputBlockedRef.current) return;
     e.preventDefault();
     const zoomSpeed = 0.08;
     const factor = e.deltaY > 0 ? 1 - zoomSpeed : 1 + zoomSpeed;
     const cfg = configRef.current;
     const minZoom = isSpectatingRef.current ? cfg.spectateMinZoom : 0.4;
+    // Spectators get a much higher zoom ceiling than players
     const maxZoom = isSpectatingRef.current ? cfg.spectateMaxZoom : 2.2;
     cameraRef.current.userZoom = Math.max(minZoom, Math.min(maxZoom, cameraRef.current.userZoom * factor));
   }, []);
@@ -742,10 +841,34 @@ export function GameCanvas({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (inputBlockedRef.current) return;
-      if (e.code === 'Space') {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) {
+        return;
+      }
+
+      const p = prefsRef.current;
+      if (gameplayKeysEnabledRef.current && e.code === p.keySplit) {
         e.preventDefault();
         onSplit();
-      } else if (e.code === 'KeyQ') {
+        return;
+      }
+
+      if (gameplayKeysEnabledRef.current && p.keyEject && e.code === p.keyEject) {
+        e.preventDefault();
+        ejectKeyDownRef.current = true;
+        onEject();
+        return;
+      }
+
+      if (gameplayKeysEnabledRef.current && e.code === p.keyFreeze) {
+        e.preventDefault();
+        onFreezeRef.current?.();
+        return;
+      }
+
+      if (!adminKeysEnabledRef.current) return;
+
+      if (e.code === 'KeyQ') {
         e.preventDefault();
         onAddMass();
       } else if (e.code === 'Digit1' || e.code === 'Numpad1') {
@@ -758,19 +881,39 @@ export function GameCanvas({
         e.preventDefault();
         const m = mouseWorldRef.current;
         onSpawnVirusRef.current?.(m.x, m.y);
+      } else if (e.code === 'Digit4' || e.code === 'Numpad4') {
+        e.preventDefault();
+        onForceMergeRef.current?.();
+      } else if (e.code === 'Digit5' || e.code === 'Numpad5') {
+        e.preventDefault();
+        const m = mouseWorldRef.current;
+        onKickAtRef.current?.(m.x, m.y);
+      } else if (e.code === 'Digit6' || e.code === 'Numpad6') {
+        e.preventDefault();
+        const m = mouseWorldRef.current;
+        onSpawnBotRef.current?.(m.x, m.y);
       }
     },
-    [onSplit, onAddMass]
+    [onSplit, onEject, onAddMass]
   );
+
+  const handleKeyUp = useCallback((e: KeyboardEvent) => {
+    const p = prefsRef.current;
+    if (p.keyEject && e.code === p.keyEject) {
+      ejectKeyDownRef.current = false;
+    }
+  }, []);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
     window.addEventListener('wheel', handleWheel, { passive: false });
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('wheel', handleWheel);
     };
-  }, [handleKeyDown, handleWheel]);
+  }, [handleKeyDown, handleKeyUp, handleWheel]);
 
   const [lmbDown, setLmbDown] = useState(false);
   const lmbDownRef = useRef(false);
@@ -786,51 +929,60 @@ export function GameCanvas({
 
   useEffect(() => {
     if (isSpectating || inputBlocked) return;
-    if (!isWPressed && !lmbDown) return;
+    if (!ejectKeyDownRef.current && !lmbDown) return;
 
     onEject();
 
     const interval = setInterval(() => {
-      if (isWPressed || lmbDownRef.current) onEject();
+      if (ejectKeyDownRef.current || lmbDownRef.current) onEject();
     }, 100);
 
     return () => clearInterval(interval);
-  }, [isWPressed, lmbDown, onEject, isSpectating, inputBlocked]);
+  }, [lmbDown, onEject, isSpectating, inputBlocked]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      onMouseMove={handleMouseMove}
-      onMouseDown={(e) => {
-        if (e.button !== 0) return;
-        if (isSpectatingRef.current) {
-          const canvas = canvasRef.current;
-          if (!canvas) return;
-          const rect = canvas.getBoundingClientRect();
-          const mx = e.clientX - rect.left;
-          const my = e.clientY - rect.top;
-          mouseScreenRef.current = { x: mx, y: my, valid: true };
-          lastSpectateDragRef.current = { x: mx, y: my };
-          const cam = cameraRef.current;
-          const wx = (mx - canvas.width / 2) / cam.scale + cam.x;
-          const wy = (my - canvas.height / 2) / cam.scale + cam.y;
-          onSpectateMoveRef.current?.(wx, wy);
-          return;
-        }
-        if (inputBlockedRef.current) return;
-        lmbDownRef.current = true;
-        setLmbDown(true);
-        onEject();
-      }}
-      onMouseUp={() => {
-        lastSpectateDragRef.current = null;
-      }}
-      onMouseLeave={() => {
-        lmbDownRef.current = false;
-        setLmbDown(false);
-        lastSpectateDragRef.current = null;
-      }}
-      className="block cursor-crosshair"
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        onMouseMove={handleMouseMove}
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          if (isSpectatingRef.current) {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            mouseScreenRef.current = { x: mx, y: my, valid: true };
+            lastSpectateDragRef.current = { x: mx, y: my };
+            const cam = cameraRef.current;
+            const wx = (mx - canvas.width / 2) / cam.scale + cam.x;
+            const wy = (my - canvas.height / 2) / cam.scale + cam.y;
+            onSpectateMoveRef.current?.(wx, wy);
+            return;
+          }
+          if (inputBlockedRef.current) return;
+          lmbDownRef.current = true;
+          setLmbDown(true);
+          onEject();
+        }}
+        onMouseUp={() => {
+          lastSpectateDragRef.current = null;
+        }}
+        onMouseLeave={() => {
+          lmbDownRef.current = false;
+          setLmbDown(false);
+          lastSpectateDragRef.current = null;
+        }}
+        className="block cursor-crosshair"
+      />
+      {frozen && !isSpectating && (
+        <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-20">
+          <div className="text-white text-4xl font-bold tracking-wide drop-shadow-lg select-none">
+            Остановлено
+          </div>
+        </div>
+      )}
+    </>
   );
 }

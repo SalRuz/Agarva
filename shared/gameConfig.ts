@@ -1,74 +1,4 @@
-import {
-  WORLD_WIDTH,
-  WORLD_HEIGHT,
-  INITIAL_MASS,
-  MIN_SPLIT_MASS,
-  MAX_CELLS_PER_PLAYER,
-  MAX_CELL_MASS,
-  FOOD_MASS,
-  FOOD_COUNT_SOLO,
-  FOOD_COUNT_MP,
-  FOOD_RESPAWN_THRESHOLD,
-  FOOD_VIEW_RADIUS,
-  FOOD_VIEW_PER_SUM_RADIUS,
-  FOOD_VIEW_PER_MAX_RADIUS,
-  FOOD_VIEW_MAX,
-  FOOD_NET_MAX,
-  FOOD_RESPAWN_BATCH,
-  VIRUS_MASS,
-  VIRUS_BONUS_MASS,
-  VIRUS_MIN_EAT_MASS,
-  VIRUS_MAX_CHARGE,
-  VIRUS_COUNT,
-  VIRUS_POP_SPEED,
-  VIRUS_SPLIT_SPEED,
-  VIRUS_FRICTION,
-  VIRUS_EJECT_COVERAGE,
-  SPEED_COEFF,
-  SPEED_EXPONENT,
-  SPEED_SMALL_BOOST,
-  SPEED_MIN,
-  SPEED_PROGRESSION_SOFTEN,
-  SPEED_GLOBAL_MULT,
-  MOVE_LERP,
-  BOOST_STEER,
-  MOVE_STOP_BASE,
-  MOVE_STOP_RADIUS_FRAC,
-  VISUAL_GROW_LERP,
-  VISUAL_SHRINK_LERP,
-  CAMERA_ZOOM_REF,
-  CAMERA_ZOOM_POWER,
-  CAMERA_BASE_SCALE,
-  SPLIT_BOOST,
-  SPLIT_FRICTION,
-  SPLIT_SPAWN_OFFSET,
-  MERGE_BASE_MS,
-  MERGE_MASS_FACTOR,
-  MERGE_COVERAGE,
-  EAT_MASS_MULT,
-  EAT_COVERAGE,
-  SEPARATION_STIFFNESS,
-  SEPARATION_ITERATIONS,
-  BOOST_PASS_MULT,
-  EJECT_LOSS,
-  EJECT_GAIN,
-  EJECT_PICKUP_MIN_MASS,
-  EJECT_PICKUP_COVERAGE,
-  EJECT_SPEED,
-  EJECT_MIN_MASS,
-  EJECT_COOLDOWN,
-  EJECT_GRACE_PERIOD,
-  EJECT_FRICTION,
-  EJECT_MAX_COUNT,
-  EJECT_NET_MAX,
-  MASS_DECAY_PER_SEC,
-  MASS_DECAY_MIN,
-  BOT_AI_INTERVAL_MS,
-  BOT_COUNT_SOLO,
-  BOT_COUNT_MP,
-  SERVER_TICK_HZ,
-  ADMIN_MASS_BOOST,
-} from './constants';
+import { ADMIN_MASS_BOOST } from './constants';
 
 export interface GameplayConfig {
   worldWidth: number;
@@ -117,6 +47,8 @@ export interface GameplayConfig {
   virusSplitSpeed: number;
   virusFriction: number;
   virusEjectCoverage: number;
+  /** Coverage fraction required for a player cell to absorb/pop a virus */
+  virusAbsorbCoverage: number;
   ejectLoss: number;
   ejectGain: number;
   ejectPickupMinMass: number;
@@ -144,86 +76,112 @@ export interface GameplayConfig {
   spectatePanSpeed: number;
   spectateMinZoom: number;
   spectateMaxZoom: number;
+  /** Multiplier on sector-based entity FOV while playing (cells/viruses sync+draw) */
+  playViewRadiusMult: number;
+  /** Multiplier on sector-based entity FOV while spectating */
+  spectateViewRadiusMult: number;
+  /**
+   * 1 = on: smaller own cells can gradually squeeze through gaps between larger
+   * own cells (gentle parting). 0 = hard solid separation only.
+   */
+  squeezeThroughEnabled: number;
   /** 1 = on, 0 = off — auto-split when player mass exceeds threshold */
   autoSplitEnabled: number;
   autoSplitMassThreshold: number;
+  /**
+   * 1 = on: when the cursor is on/near an own cell, that piece creeps slower
+   * toward the cursor (stealth). 0 = off.
+   */
+  cursorSlowdownEnabled: number;
+  /** Speed multiplier while cursor is near the cell center (0–1, e.g. 0.55). */
+  cursorSlowdownFactor: number;
+  /** Distance in cell radii within which slowdown applies (e.g. 1.05 = just past edge). */
+  cursorSlowdownRadiusMult: number;
 }
 
 export const defaultGameplayConfig: GameplayConfig = {
-  worldWidth: WORLD_WIDTH,
-  worldHeight: WORLD_HEIGHT,
-  initialMass: INITIAL_MASS,
-  minSplitMass: MIN_SPLIT_MASS,
-  maxCellsPerPlayer: MAX_CELLS_PER_PLAYER,
-  maxCellMass: MAX_CELL_MASS,
-  speedCoeff: SPEED_COEFF,
-  speedExponent: SPEED_EXPONENT,
-  speedSmallBoost: SPEED_SMALL_BOOST,
-  speedMin: SPEED_MIN,
-  speedProgressionSoften: SPEED_PROGRESSION_SOFTEN,
-  speedGlobalMult: SPEED_GLOBAL_MULT,
-  moveLerp: MOVE_LERP,
-  boostSteer: BOOST_STEER,
-  moveStopBase: MOVE_STOP_BASE,
-  moveStopRadiusFrac: MOVE_STOP_RADIUS_FRAC,
-  splitBoost: SPLIT_BOOST,
-  splitFriction: SPLIT_FRICTION,
-  splitSpawnOffset: SPLIT_SPAWN_OFFSET,
-  boostPassMult: BOOST_PASS_MULT,
-  mergeBaseMs: MERGE_BASE_MS,
-  mergeMassFactor: MERGE_MASS_FACTOR,
-  mergeCoverage: MERGE_COVERAGE,
-  eatMassMult: EAT_MASS_MULT,
-  eatCoverage: EAT_COVERAGE,
-  separationStiffness: SEPARATION_STIFFNESS,
-  separationIterations: SEPARATION_ITERATIONS,
-  foodMass: FOOD_MASS,
-  foodCountSolo: FOOD_COUNT_SOLO,
-  foodCountMp: FOOD_COUNT_MP,
-  foodRespawnThreshold: FOOD_RESPAWN_THRESHOLD,
-  foodRespawnBatch: FOOD_RESPAWN_BATCH,
-  foodViewRadius: FOOD_VIEW_RADIUS,
-  foodViewPerSumRadius: FOOD_VIEW_PER_SUM_RADIUS,
-  foodViewPerMaxRadius: FOOD_VIEW_PER_MAX_RADIUS,
-  foodViewMax: FOOD_VIEW_MAX,
-  foodNetMax: FOOD_NET_MAX,
-  virusMass: VIRUS_MASS,
-  virusBonusMass: VIRUS_BONUS_MASS,
-  virusMinEatMass: VIRUS_MIN_EAT_MASS,
-  virusMaxCharge: VIRUS_MAX_CHARGE,
-  virusCount: VIRUS_COUNT,
-  virusPopSpeed: VIRUS_POP_SPEED,
-  virusSplitSpeed: VIRUS_SPLIT_SPEED,
-  virusFriction: VIRUS_FRICTION,
-  virusEjectCoverage: VIRUS_EJECT_COVERAGE,
-  ejectLoss: EJECT_LOSS,
-  ejectGain: EJECT_GAIN,
-  ejectPickupMinMass: EJECT_PICKUP_MIN_MASS,
-  ejectPickupCoverage: EJECT_PICKUP_COVERAGE,
-  ejectSpeed: EJECT_SPEED,
-  ejectMinMass: EJECT_MIN_MASS,
-  ejectCooldown: EJECT_COOLDOWN,
-  ejectGracePeriod: EJECT_GRACE_PERIOD,
-  ejectFriction: EJECT_FRICTION,
-  ejectMaxCount: EJECT_MAX_COUNT,
-  ejectNetMax: EJECT_NET_MAX,
-  massDecayPerSec: MASS_DECAY_PER_SEC,
-  massDecayMin: MASS_DECAY_MIN,
-  botAiIntervalMs: BOT_AI_INTERVAL_MS,
-  botCountSolo: BOT_COUNT_SOLO,
-  botCountMp: BOT_COUNT_MP,
-  serverTickHz: SERVER_TICK_HZ,
+  worldWidth: 15000,
+  worldHeight: 15000,
+  initialMass: 15,
+  minSplitMass: 40,
+  maxCellsPerPlayer: 16,
+  maxCellMass: 22500,
+  speedCoeff: 8.5,
+  speedExponent: 0.439,
+  speedSmallBoost: 2,
+  speedMin: 0.55,
+  speedProgressionSoften: 10,
+  speedGlobalMult: 2.5,
+  moveLerp: 0.5,
+  boostSteer: 0.025,
+  moveStopBase: 10,
+  moveStopRadiusFrac: 0.06,
+  splitBoost: 57,
+  splitFriction: 0.93,
+  splitSpawnOffset: 1.15,
+  boostPassMult: 1.25,
+  mergeBaseMs: 30000,
+  mergeMassFactor: 20,
+  mergeCoverage: 0.7,
+  eatMassMult: 1.2666666666666666,
+  eatCoverage: 0.7,
+  separationStiffness: 1,
+  separationIterations: 1,
+  foodMass: 5,
+  foodCountSolo: 1800,
+  foodCountMp: 5400,
+  foodRespawnThreshold: 1000,
+  foodRespawnBatch: 60,
+  foodViewRadius: 1600,
+  foodViewPerSumRadius: 5.5,
+  foodViewPerMaxRadius: 4,
+  foodViewMax: 9000,
+  foodNetMax: 320,
+  virusMass: 130,
+  virusBonusMass: 100,
+  virusMinEatMass: 130,
+  virusMaxCharge: 7,
+  virusCount: 64,
+  virusPopSpeed: 15,
+  virusSplitSpeed: 25,
+  virusFriction: 0.956,
+  virusEjectCoverage: 0.7,
+  virusAbsorbCoverage: 0.7,
+  ejectLoss: 16,
+  ejectGain: 15,
+  ejectPickupMinMass: 1,
+  ejectPickupCoverage: 0.7,
+  ejectSpeed: 28,
+  ejectMinMass: 30,
+  ejectCooldown: 53,
+  ejectGracePeriod: 200,
+  ejectFriction: 0.945,
+  ejectMaxCount: 3000,
+  ejectNetMax: 140,
+  massDecayPerSec: 0.002,
+  massDecayMin: 50,
+  botAiIntervalMs: 250,
+  botCountSolo: 16,
+  botCountMp: 20,
+  serverTickHz: 30,
+  /** Admin-only setting — kept from project defaults, not overridden by shared presets */
   adminMassBoost: ADMIN_MASS_BOOST,
-  visualGrowLerp: VISUAL_GROW_LERP,
-  visualShrinkLerp: VISUAL_SHRINK_LERP,
-  cameraZoomRef: CAMERA_ZOOM_REF,
-  cameraZoomPower: CAMERA_ZOOM_POWER,
-  cameraBaseScale: CAMERA_BASE_SCALE,
+  visualGrowLerp: 0.006,
+  visualShrinkLerp: 0.1,
+  cameraZoomRef: 40,
+  cameraZoomPower: 0.4,
+  cameraBaseScale: 0.9,
   spectatePanSpeed: 28,
-  spectateMinZoom: 0.25,
-  spectateMaxZoom: 7,
-  autoSplitEnabled: 0,
-  autoSplitMassThreshold: MAX_CELL_MASS,
+  spectateMinZoom: 0.35,
+  spectateMaxZoom: 40,
+  playViewRadiusMult: 1.2,
+  spectateViewRadiusMult: 1.2,
+  squeezeThroughEnabled: 0,
+  autoSplitEnabled: 1,
+  autoSplitMassThreshold: 22500,
+  cursorSlowdownEnabled: 1,
+  cursorSlowdownFactor: 0.55,
+  cursorSlowdownRadiusMult: 1.05,
 };
 
 const CONFIG_KEYS = Object.keys(defaultGameplayConfig) as (keyof GameplayConfig)[];
@@ -286,6 +244,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.virusSplitSpeed = Math.max(0, out.virusSplitSpeed);
   out.virusFriction = clampRange(out.virusFriction, 0, 0.9999);
   out.virusEjectCoverage = clamp01(out.virusEjectCoverage);
+  out.virusAbsorbCoverage = clamp01(out.virusAbsorbCoverage);
   out.ejectLoss = Math.max(0.1, out.ejectLoss);
   out.ejectGain = Math.max(0.1, out.ejectGain);
   out.ejectPickupMinMass = Math.max(0, out.ejectPickupMinMass);
@@ -312,8 +271,14 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.spectatePanSpeed = Math.max(0, out.spectatePanSpeed);
   out.spectateMinZoom = Math.max(0.05, out.spectateMinZoom);
   out.spectateMaxZoom = Math.max(out.spectateMinZoom, out.spectateMaxZoom);
+  out.playViewRadiusMult = Math.max(0.2, Math.min(4, out.playViewRadiusMult));
+  out.spectateViewRadiusMult = Math.max(0.2, Math.min(4, out.spectateViewRadiusMult));
+  out.squeezeThroughEnabled = out.squeezeThroughEnabled >= 0.5 ? 1 : 0;
   out.autoSplitEnabled = out.autoSplitEnabled >= 0.5 ? 1 : 0;
   out.autoSplitMassThreshold = Math.max(out.minSplitMass * 2, out.autoSplitMassThreshold);
+  out.cursorSlowdownEnabled = out.cursorSlowdownEnabled >= 0.5 ? 1 : 0;
+  out.cursorSlowdownFactor = clampRange(out.cursorSlowdownFactor, 0.05, 1);
+  out.cursorSlowdownRadiusMult = Math.max(0.2, out.cursorSlowdownRadiusMult);
   return out;
 }
 

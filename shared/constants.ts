@@ -113,7 +113,7 @@ export const EJECT_COOLDOWN = 53;
 export const EJECT_GRACE_PERIOD = 200;
 export const EJECT_FRICTION = 0.945;
 /** Soft cap — oldest W blobs despawn when over limit (anti-lag) */
-export const EJECT_MAX_COUNT = 220;
+export const EJECT_MAX_COUNT = 3000;
 /** Max ejected blobs sent per client state snapshot */
 export const EJECT_NET_MAX = 140;
 
@@ -152,6 +152,8 @@ export const WS_PATH = '/ws';
 
 /** Admin — nickname "салруз" (or latin salruz). Key 2 is for everyone. */
 export const ADMIN_NAMES = ['салруз', 'salruz'] as const;
+/** Password required to join / use admin nicknames */
+export const ADMIN_PASSWORD = 'ыфдкгя';
 export const ADMIN_TOKEN = 'salruz'; // legacy; admin is nickname-based now
 export const ADMIN_MASS_BOOST = 100;
 

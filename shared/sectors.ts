@@ -40,11 +40,15 @@ export function getSectorLabelAt(x: number, y: number, worldW: number, worldH: n
 /**
  * Entity draw/sync FOV: same reach as old "1 sector + 70% neighbors",
  * but as a circle that follows the player (not grid-locked).
- * = sectorSize × (0.5 + 0.7)
+ * Default mult 1.2 ≈ sectorSize × (0.5 + 0.7).
  */
-export function getEntityViewRadius(worldW: number, worldH: number): number {
+export function getEntityViewRadius(
+  worldW: number,
+  worldH: number,
+  mult: number = 1.2
+): number {
   const { sw, sh } = getSectorSize(worldW, worldH);
-  return Math.max(sw, sh) * 1.2;
+  return Math.max(sw, sh) * Math.max(0.05, mult);
 }
 
 export function isWithinViewRadius(
@@ -57,6 +61,24 @@ export function isWithinViewRadius(
   const dx = x - cx;
   const dy = y - cy;
   return dx * dx + dy * dy <= viewR * viewR;
+}
+
+/**
+ * True if a circular entity intersects the view circle
+ * (center may be outside FOV, but the blob edge still peeks in).
+ */
+export function isEntityNearView(
+  x: number,
+  y: number,
+  radius: number,
+  cx: number,
+  cy: number,
+  viewR: number
+): boolean {
+  const dx = x - cx;
+  const dy = y - cy;
+  const limit = viewR + Math.max(0, radius);
+  return dx * dx + dy * dy <= limit * limit;
 }
 
 /**

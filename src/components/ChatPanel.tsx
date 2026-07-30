@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { CHAT_HISTORY_MAX, CHAT_MAX_LENGTH } from '../../shared/constants';
+import { HudPanel } from './HudPanel';
 
 export interface ChatLine {
   name: string;
@@ -75,51 +76,49 @@ export function ChatPanel({
       className="absolute bottom-4 left-4 z-40 w-[min(360px,calc(100vw-2rem))] pointer-events-auto"
       onWheel={handleWheel}
     >
-      <div
-        ref={listRef}
-        className="max-h-40 overflow-y-auto rounded-lg bg-black/55 backdrop-blur-sm px-3 py-2 space-y-1 text-sm scrollbar-thin"
-      >
-        {shown.length === 0 && (
-          <div className="text-gray-500 text-xs">Enter — открыть чат</div>
-        )}
-        {shown.map((m, i) => (
-          <div key={`${m.t}-${i}`} className="text-gray-200 leading-snug break-words">
-            <span
-              className="font-semibold"
-              style={{ color: m.color || '#34d399' }}
-            >
-              {m.name}
-            </span>
-            <span className="text-gray-500">: </span>
-            <span>{m.text}</span>
-          </div>
-        ))}
-      </div>
+      <HudPanel id="chat" title="Чат" className="bg-black/55 backdrop-blur-sm rounded-lg px-3 py-2">
+        <div
+          ref={listRef}
+          className="max-h-40 overflow-y-auto space-y-1 text-sm scrollbar-thin select-none"
+          style={{ userSelect: 'none' }}
+        >
+          {shown.length === 0 && (
+            <div className="text-gray-500 text-xs">Enter — открыть чат</div>
+          )}
+          {shown.map((m, i) => (
+            <div key={`${m.t}-${i}`} className="text-gray-200 leading-snug break-words">
+              <span className="font-semibold" style={{ color: m.color || '#34d399' }}>
+                {m.name}
+              </span>
+              <span className="text-gray-500">: </span>
+              <span>{m.text}</span>
+            </div>
+          ))}
+        </div>
 
-      {inputOpen && (
-        <form onSubmit={submit} className="mt-2">
-          <input
-            ref={inputRef}
-            type="text"
-            value={draft}
-            maxLength={CHAT_MAX_LENGTH}
-            onChange={(e) => setDraft(e.target.value)}
-            onBlur={() => {
-              // Keep open until Enter/Esc handled by App; blur may fire when clicking
-            }}
-            onKeyDown={(e) => {
-              e.stopPropagation();
-              if (e.code === 'Escape') {
-                e.preventDefault();
-                setDraft('');
-                onCloseInput();
-              }
-            }}
-            placeholder="Сообщение…"
-            className="w-full px-3 py-2 rounded-lg bg-black/70 border border-white/20 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
-          />
-        </form>
-      )}
+        {inputOpen && (
+          <form onSubmit={submit} className="mt-2">
+            <input
+              ref={inputRef}
+              type="text"
+              value={draft}
+              maxLength={CHAT_MAX_LENGTH}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.code === 'Escape') {
+                  e.preventDefault();
+                  setDraft('');
+                  onCloseInput();
+                }
+              }}
+              placeholder="Сообщение…"
+              className="w-full px-3 py-2 rounded-lg bg-black/70 border border-white/20 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
+              style={{ userSelect: 'text', WebkitUserSelect: 'text' }}
+            />
+          </form>
+        )}
+      </HudPanel>
     </div>
   );
 }
