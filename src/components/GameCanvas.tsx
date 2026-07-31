@@ -13,7 +13,13 @@ import {
 } from '../utils/gameUtils';
 import type { GameplayConfig } from '../../shared/gameConfig';
 import type { PlayerPrefs } from '../settings/playerPrefs';
-import { DEFAULT_PLAYER_PREFS } from '../settings/playerPrefs';
+import {
+  DEFAULT_PLAYER_PREFS,
+  isMouseBind,
+  mouseButtonCode,
+  parseMouseButton,
+} from '../settings/playerPrefs';
+import { resolveSkinUrl } from '../skins/loadSkins';
 
 export type SessionKind = 'solo' | 'multiplayer';
 
@@ -53,6 +59,9 @@ interface GameCanvasProps {
   skinUrl?: string | null;
   prefs?: PlayerPrefs;
   frozen?: boolean;
+  /** Player ids owned by local session (multibox) */
+  ownedIdsRef?: MutableRefObject<string[]>;
+  onMultibox?: () => void;
 }
 
 export function GameCanvas({
@@ -85,6 +94,8 @@ export function GameCanvas({
   skinUrl = null,
   prefs = DEFAULT_PLAYER_PREFS,
   frozen = false,
+  ownedIdsRef,
+  onMultibox,
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef({
@@ -120,6 +131,9 @@ export function GameCanvas({
   const prefsRef = useRef(prefs);
   const skinUrlRef = useRef(skinUrl);
   const skinImageRef = useRef<HTMLImageElement | null>(null);
+  /** Cache remote skins by id for other players */
+  const skinCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const onMultiboxRef = useRef(onMultibox);
   const lastSpectateDragRef = useRef<{ x: number; y: number } | null>(null);
   const cellVisualsRef = useRef(
     new Map<
@@ -130,6 +144,8 @@ export function GameCanvas({
   // Stable id->hash for deterministic z-order tie-breaking (prevents virus "flicker" when radii match)
   const idHashRef = useRef<Map<string, number>>(new Map());
   const ejectKeyDownRef = useRef(false);
+  /** Held mouse button for eject bind (null = none); LMB default uses lmbDownRef */
+  const ejectMouseBtnRef = useRef<number | null>(null);
 
   useEffect(() => {
     onMouseMoveRef.current = onMouseMove;
@@ -198,6 +214,17 @@ export function GameCanvas({
     img.src = skinUrl;
     skinImageRef.current = img;
   }, [skinUrl, prefs.disableSkins]);
+
+  useEffect(() => {
+    onMultiboxRef.current = onMultibox;
+  }, [onMultibox]);
+
+  // Leaving spectate: reset wheel zoom so gameplay isn't stuck at ultra-zoom
+  useEffect(() => {
+    if (!isSpectating) {
+      cameraRef.current.userZoom = 1;
+    }
+  }, [isSpectating]);
 
   // Spectate: track mouse on window so view pans even after death / UI clicks
   useEffect(() => {
@@ -306,26 +333,6 @@ export function GameCanvas({
       return Math.max(0.15, Math.min(1.5, auto));
     };
 
-    const clampCameraToWorld = (
-      x: number,
-      y: number,
-      scale: number,
-      width: number,
-      height: number,
-      worldW: number,
-      worldH: number
-    ) => {
-      const halfW = width / Math.max(scale, 0.001) / 2;
-      const halfH = height / Math.max(scale, 0.001) / 2;
-      let cx = x;
-      let cy = y;
-      if (worldW <= halfW * 2) cx = worldW / 2;
-      else cx = Math.max(halfW, Math.min(worldW - halfW, cx));
-      if (worldH <= halfH * 2) cy = worldH / 2;
-      else cy = Math.max(halfH, Math.min(worldH - halfH, cy));
-      return { x: cx, y: cy };
-    };
-
     const draw = (gameState: GameState, currentPlayer: Player | undefined) => {
       const width = canvas.width;
       const height = canvas.height;
@@ -360,9 +367,7 @@ export function GameCanvas({
 
           const scaled = cfg.cameraBaseScale * cameraRef.current.userZoom;
           cameraRef.current.targetScale = scaled;
-          const clampedTarget = clampCameraToWorld(st.x, st.y, scaled, width, height, worldW, worldH);
-          st.x = clampedTarget.x;
-          st.y = clampedTarget.y;
+          // Spectate: free pan past map edges (no world clamp)
           targetX = st.x;
           targetY = st.y;
         } else {
@@ -382,20 +387,7 @@ export function GameCanvas({
       cameraRef.current.y += (targetY - cameraRef.current.y) * follow;
       cameraRef.current.scale += (cameraRef.current.targetScale - cameraRef.current.scale) * 0.05;
 
-      // Clamp view to map ONLY while spectating (gameplay can look past walls)
-      if (spectating) {
-        const clampedCam = clampCameraToWorld(
-          cameraRef.current.x,
-          cameraRef.current.y,
-          cameraRef.current.scale,
-          width,
-          height,
-          worldW,
-          worldH
-        );
-        cameraRef.current.x = clampedCam.x;
-        cameraRef.current.y = clampedCam.y;
-      }
+      // Gameplay may look past walls; spectate also unrestricted (no clamp)
       const camera = cameraRef.current;
 
       const viewHalfW = width / camera.scale / 2;
@@ -493,6 +485,7 @@ export function GameCanvas({
             playerName: string;
             isCurrentPlayer: boolean;
             isBot: boolean;
+            skinId?: string;
           }
         | {
             kind: 'virus';
@@ -508,9 +501,16 @@ export function GameCanvas({
       const seenCellIds = new Set<string>();
       const prefs = prefsRef.current;
       let visibleCellCount = 0;
+      const owned = ownedIdsRef?.current;
+      const ownedSet =
+        owned && owned.length > 0
+          ? new Set(owned)
+          : currentPlayer
+            ? new Set([currentPlayer.id])
+            : null;
 
       for (const player of gameState.players) {
-        const isMe = currentPlayer?.id === player.id;
+        const isMe = !!(ownedSet?.has(player.id) || currentPlayer?.id === player.id);
         for (const cell of player.cells) {
           const approxR = cell.visualRadius > 0 ? cell.visualRadius : cell.radius;
           // Cheap screen+FOV cull BEFORE expensive visual lerp / map writes
@@ -570,6 +570,7 @@ export function GameCanvas({
             playerName: visual.name,
             isCurrentPlayer: isMe,
             isBot: visual.isBot,
+            skinId: player.skin,
           });
         }
       }
@@ -626,13 +627,24 @@ export function GameCanvas({
       const heavyScene = visibleCellCount > 40;
       // Skins stay on whenever enabled — never thrash with cell-count thresholds.
       const allowSkins = !prefs.disableSkins;
-      const skinReady =
-        allowSkins &&
-        skinImageRef.current &&
-        skinImageRef.current.complete &&
-        skinImageRef.current.naturalWidth > 0
-          ? skinImageRef.current
-          : null;
+      const getSkinImage = (skinId: string | undefined, isLocalOwned: boolean): HTMLImageElement | null => {
+        if (!allowSkins) return null;
+        if (isLocalOwned && skinImageRef.current) {
+          const img = skinImageRef.current;
+          if (img.complete && img.naturalWidth > 0) return img;
+        }
+        if (!skinId) return null;
+        let img = skinCacheRef.current.get(skinId);
+        if (!img) {
+          const url = resolveSkinUrl(skinId);
+          if (!url) return null;
+          img = new Image();
+          img.decoding = 'async';
+          img.src = url;
+          skinCacheRef.current.set(skinId, img);
+        }
+        return img.complete && img.naturalWidth > 0 ? img : null;
+      };
 
       for (const item of drawItems) {
         if (item.kind === 'virus') {
@@ -658,7 +670,7 @@ export function GameCanvas({
           continue;
         }
 
-        const { cell, playerName, isCurrentPlayer, isBot, x, y, r } = item;
+        const { cell, playerName, isCurrentPlayer, x, y, r, skinId } = item;
 
         // Always paint base color first so skin load / clip never flickers to empty.
         ctx.beginPath();
@@ -666,13 +678,14 @@ export function GameCanvas({
         ctx.fillStyle = cell.color;
         ctx.fill();
 
-        if (skinReady && isCurrentPlayer && r > 8) {
+        const skinImg = getSkinImage(skinId, isCurrentPlayer);
+        if (skinImg && r > 8) {
           ctx.save();
           ctx.beginPath();
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.closePath();
           ctx.clip();
-          ctx.drawImage(skinReady, x - r, y - r, r * 2, r * 2);
+          ctx.drawImage(skinImg, x - r, y - r, r * 2, r * 2);
           ctx.restore();
         }
 
@@ -682,32 +695,40 @@ export function GameCanvas({
         ctx.lineWidth = isCurrentPlayer ? 3 : 1.5;
         ctx.stroke();
 
-        // Names: readable minimum size, draw even on small cells
-        const textMinR = 6;
+        // Nickname centered in cell; mass sits under the name (not shared center)
+        const textMinR = 8;
         if (r > textMinR) {
-          const showMass =
-            (isCurrentPlayer && prefs.showMassSelf) ||
-            (!isCurrentPlayer && isBot && prefs.showMassBots) ||
-            (!isCurrentPlayer && !isBot && prefs.showMassOthers);
-
-          const fontSize = Math.max(14, Math.min(r * 0.45, heavyScene ? 32 : 52));
-          ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+          const showMass = prefs.showMass;
+          const nameScale = Math.max(0.15, Math.min(0.55, cfg.nameScale || 0.28));
+          const strokeFrac = Math.max(0, cfg.nameStrokeWidth ?? 0.02);
+          let fontSize = r * nameScale;
+          fontSize = Math.min(fontSize, r * 0.42);
+          fontSize = Math.max(fontSize, Math.min(r * 0.22, 14 / Math.max(camera.scale, 0.001)));
+          // Quantize font size to cut canvas font churn with many cells
+          fontSize = Math.max(8, Math.round(fontSize));
+          ctx.font = `bold ${fontSize}px Arial, Helvetica, sans-serif`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.lineJoin = 'round';
-          ctx.miterLimit = 2;
-          ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-          ctx.lineWidth = Math.max(2.5, fontSize * 0.18);
-          ctx.strokeText(playerName, x, y);
           ctx.fillStyle = '#ffffff';
+          const strokeW = fontSize * strokeFrac;
+          // Name stays at cell center; mass is drawn below it
+          if (strokeW > 0.35) {
+            ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+            ctx.lineWidth = strokeW;
+            ctx.strokeText(playerName, x, y);
+          }
           ctx.fillText(playerName, x, y);
           if (showMass && r > 14) {
             const mass = Math.floor(getMass(cell.radius));
-            const massFont = Math.max(11, fontSize * 0.55);
-            ctx.font = `bold ${massFont}px Arial, sans-serif`;
-            ctx.lineWidth = Math.max(2, massFont * 0.18);
-            ctx.strokeText(String(mass), x, y + fontSize * 0.72);
-            ctx.fillText(String(mass), x, y + fontSize * 0.72);
+            const massFont = Math.max(8, Math.round(fontSize * 0.72));
+            const massY = y + fontSize * 0.72;
+            ctx.font = `${massFont}px Arial, Helvetica, sans-serif`;
+            if (strokeW > 0.35) {
+              ctx.lineWidth = Math.max(0.5, massFont * strokeFrac);
+              ctx.strokeText(String(mass), x, massY);
+            }
+            ctx.fillText(String(mass), x, massY);
           }
         }
       }
@@ -832,8 +853,8 @@ export function GameCanvas({
     const zoomSpeed = 0.08;
     const factor = e.deltaY > 0 ? 1 - zoomSpeed : 1 + zoomSpeed;
     const cfg = configRef.current;
+    // Spectate: very wide range (min ≈ unlimited zoom-out for huge cells; max ≈ unlimited zoom-in)
     const minZoom = isSpectatingRef.current ? cfg.spectateMinZoom : 0.4;
-    // Spectators get a much higher zoom ceiling than players
     const maxZoom = isSpectatingRef.current ? cfg.spectateMaxZoom : 2.2;
     cameraRef.current.userZoom = Math.max(minZoom, Math.min(maxZoom, cameraRef.current.userZoom * factor));
   }, []);
@@ -847,22 +868,45 @@ export function GameCanvas({
       }
 
       const p = prefsRef.current;
-      if (gameplayKeysEnabledRef.current && e.code === p.keySplit) {
+      if (
+        gameplayKeysEnabledRef.current &&
+        !isMouseBind(p.keySplit) &&
+        e.code === p.keySplit
+      ) {
         e.preventDefault();
         onSplit();
         return;
       }
 
-      if (gameplayKeysEnabledRef.current && p.keyEject && e.code === p.keyEject) {
+      if (
+        gameplayKeysEnabledRef.current &&
+        p.keyEject &&
+        !isMouseBind(p.keyEject) &&
+        e.code === p.keyEject
+      ) {
         e.preventDefault();
         ejectKeyDownRef.current = true;
         onEject();
         return;
       }
 
-      if (gameplayKeysEnabledRef.current && e.code === p.keyFreeze) {
+      if (
+        gameplayKeysEnabledRef.current &&
+        !isMouseBind(p.keyFreeze) &&
+        e.code === p.keyFreeze
+      ) {
         e.preventDefault();
         onFreezeRef.current?.();
+        return;
+      }
+
+      if (
+        gameplayKeysEnabledRef.current &&
+        !isMouseBind(p.keyMultibox) &&
+        e.code === p.keyMultibox
+      ) {
+        e.preventDefault();
+        onMultiboxRef.current?.();
         return;
       }
 
@@ -899,7 +943,7 @@ export function GameCanvas({
 
   const handleKeyUp = useCallback((e: KeyboardEvent) => {
     const p = prefsRef.current;
-    if (p.keyEject && e.code === p.keyEject) {
+    if (p.keyEject && !isMouseBind(p.keyEject) && e.code === p.keyEject) {
       ejectKeyDownRef.current = false;
     }
   }, []);
@@ -917,28 +961,56 @@ export function GameCanvas({
 
   const [lmbDown, setLmbDown] = useState(false);
   const lmbDownRef = useRef(false);
+  const [mouseEjectHeld, setMouseEjectHeld] = useState(false);
 
   useEffect(() => {
-    const up = () => {
-      lmbDownRef.current = false;
-      setLmbDown(false);
+    const up = (e: MouseEvent) => {
+      if (e.button === 0) {
+        lmbDownRef.current = false;
+        setLmbDown(false);
+      }
+      if (ejectMouseBtnRef.current !== null && e.button === ejectMouseBtnRef.current) {
+        ejectMouseBtnRef.current = null;
+        setMouseEjectHeld(false);
+      }
     };
     window.addEventListener('mouseup', up);
     return () => window.removeEventListener('mouseup', up);
   }, []);
 
+  // Prevent browser context menu when RMB is a gameplay bind
+  useEffect(() => {
+    const onCtx = (e: MouseEvent) => {
+      if (inputBlockedRef.current || isSpectatingRef.current || !gameplayKeysEnabledRef.current) {
+        return;
+      }
+      const p = prefsRef.current;
+      const usesRmb =
+        parseMouseButton(p.keySplit) === 2 ||
+        parseMouseButton(p.keyEject || '') === 2 ||
+        parseMouseButton(p.keyFreeze) === 2;
+      if (usesRmb) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener('contextmenu', onCtx);
+    return () => window.removeEventListener('contextmenu', onCtx);
+  }, []);
+
   useEffect(() => {
     if (isSpectating || inputBlocked) return;
-    if (!ejectKeyDownRef.current && !lmbDown) return;
+    if (!ejectKeyDownRef.current && !lmbDown && !mouseEjectHeld) return;
 
     onEject();
 
     const interval = setInterval(() => {
-      if (ejectKeyDownRef.current || lmbDownRef.current) onEject();
+      if (ejectKeyDownRef.current || lmbDownRef.current || ejectMouseBtnRef.current !== null) {
+        onEject();
+      }
     }, 100);
 
     return () => clearInterval(interval);
-  }, [lmbDown, onEject, isSpectating, inputBlocked]);
+  }, [lmbDown, mouseEjectHeld, onEject, isSpectating, inputBlocked]);
 
   return (
     <>
@@ -946,8 +1018,8 @@ export function GameCanvas({
         ref={canvasRef}
         onMouseMove={handleMouseMove}
         onMouseDown={(e) => {
-          if (e.button !== 0) return;
           if (isSpectatingRef.current) {
+            if (e.button !== 0) return;
             const canvas = canvasRef.current;
             if (!canvas) return;
             const rect = canvas.getBoundingClientRect();
@@ -961,10 +1033,41 @@ export function GameCanvas({
             onSpectateMoveRef.current?.(wx, wy);
             return;
           }
-          if (inputBlockedRef.current) return;
-          lmbDownRef.current = true;
-          setLmbDown(true);
-          onEject();
+          if (inputBlockedRef.current || !gameplayKeysEnabledRef.current) return;
+
+          const p = prefsRef.current;
+          const code = mouseButtonCode(e.button);
+
+          if (code === p.keySplit) {
+            e.preventDefault();
+            onSplit();
+            return;
+          }
+          if (code === p.keyFreeze) {
+            e.preventDefault();
+            onFreezeRef.current?.();
+            return;
+          }
+
+          // Explicit mouse eject bind (including Mouse0)
+          if (p.keyEject && code === p.keyEject) {
+            e.preventDefault();
+            ejectMouseBtnRef.current = e.button;
+            setMouseEjectHeld(true);
+            if (e.button === 0) {
+              lmbDownRef.current = true;
+              setLmbDown(true);
+            }
+            onEject();
+            return;
+          }
+
+          // Default LMB eject (always available unless LMB is bound to split/freeze)
+          if (e.button === 0) {
+            lmbDownRef.current = true;
+            setLmbDown(true);
+            onEject();
+          }
         }}
         onMouseUp={() => {
           lastSpectateDragRef.current = null;
@@ -972,6 +1075,8 @@ export function GameCanvas({
         onMouseLeave={() => {
           lmbDownRef.current = false;
           setLmbDown(false);
+          ejectMouseBtnRef.current = null;
+          setMouseEjectHeld(false);
           lastSpectateDragRef.current = null;
         }}
         className="block cursor-crosshair"

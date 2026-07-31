@@ -31,6 +31,8 @@ export interface Player {
   lastEject: number;
   /** When true, cells stay put (ignore mouse target) */
   frozen?: boolean;
+  /** Equipped skin id (filename), synced over network */
+  skin?: string;
 }
 
 export interface Food {

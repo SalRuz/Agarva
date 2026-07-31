@@ -17,14 +17,25 @@ export type MultiplayerStatus = 'connecting' | 'connected' | 'disconnected' | 'e
 
 export interface MultiplayerCallbacks {
   onWelcome?: (id: string, world: { w: number; h: number }, isAdmin?: boolean) => void;
-  onState?: (state: GameState, you: Player | undefined, leaderboard: StateMessage['leaderboard']) => void;
+  onState?: (
+    state: GameState,
+    you: Player | undefined,
+    leaderboard: LeaderboardEntry[],
+    ownedIds?: string[]
+  ) => void;
   onDied?: () => void;
   onError?: (message: string) => void;
   onStatus?: (status: MultiplayerStatus) => void;
   onWorld?: (w: number, h: number) => void;
   onAdminStatus?: (ok: boolean) => void;
   onChat?: (msg: ChatBroadcastMessage) => void;
-  onSettings?: (settings: GameplayConfig) => void;
+  onSettings?: (settings: GameplayConfig, mode?: 'classic' | 'soloFight') => void;
+  onSoloFightHud?: (hud: {
+    phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+    countdown: number;
+    a: { name: string; score: number };
+    b: { name: string; score: number };
+  }) => void;
 }
 
 interface Snap {
@@ -32,9 +43,10 @@ interface Snap {
   state: GameState;
   you: Player | undefined;
   leaderboard: LeaderboardEntry[];
+  ownedIds: string[];
 }
 
-function netPlayerToPlayer(np: NetPlayer): Player {
+function netPlayerToPlayer(np: NetPlayer, skinCache: Map<string, string>): Player {
   const cells: Cell[] = np.cells.map((c) => ({
     id: c.id,
     x: c.x,
@@ -50,6 +62,12 @@ function netPlayerToPlayer(np: NetPlayer): Player {
     splitMaxSpeed: 0,
   }));
 
+  if (np.skin !== undefined) {
+    if (np.skin) skinCache.set(np.id, np.skin);
+    else skinCache.delete(np.id);
+  }
+  const skin = np.skin !== undefined ? np.skin || undefined : skinCache.get(np.id);
+
   return {
     id: np.id,
     name: np.name,
@@ -62,6 +80,7 @@ function netPlayerToPlayer(np: NetPlayer): Player {
     lastSplit: 0,
     lastEject: 0,
     frozen: np.fr === 1,
+    skin,
   };
 }
 
@@ -93,6 +112,7 @@ function lerpPlayers(from: GameState, to: GameState, t: number): Player[] {
       ...tp,
       cells,
       frozen: tp.frozen ?? fp?.frozen,
+      skin: tp.skin ?? fp?.skin,
       targetX: cells[0]?.x ?? tp.targetX,
       targetY: cells[0]?.y ?? tp.targetY,
     };
@@ -208,6 +228,7 @@ export class MultiplayerClient {
   private playerId: string | null = null;
   private name: string;
   private password: string | undefined;
+  private skin: string | undefined;
   private snapPrev: Snap | null = null;
   private snapCurr: Snap | null = null;
   private worldW = WORLD_WIDTH;
@@ -217,21 +238,60 @@ export class MultiplayerClient {
   /** Render ~half a tick behind latest snap so we can interpolate smoothly */
   private interpDelayMs = 35;
   private config: GameplayConfig = defaultGameplayConfig;
+  private lastInputSentAt = 0;
+  private lastInputMx = Number.NaN;
+  private lastInputMy = Number.NaN;
+  /** Cap upload: ~tick rate, skip tiny cursor jitter */
+  private static readonly INPUT_MIN_INTERVAL_MS = 33;
+  private static readonly INPUT_MIN_DELTA = 2;
   private spectateOnly = false;
+  private ownedIds: string[] = [];
+  private roomMode: 'classic' | 'soloFight' = 'classic';
+  /** Retain skins when server omits unchanged skin fields */
+  private skinCache = new Map<string, string>();
+  private lastLeaderboard: LeaderboardEntry[] = [];
 
-  constructor(name: string, callbacks: MultiplayerCallbacks = {}, password?: string) {
+  constructor(name: string, callbacks: MultiplayerCallbacks = {}, password?: string, skin?: string) {
     this.name = name;
     this.callbacks = callbacks;
     this.password = password;
+    this.skin = skin;
+  }
+
+  setRoomMode(mode: 'classic' | 'soloFight') {
+    this.roomMode = mode;
+  }
+
+  getRoomMode() {
+    return this.roomMode;
   }
 
   setPassword(password: string | undefined) {
     this.password = password;
   }
 
+  setSkin(skin: string | null | undefined) {
+    this.skin = skin || undefined;
+  }
+
+  getOwnedIds() {
+    return this.ownedIds;
+  }
+
   private joinPayload(name = this.name) {
-    const msg: { type: 'join'; name: string; password?: string } = { type: 'join', name };
+    const msg: {
+      type: 'join';
+      name: string;
+      password?: string;
+      skin?: string;
+      mode: 'classic' | 'soloFight';
+    } = {
+      type: 'join',
+      name,
+      mode: this.roomMode,
+    };
     if (isAdminName(name) && this.password) msg.password = this.password;
+    if (this.skin) msg.skin = this.skin;
     return msg;
   }
 
@@ -274,8 +334,11 @@ export class MultiplayerClient {
     return interpolateStates(this.snapPrev, this.snapCurr, alpha);
   }
 
-  connect(url: string, opts?: { spectate?: boolean }) {
+  connect(url: string, opts?: { spectate?: boolean; mode?: 'classic' | 'soloFight' }) {
     this.spectateOnly = !!opts?.spectate;
+    if (opts?.mode) this.roomMode = opts.mode;
+    this.skinCache.clear();
+    this.lastLeaderboard = [];
     this.callbacks.onStatus?.('connecting');
     this.ws = new WebSocket(url);
 
@@ -283,7 +346,7 @@ export class MultiplayerClient {
       this.callbacks.onStatus?.('connected');
       this.send({ type: 'adminAuth', token: resolveAdminToken() });
       if (this.spectateOnly) {
-        this.send({ type: 'spectate' });
+        this.send({ type: 'spectate', mode: this.roomMode });
       } else {
         this.send(this.joinPayload());
       }
@@ -345,8 +408,8 @@ export class MultiplayerClient {
       createdAt: 0,
     }));
 
-    const you = msg.you ? netPlayerToPlayer(msg.you) : undefined;
-    const others = msg.players.map((p) => netPlayerToPlayer(p));
+    const you = msg.you ? netPlayerToPlayer(msg.you, this.skinCache) : undefined;
+    const others = msg.players.map((p) => netPlayerToPlayer(p, this.skinCache));
     const players = you ? [you, ...others.filter((p) => p.id !== you.id)] : others;
 
     return {
@@ -393,7 +456,15 @@ export class MultiplayerClient {
         break;
       case 'settings':
         this.config = sanitizeGameplayConfig(msg.settings);
-        this.callbacks.onSettings?.(msg.settings);
+        this.callbacks.onSettings?.(msg.settings, msg.mode);
+        break;
+      case 'soloFightHud':
+        this.callbacks.onSoloFightHud?.({
+          phase: msg.phase,
+          countdown: msg.countdown,
+          a: msg.a,
+          b: msg.b,
+        });
         break;
       case 'state': {
         const { state, you } = this.buildStateFromMsg(msg);
@@ -404,14 +475,17 @@ export class MultiplayerClient {
             this.interpDelayMs = Math.min(50, Math.max(20, gap * 0.55));
           }
         }
+        if (msg.leaderboard) this.lastLeaderboard = msg.leaderboard;
         this.snapPrev = this.snapCurr;
         this.snapCurr = {
           localT: performance.now(),
           state,
           you,
-          leaderboard: msg.leaderboard,
+          leaderboard: this.lastLeaderboard,
+          ownedIds: msg.ownedIds ?? (you ? [you.id] : []),
         };
-        this.callbacks.onState?.(state, you, msg.leaderboard);
+        this.ownedIds = this.snapCurr.ownedIds;
+        this.callbacks.onState?.(state, you, this.lastLeaderboard, this.ownedIds);
         break;
       }
       case 'died':
@@ -434,7 +508,21 @@ export class MultiplayerClient {
   }
 
   sendInput(mx: number, my: number) {
-    this.send({ type: 'input', mx, my });
+    if (!Number.isFinite(mx) || !Number.isFinite(my)) return;
+    const now = performance.now();
+    if (now - this.lastInputSentAt < MultiplayerClient.INPUT_MIN_INTERVAL_MS) return;
+    const dx = mx - this.lastInputMx;
+    const dy = my - this.lastInputMy;
+    if (
+      Number.isFinite(this.lastInputMx) &&
+      dx * dx + dy * dy < MultiplayerClient.INPUT_MIN_DELTA ** 2
+    ) {
+      return;
+    }
+    this.lastInputSentAt = now;
+    this.lastInputMx = mx;
+    this.lastInputMy = my;
+    this.send({ type: 'input', mx: Math.round(mx * 10) / 10, my: Math.round(my * 10) / 10 });
   }
 
   split() {
@@ -455,15 +543,29 @@ export class MultiplayerClient {
 
   enterSpectate() {
     this.spectateOnly = true;
-    this.send({ type: 'spectate' });
+    this.send({ type: 'spectate', mode: this.roomMode });
   }
 
-  rename(name: string, password?: string) {
+  rename(name: string, password?: string, skin?: string | null) {
     this.name = name;
     if (password !== undefined) this.password = password;
-    const msg: { type: 'rename'; name: string; password?: string } = { type: 'rename', name };
+    if (skin !== undefined) this.skin = skin || undefined;
+    const msg: { type: 'rename'; name: string; password?: string; skin?: string } = {
+      type: 'rename',
+      name,
+    };
     if (isAdminName(name) && this.password) msg.password = this.password;
+    if (this.skin) msg.skin = this.skin;
+    else if (skin === null || skin === '') msg.skin = '';
     this.send(msg);
+  }
+
+  multiboxSpawn() {
+    this.send({ type: 'multiboxSpawn' });
+  }
+
+  multiboxSwitch() {
+    this.send({ type: 'multiboxSwitch' });
   }
 
   sendChat(text: string) {
@@ -533,5 +635,6 @@ export class MultiplayerClient {
     this.playerId = null;
     this.isAdmin = false;
     this.spectateOnly = false;
+    this.ownedIds = [];
   }
 }

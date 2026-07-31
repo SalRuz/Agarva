@@ -41,6 +41,8 @@ export function getSectorLabelAt(x: number, y: number, worldW: number, worldH: n
  * Entity draw/sync FOV: same reach as old "1 sector + 70% neighbors",
  * but as a circle that follows the player (not grid-locked).
  * Default mult 1.2 ≈ sectorSize × (0.5 + 0.7).
+ * Sector contribution is capped so large maps (20k+) don't explode
+ * bandwidth/CPU while keeping ~classic 15k FOV feel.
  */
 export function getEntityViewRadius(
   worldW: number,
@@ -48,7 +50,8 @@ export function getEntityViewRadius(
   mult: number = 1.2
 ): number {
   const { sw, sh } = getSectorSize(worldW, worldH);
-  return Math.max(sw, sh) * Math.max(0.05, mult);
+  const sector = Math.min(Math.max(sw, sh), 3200);
+  return sector * Math.max(0.05, mult);
 }
 
 export function isWithinViewRadius(

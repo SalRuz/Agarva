@@ -49,7 +49,10 @@ const SECTIONS: SectionDef[] = [
   {
     title: 'Деление и слияние',
     fields: [
-      { key: 'splitBoost', label: 'Сила деления', help: 'Начальная скорость разлёта после пробела.', step: 0.1 },
+      { key: 'splitBoost', label: 'Сила деления', help: 'Базовая начальная скорость разлёта после пробела.', step: 0.1 },
+      { key: 'splitLaunchSharpness', label: 'Резкость вылета (общая)', help: 'Множитель резкости/плавности вылета частей (1 = по умолчанию; >1 резче и быстрее старт, <1 мягче).', step: 0.05 },
+      { key: 'splitLaunchSharpnessSmall', label: 'Резкость мелких частей', help: 'Доп. множитель для более мелких осколков при делении.', step: 0.05 },
+      { key: 'splitLaunchSharpnessLarge', label: 'Резкость крупных частей', help: 'Доп. множитель для более крупных осколков при делении.', step: 0.05 },
       { key: 'splitFriction', label: 'Трение деления', help: 'Как быстро затухает сплит-буст.', step: 0.001 },
       { key: 'splitSpawnOffset', label: 'Смещение новой части', help: 'На каком расстоянии новая часть появляется при делении.', step: 0.01 },
       { key: 'mergeBaseMs', label: 'База таймера слияния', help: 'Базовая часть merge-таймера в миллисекундах.', step: 100 },
@@ -90,6 +93,11 @@ const SECTIONS: SectionDef[] = [
       { key: 'virusFriction', label: 'Трение летящей колючки', help: 'Как быстро затухает скорость летящей колючки.', step: 0.001 },
       { key: 'virusEjectCoverage', label: 'Порог кормления колючки', help: 'Насколько глубоко W должна войти в колючку.', step: 0.01 },
       { key: 'virusAbsorbCoverage', label: 'Порог поглощения колючки', help: 'Какая доля колючки должна войти в клетку, чтобы она поглотилась / взорвала игрока.', step: 0.01 },
+      { key: 'virusBounceFromEject', label: 'Отскок колючки от W (0/1)', help: '1 = летящая колючка отскакивает от выброшенной массы (W) в обратную сторону; 0 = выключено.', step: 1 },
+      { key: 'virusPopSharpnessSmall', label: 'Резкость мелких осколков (вирус)', help: 'Множитель скорости вылета мелких частей при взрыве об колючку.', step: 0.05 },
+      { key: 'virusPopSharpnessLarge', label: 'Резкость крупных осколков (вирус)', help: 'Множитель скорости вылета крупных частей при взрыве об колючку.', step: 0.05 },
+      { key: 'virusPopRangeSmall', label: 'Дальность мелких осколков (вирус)', help: 'Множитель дистанции разлёта мелких частей при взрыве.', step: 0.05 },
+      { key: 'virusPopRangeLarge', label: 'Дальность крупных осколков (вирус)', help: 'Множитель дистанции разлёта крупных частей при взрыве.', step: 0.05 },
     ],
   },
   {
@@ -126,14 +134,16 @@ const SECTIONS: SectionDef[] = [
       { key: 'playViewRadiusMult', label: 'FOV в игре (множитель)', help: 'Множитель радиуса видимости клеток/колючек во время игры (баз. = размер сектора).', step: 0.05 },
       { key: 'spectateViewRadiusMult', label: 'FOV в наблюдении (множитель)', help: 'Множитель радиуса видимости при spectate / после смерти.', step: 0.05 },
       { key: 'spectatePanSpeed', label: 'Скорость панорамы', help: 'Как быстро камера едет за курсором в режиме наблюдения.', step: 1 },
-      { key: 'spectateMinZoom', label: 'Мин. зум наблюдения', help: 'Минимальный zoom колёсиком в spectate (игроки ограничены ~0.4–2.2).', step: 0.01 },
-      { key: 'spectateMaxZoom', label: 'Макс. зум наблюдения', help: 'Максимальный zoom колёсиком в spectate (выше, чем у игрока).', step: 0.1 },
+      { key: 'spectateMinZoom', label: 'Мин. зум наблюдения', help: 'Минимальный zoom колёсиком в spectate (отдаление; низкое значение нужно, чтобы огромные клетки влезали в кадр). Игроки ограничены ~0.4–2.2.', step: 0.01 },
+      { key: 'spectateMaxZoom', label: 'Макс. зум наблюдения', help: 'Максимальный zoom колёсиком в spectate (приближение). По умолчанию очень высокий (~250 ≈ «безлимит»).', step: 1 },
       { key: 'cameraBaseScale', label: 'Базовый масштаб камеры', help: 'Общий множитель масштаба камеры (и в игре, и в наблюдении).', step: 0.01 },
     ],
   },
   {
     title: 'Локальная визуализация',
     fields: [
+      { key: 'nameScale', label: 'Размер ника (доля радиуса)', help: 'Размер ника относительно радиуса клетки (≈0.28 как в классике).', step: 0.01 },
+      { key: 'nameStrokeWidth', label: 'Толщина обводки ника', help: 'Толщина обводки относительно шрифта (0 = почти без обводки; 0.02 по умолчанию).', step: 0.005 },
       { key: 'visualGrowLerp', label: 'Плавность роста', help: 'Насколько быстро визуальный радиус догоняет рост массы.', step: 0.001 },
       { key: 'visualShrinkLerp', label: 'Плавность уменьшения', help: 'Насколько быстро визуальный радиус догоняет потерю массы.', step: 0.001 },
       { key: 'cameraZoomRef', label: 'Опорный зум', help: 'Базовый размер для формулы камеры.', step: 0.1 },
@@ -204,6 +214,8 @@ interface AdminSettingsPanelProps {
   sourceLabel: string;
   error?: string | null;
   saveNotice?: string | null;
+  configMode: 'classic' | 'soloFight';
+  onConfigModeChange: (mode: 'classic' | 'soloFight') => void;
   onClose: () => void;
   onChange: (key: ConfigKey, value: number) => void;
   onSave: () => void;
@@ -218,6 +230,8 @@ export function AdminSettingsPanel({
   sourceLabel,
   error,
   saveNotice,
+  configMode,
+  onConfigModeChange,
   onClose,
   onChange,
   onSave,
@@ -246,6 +260,26 @@ export function AdminSettingsPanel({
             <p className="text-sm text-slate-300 mt-1">
               Источник: {sourceLabel}. Полей: {totalFields}. Изменения применяются после `Сохранить`.
             </p>
+            <div className="flex gap-2 mt-3">
+              <button
+                type="button"
+                onClick={() => onConfigModeChange('classic')}
+                className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
+                  configMode === 'classic' ? 'bg-sky-600 text-white' : 'bg-white/10 text-white/70 hover:bg-white/15'
+                }`}
+              >
+                Классик
+              </button>
+              <button
+                type="button"
+                onClick={() => onConfigModeChange('soloFight')}
+                className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
+                  configMode === 'soloFight' ? 'bg-rose-600 text-white' : 'bg-white/10 text-white/70 hover:bg-white/15'
+                }`}
+              >
+                Соло файт
+              </button>
+            </div>
           </div>
           <button
             type="button"

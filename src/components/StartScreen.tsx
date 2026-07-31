@@ -3,13 +3,17 @@ import { resolveServerUrl } from '../net/MultiplayerClient';
 import { isAdminName } from '../../shared/physics';
 import { ADMIN_PASSWORD } from '../../shared/constants';
 
+export type PlayRoomMode = 'classic' | 'soloFight';
+
 interface StartScreenProps {
   name: string;
   onNameChange: (name: string) => void;
   password: string;
   onPasswordChange: (password: string) => void;
-  onStart: (name: string, serverUrl: string, password?: string) => void;
-  onSpectate?: () => void;
+  playMode: PlayRoomMode;
+  onPlayModeChange: (mode: PlayRoomMode) => void;
+  onStart: (name: string, serverUrl: string, password?: string, mode?: PlayRoomMode) => void;
+  onSpectate?: (mode: PlayRoomMode) => void;
   /** When true, spectate button is hidden/disabled (player is currently in a match) */
   spectateDisabled?: boolean;
   /** Escape overlay while already in a match */
@@ -29,6 +33,8 @@ export function StartScreen({
   onNameChange,
   password,
   onPasswordChange,
+  playMode,
+  onPlayModeChange,
   onStart,
   onSpectate,
   spectateDisabled = false,
@@ -57,7 +63,7 @@ export function StartScreen({
       setLocalError('Неверный пароль');
       return;
     }
-    onStart(name.trim(), resolveServerUrl(), adminName ? password : undefined);
+    onStart(name.trim(), resolveServerUrl(), adminName ? password : undefined, playMode);
   };
 
   const stopKeys = (e: React.KeyboardEvent) => {
@@ -82,13 +88,35 @@ export function StartScreen({
           </h1>
         </div>
 
-        <div className="mb-4">
-          <div className="w-full py-2 rounded-lg font-semibold text-center bg-sky-600 text-white">
+        <div className="mb-4 flex gap-2">
+          <button
+            type="button"
+            onClick={() => onPlayModeChange('classic')}
+            className={`flex-1 py-2 rounded-lg font-semibold transition-all ${
+              playMode === 'classic' ? 'bg-sky-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'
+            }`}
+          >
             Классик
-            <span className="block text-xs font-normal text-sky-100/90 mt-0.5">
-              Игроки: {roomPlayers ?? '—'} · В меню: {roomLobby ?? '—'}
-            </span>
-          </div>
+            {playMode === 'classic' && (
+              <span className="block text-xs font-normal text-sky-100/90 mt-0.5">
+                Игроки: {roomPlayers ?? '—'} · В меню: {roomLobby ?? '—'}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => onPlayModeChange('soloFight')}
+            className={`flex-1 py-2 rounded-lg font-semibold transition-all ${
+              playMode === 'soloFight' ? 'bg-rose-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'
+            }`}
+          >
+            Соло файт
+            {playMode === 'soloFight' && (
+              <span className="block text-xs font-normal text-rose-100/90 mt-0.5">
+                Бой: {roomPlayers ?? '—'} / 2 · В меню: {roomLobby ?? '—'}
+              </span>
+            )}
+          </button>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -158,7 +186,7 @@ export function StartScreen({
             {onSpectate && !spectateDisabled ? (
               <button
                 type="button"
-                onClick={onSpectate}
+                onClick={() => onSpectate(playMode)}
                 className="py-3 rounded-lg bg-white/10 border border-white/20 text-white font-bold text-sm hover:bg-white/20 transition-all"
               >
                 Наблюдать
@@ -205,12 +233,17 @@ export function StartScreen({
 }
 
 /** Lightweight WS watcher for menu room counts */
-export function useRoomStats(active: boolean): { players: number | null; lobby: number | null } {
+export function useRoomStats(
+  active: boolean,
+  mode: PlayRoomMode = 'classic'
+): { players: number | null; lobby: number | null } {
   const [players, setPlayers] = useState<number | null>(null);
   const [lobby, setLobby] = useState<number | null>(null);
 
   useEffect(() => {
     if (!active) return;
+    setPlayers(null);
+    setLobby(null);
     let ws: WebSocket | null = null;
     let closed = false;
     try {
@@ -220,7 +253,7 @@ export function useRoomStats(active: boolean): { players: number | null; lobby: 
     }
     ws.onopen = () => {
       if (closed) return;
-      ws?.send(JSON.stringify({ type: 'lobby' }));
+      ws?.send(JSON.stringify({ type: 'lobby', mode }));
     };
     ws.onmessage = (ev) => {
       try {
@@ -228,6 +261,7 @@ export function useRoomStats(active: boolean): { players: number | null; lobby: 
           type: string;
           players?: number;
           lobby?: number;
+          mode?: string;
         };
         if (msg.type === 'roomInfo') {
           setPlayers(typeof msg.players === 'number' ? msg.players : 0);
@@ -245,7 +279,7 @@ export function useRoomStats(active: boolean): { players: number | null; lobby: 
         /* ignore */
       }
     };
-  }, [active]);
+  }, [active, mode]);
 
   return { players, lobby };
 }

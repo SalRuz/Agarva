@@ -1,6 +1,7 @@
 import { useEffect, useState, type WheelEventHandler } from 'react';
 import {
   formatKeyCode,
+  mouseButtonCode,
   type HudSizeMode,
   type PlayerPrefs,
 } from '../settings/playerPrefs';
@@ -12,10 +13,28 @@ interface PlayerSettingsPanelProps {
   onClose: () => void;
 }
 
-type BindTarget = 'keySplit' | 'keyEject' | 'keyFreeze' | null;
+type BindTarget = 'keySplit' | 'keyEject' | 'keyFreeze' | 'keyMultibox' | null;
 
 export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSettingsPanelProps) {
   const [listening, setListening] = useState<BindTarget>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.code !== 'Escape') return;
+      if (listening) {
+        e.preventDefault();
+        e.stopPropagation();
+        setListening(null);
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener('keydown', onEsc, true);
+    return () => window.removeEventListener('keydown', onEsc, true);
+  }, [open, listening, onClose]);
 
   useEffect(() => {
     if (!open) setListening(null);
@@ -23,6 +42,12 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
 
   useEffect(() => {
     if (!listening) return;
+
+    const applyBind = (code: string) => {
+      onChange({ ...prefs, [listening]: code });
+      setListening(null);
+    };
+
     const onKey = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
@@ -36,11 +61,28 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
         setListening(null);
         return;
       }
-      onChange({ ...prefs, [listening]: e.code });
-      setListening(null);
+      applyBind(e.code);
     };
+
+    const onMouse = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      applyBind(mouseButtonCode(e.button));
+    };
+
+    const onContextMenu = (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('mousedown', onMouse, true);
+    window.addEventListener('contextmenu', onContextMenu, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('mousedown', onMouse, true);
+      window.removeEventListener('contextmenu', onContextMenu, true);
+    };
   }, [listening, onChange, prefs]);
 
   if (!open) return null;
@@ -104,25 +146,14 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
 
         <section className="space-y-2 mb-5">
           <h3 className="text-white font-semibold">Показывать массу</h3>
-          {(
-            [
-              ['showMassSelf', 'У себя'],
-              ['showMassOthers', 'У других игроков'],
-              ['showMassBots', 'У ботов'],
-            ] as const
-          ).map(([key, label]) => (
-            <label
-              key={key}
-              className="flex items-center justify-between rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white text-sm"
-            >
-              <span>{label}</span>
-              <input
-                type="checkbox"
-                checked={prefs[key]}
-                onChange={(e) => toggle(key, e.target.checked)}
-              />
-            </label>
-          ))}
+          <label className="flex items-center justify-between rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white text-sm">
+            <span>Показывать массу</span>
+            <input
+              type="checkbox"
+              checked={prefs.showMass}
+              onChange={(e) => toggle('showMass', e.target.checked)}
+            />
+          </label>
         </section>
 
         <section className="space-y-2 mb-5">
@@ -164,10 +195,14 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
         </section>
 
         <section className="space-y-2">
-          <h3 className="text-white font-semibold">Клавиши</h3>
+          <h3 className="text-white font-semibold">Клавиши и мышь</h3>
+          <p className="text-xs text-slate-400 -mt-1 mb-1">
+            Можно назначить клавишу или кнопку мыши (ЛКМ / ПКМ / СКМ). Для выброса: Backspace — сброс на ЛКМ.
+          </p>
           {bindBtn('keySplit', 'Деление', prefs.keySplit)}
           {bindBtn('keyEject', 'Выброс массы', prefs.keyEject)}
           {bindBtn('keyFreeze', 'Стоп / продолжить', prefs.keyFreeze)}
+          {bindBtn('keyMultibox', 'Мультибокс', prefs.keyMultibox)}
         </section>
       </div>
     </div>

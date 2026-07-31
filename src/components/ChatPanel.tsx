@@ -16,6 +16,11 @@ interface ChatPanelProps {
   onCloseInput: () => void;
   onSend: (text: string) => void;
   onInputFocusChange?: (focused: boolean) => void;
+  /** Click nick → mention in chat */
+  onClickNick?: (name: string) => void;
+  /** Prefill draft when clicking a nick (e.g. "Name: ") */
+  mentionPrefix?: string | null;
+  onMentionConsumed?: () => void;
 }
 
 export function ChatPanel({
@@ -25,6 +30,9 @@ export function ChatPanel({
   onCloseInput,
   onSend,
   onInputFocusChange,
+  onClickNick,
+  mentionPrefix,
+  onMentionConsumed,
 }: ChatPanelProps) {
   const [draft, setDraft] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
@@ -43,6 +51,21 @@ export function ChatPanel({
     });
     return () => cancelAnimationFrame(id);
   }, [inputOpen, onInputFocusChange]);
+
+  useEffect(() => {
+    if (!mentionPrefix) return;
+    setDraft(mentionPrefix);
+    onMentionConsumed?.();
+    const id = requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      const el = inputRef.current;
+      if (el) {
+        const len = el.value.length;
+        el.setSelectionRange(len, len);
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [mentionPrefix, onMentionConsumed]);
 
   useEffect(() => {
     const el = listRef.current;
@@ -87,9 +110,15 @@ export function ChatPanel({
           )}
           {shown.map((m, i) => (
             <div key={`${m.t}-${i}`} className="text-gray-200 leading-snug break-words">
-              <span className="font-semibold" style={{ color: m.color || '#34d399' }}>
+              <button
+                type="button"
+                className="font-semibold hover:underline cursor-pointer bg-transparent border-0 p-0"
+                style={{ color: m.color || '#34d399' }}
+                onClick={() => onClickNick?.(m.name)}
+                title="Упомянуть в чате"
+              >
                 {m.name}
-              </span>
+              </button>
               <span className="text-gray-500">: </span>
               <span>{m.text}</span>
             </div>

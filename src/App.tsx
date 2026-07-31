@@ -3,7 +3,8 @@ import { GameEngine } from './engine/GameEngine';
 import { GameCanvas } from './components/GameCanvas';
 import { Leaderboard } from './components/Leaderboard';
 import { Minimap } from './components/Minimap';
-import { StartScreen, useRoomStats } from './components/StartScreen';
+import { StartScreen, useRoomStats, type PlayRoomMode } from './components/StartScreen';
+import { SoloFightHud } from './components/SoloFightHud';
 import { HUD } from './components/HUD';
 import { ChatPanel, type ChatLine } from './components/ChatPanel';
 import { AdminSettingsPanel } from './components/AdminSettingsPanel';
@@ -12,7 +13,13 @@ import { SkinPicker } from './components/SkinPicker';
 import { GameState, Player } from './types/game';
 import { MultiplayerClient, resolveServerUrl } from './net/MultiplayerClient';
 import { HUD_HZ } from '../shared/constants';
-import { cloneGameplayConfig, defaultGameplayConfig, sanitizeGameplayConfig, type GameplayConfig } from '../shared/gameConfig';
+import {
+  cloneGameplayConfig,
+  defaultGameplayConfig,
+  defaultSoloFightConfig,
+  sanitizeGameplayConfig,
+  type GameplayConfig,
+} from '../shared/gameConfig';
 import { isAdminName } from '../shared/physics';
 import { requestRemoteAdminSettings } from './net/adminSettings';
 import {
@@ -51,6 +58,14 @@ export function App() {
   const [pingMs, setPingMs] = useState<number | null>(null);
   const [gameConfig, setGameConfig] = useState<GameplayConfig>(() => cloneGameplayConfig(defaultGameplayConfig));
   const [draftConfig, setDraftConfig] = useState<GameplayConfig>(() => cloneGameplayConfig(defaultGameplayConfig));
+  const [adminConfigMode, setAdminConfigMode] = useState<PlayRoomMode>('classic');
+  const [playMode, setPlayMode] = useState<PlayRoomMode>('classic');
+  const [soloFightHud, setSoloFightHud] = useState<{
+    phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+    countdown: number;
+    a: { name: string; score: number };
+    b: { name: string; score: number };
+  } | null>(null);
   const [showAdminSettings, setShowAdminSettings] = useState(false);
   const [showPlayerSettings, setShowPlayerSettings] = useState(false);
   const [playerPrefs, setPlayerPrefs] = useState<PlayerPrefs>(() => loadPlayerPrefs());
@@ -81,6 +96,9 @@ export function App() {
   const lastAliveCenterRef = useRef<{ x: number; y: number } | null>(null);
   const spectateReturnModeRef = useRef<GameMode>('menu');
   const spectateReturnPlayerIdRef = useRef<string | null>(null);
+  const ownedIdsRef = useRef<string[]>([]);
+  const selectedSkinIdRef = useRef<string | null>(selectedSkinId);
+  const [chatMention, setChatMention] = useState<string | null>(null);
   const mpRenderRef = useRef<
     (() => { state: GameState; you: Player | undefined } | null) | null
   >(null);
@@ -88,10 +106,25 @@ export function App() {
   const adminPasswordRef = useRef<string | undefined>(undefined);
   const peakMassRef = useRef(0);
   const frozenRef = useRef(false);
+  const showAdminSettingsRef = useRef(false);
+  const adminConfigModeRef = useRef<PlayRoomMode>('classic');
+  const playModeRef = useRef<PlayRoomMode>('classic');
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    showAdminSettingsRef.current = showAdminSettings;
+  }, [showAdminSettings]);
+
+  useEffect(() => {
+    adminConfigModeRef.current = adminConfigMode;
+  }, [adminConfigMode]);
+
+  useEffect(() => {
+    playModeRef.current = playMode;
+  }, [playMode]);
 
   useEffect(() => {
     showEscapeMenuRef.current = showEscapeMenu;
@@ -108,6 +141,10 @@ export function App() {
   useEffect(() => {
     frozenRef.current = frozen;
   }, [frozen]);
+
+  useEffect(() => {
+    selectedSkinIdRef.current = selectedSkinId;
+  }, [selectedSkinId]);
 
   const startMenuEngine = useCallback(() => {
     const engine = new GameEngine({
@@ -168,13 +205,31 @@ export function App() {
         }
 
         if (modeRef.current === 'playing' && player && player.cells.length === 0) {
-          if (lastAliveCenterRef.current) {
-            spectateTargetRef.current = { ...lastAliveCenterRef.current };
+          // Multibox: switch to another owned living box before dying
+          const statePlayers = state.players;
+          const other = ownedIdsRef.current.find((id) => {
+            if (id === player.id) return false;
+            const p = statePlayers.find((x) => x.id === id);
+            return !!(p && p.cells.length > 0);
+          });
+          if (other) {
+            const next = statePlayers.find((p) => p.id === other)!;
+            // Drop the empty box
+            engine.removePlayer(player.id);
+            playerIdRef.current = next.id;
+            currentPlayerRef.current = next;
+            setCurrentPlayer(next);
+            ownedIdsRef.current = ownedIdsRef.current.filter((id) => id !== player.id);
+          } else {
+            if (lastAliveCenterRef.current) {
+              spectateTargetRef.current = { ...lastAliveCenterRef.current };
+            }
+            setLastScore(Math.floor(peakMassRef.current));
+            setMode('dead');
+            setShowEscapeMenu(false);
+            setFrozen(false);
+            ownedIdsRef.current = [];
           }
-          setLastScore(Math.floor(peakMassRef.current));
-          setMode('dead');
-          setShowEscapeMenu(false);
-          setFrozen(false);
         }
         setPingMs(null);
       } else {
@@ -282,6 +337,7 @@ export function App() {
     (opts?: { spectate?: boolean }) => ({
       onWelcome: (id: string, _world: { w: number; h: number }, adminFlag?: boolean) => {
         playerIdRef.current = opts?.spectate ? null : id;
+        if (!opts?.spectate && id) ownedIdsRef.current = [id];
         setIsConnecting(false);
         if (opts?.spectate) {
           setMode('spectating');
@@ -312,15 +368,38 @@ export function App() {
           { name: msg.name, text: msg.text, t: msg.t, color: msg.color },
         ]);
       },
-      onSettings: (settings: GameplayConfig) => {
+      onSettings: (settings: GameplayConfig, settingsMode?: PlayRoomMode) => {
         const clean = sanitizeGameplayConfig(settings);
         setGameConfig(clean);
-        setDraftConfig(clean);
+        setDraftConfig((prev) => {
+          if (
+            showAdminSettingsRef.current &&
+            settingsMode &&
+            settingsMode !== adminConfigModeRef.current
+          ) {
+            return prev;
+          }
+          return clean;
+        });
       },
-      onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[]) => {
+      onSoloFightHud: (hud: {
+        phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+        countdown: number;
+        a: { name: string; score: number };
+        b: { name: string; score: number };
+      }) => {
+        setSoloFightHud(hud);
+      },
+      onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[], ownedIds?: string[]) => {
         gameStateRef.current = state;
+        if (ownedIds && ownedIds.length > 0) {
+          ownedIdsRef.current = ownedIds;
+        } else if (you) {
+          ownedIdsRef.current = [you.id];
+        }
         if (you) {
           currentPlayerRef.current = you;
+          playerIdRef.current = you.id;
           playerNameRef.current = you.name;
           setFrozen(!!you.frozen);
           if (you.score > peakMassRef.current) {
@@ -355,6 +434,7 @@ export function App() {
         setFrozen(false);
         currentPlayerRef.current = undefined;
         setCurrentPlayer(undefined);
+        ownedIdsRef.current = [];
       },
       onError: (message: string) => {
         setConnectionError(message);
@@ -369,64 +449,81 @@ export function App() {
     []
   );
 
-  const handleStartMultiplayer = useCallback((name: string, serverUrl: string, password?: string) => {
-    setConnectionError(null);
-    setIsConnecting(true);
-    engineRef.current = null;
-    disconnectMultiplayer();
-    setShowEscapeMenu(false);
+  const handleStartMultiplayer = useCallback(
+    (name: string, serverUrl: string, password?: string, mode: PlayRoomMode = 'classic') => {
+      setConnectionError(null);
+      setIsConnecting(true);
+      engineRef.current = null;
+      disconnectMultiplayer();
+      setShowEscapeMenu(false);
+      setSoloFightHud(null);
+      setPlayMode(mode);
 
-    setSessionKind('multiplayer');
-    sessionKindRef.current = 'multiplayer';
-    serverUrlRef.current = serverUrl || resolveServerUrl();
-    playerNameRef.current = name;
-    setMenuName(name);
-    if (password) setMenuPassword(password);
-    adminPasswordRef.current = password;
-    peakMassRef.current = 0;
-    setLastScore(0);
-    setIsAdmin(false);
-    isAdminRef.current = false;
-    setChatMessages([]);
-    setFrozen(false);
+      setSessionKind('multiplayer');
+      sessionKindRef.current = 'multiplayer';
+      serverUrlRef.current = serverUrl || resolveServerUrl();
+      playerNameRef.current = name;
+      setMenuName(name);
+      if (password) setMenuPassword(password);
+      adminPasswordRef.current = password;
+      peakMassRef.current = 0;
+      setLastScore(0);
+      setIsAdmin(false);
+      isAdminRef.current = false;
+      setChatMessages([]);
+      setFrozen(false);
 
-    const client = new MultiplayerClient(name, attachMpCallbacks(), password);
-    mpRef.current = client;
-    mpRenderRef.current = () => client.getRenderState();
-    client.connect(serverUrlRef.current);
-  }, [disconnectMultiplayer, attachMpCallbacks]);
+      const client = new MultiplayerClient(
+        name,
+        attachMpCallbacks(),
+        password,
+        selectedSkinIdRef.current || undefined
+      );
+      client.setRoomMode(mode);
+      mpRef.current = client;
+      mpRenderRef.current = () => client.getRenderState();
+      client.connect(serverUrlRef.current, { mode });
+    },
+    [disconnectMultiplayer, attachMpCallbacks]
+  );
 
-  const handleSpectateClassic = useCallback(() => {
-    setConnectionError(null);
-    setIsConnecting(true);
-    engineRef.current = null;
-    disconnectMultiplayer();
-    setShowEscapeMenu(false);
-    setSessionKind('multiplayer');
-    sessionKindRef.current = 'multiplayer';
-    serverUrlRef.current = resolveServerUrl();
-    spectateReturnModeRef.current = 'menu';
-    spectateReturnPlayerIdRef.current = null;
-    setFrozen(false);
+  const handleSpectateClassic = useCallback(
+    (mode: PlayRoomMode = playMode) => {
+      setConnectionError(null);
+      setIsConnecting(true);
+      engineRef.current = null;
+      disconnectMultiplayer();
+      setShowEscapeMenu(false);
+      setSoloFightHud(null);
+      setPlayMode(mode);
+      setSessionKind('multiplayer');
+      sessionKindRef.current = 'multiplayer';
+      serverUrlRef.current = resolveServerUrl();
+      spectateReturnModeRef.current = 'menu';
+      spectateReturnPlayerIdRef.current = null;
+      setFrozen(false);
 
-    const ww = gameConfig.worldWidth;
-    const wh = gameConfig.worldHeight;
-    if (!spectateTargetRef.current) {
-      if (lastAliveCenterRef.current) {
-        spectateTargetRef.current = { ...lastAliveCenterRef.current };
-      } else {
-        spectateTargetRef.current = { x: ww / 2, y: wh / 2 };
+      const ww = mode === 'soloFight' ? defaultSoloFightConfig.worldWidth : gameConfig.worldWidth;
+      const wh = mode === 'soloFight' ? defaultSoloFightConfig.worldHeight : gameConfig.worldHeight;
+      if (!spectateTargetRef.current) {
+        if (lastAliveCenterRef.current) {
+          spectateTargetRef.current = { ...lastAliveCenterRef.current };
+        } else {
+          spectateTargetRef.current = { x: ww / 2, y: wh / 2 };
+        }
       }
-    }
 
-    const client = new MultiplayerClient(
-      playerNameRef.current || menuName || 'Spectator',
-      attachMpCallbacks({ spectate: true })
-    );
-    mpRef.current = client;
-    mpRenderRef.current = () => client.getRenderState();
-    client.connect(serverUrlRef.current, { spectate: true });
-  }, [disconnectMultiplayer, attachMpCallbacks, gameConfig.worldWidth, gameConfig.worldHeight, menuName]);
+      const client = new MultiplayerClient(
+        playerNameRef.current || menuName || 'Spectator',
+        attachMpCallbacks({ spectate: true })
+      );
+      client.setRoomMode(mode);
+      mpRef.current = client;
+      mpRenderRef.current = () => client.getRenderState();
+      client.connect(serverUrlRef.current, { spectate: true, mode });
+    },
+    [disconnectMultiplayer, attachMpCallbacks, gameConfig.worldWidth, gameConfig.worldHeight, menuName, playMode]
+  );
 
   const handleMouseMove = useCallback((x: number, y: number) => {
     if (showEscapeMenuRef.current || chatOpenRef.current) return;
@@ -573,6 +670,9 @@ export function App() {
       return;
     }
     if (!engineRef.current || !playerIdRef.current) return;
+    for (const id of ownedIdsRef.current) {
+      engineRef.current.updatePlayerName(id, trimmed);
+    }
     engineRef.current.updatePlayerName(playerIdRef.current, trimmed);
   }, []);
 
@@ -583,6 +683,7 @@ export function App() {
     if (sessionKind === 'multiplayer') {
       const client = mpRef.current;
       if (client) {
+        client.setSkin(selectedSkinIdRef.current);
         client.respawn(name);
         setMode('playing');
       } else {
@@ -593,14 +694,20 @@ export function App() {
 
     if (!engineRef.current) return;
     const state = engineRef.current.getState();
-    if (currentPlayer) {
+    for (const id of [...ownedIdsRef.current]) {
+      engineRef.current.removePlayer(id);
+    }
+    if (currentPlayer && !ownedIdsRef.current.includes(currentPlayer.id)) {
       const playerIndex = state.players.findIndex((p) => p.id === currentPlayer.id);
       if (playerIndex !== -1) {
         state.players.splice(playerIndex, 1);
       }
     }
-    const newPlayer = engineRef.current.addPlayer(name);
+    const newPlayer = engineRef.current.addPlayer(name, false, {
+      skin: selectedSkinIdRef.current || undefined,
+    });
     playerIdRef.current = newPlayer.id;
+    ownedIdsRef.current = [newPlayer.id];
     currentPlayerRef.current = newPlayer;
     setCurrentPlayer(newPlayer);
     setMode('playing');
@@ -699,7 +806,10 @@ export function App() {
     peakMassRef.current = 0;
     setChatOpen(false);
     setFrozen(false);
+    setSoloFightHud(null);
     spectateTargetRef.current = null;
+    ownedIdsRef.current = [];
+    setChatMention(null);
   }, [disconnectMultiplayer, startMenuEngine, menuName]);
 
   const handleBackToMenuRef = useRef(handleBackToMenu);
@@ -723,8 +833,16 @@ export function App() {
     setAdminSettingsError(null);
     setAdminSaveNotice(null);
     setAdminSettingsSaving(true);
+    setAdminConfigMode('classic');
     try {
-      const settings = await requestRemoteAdminSettings(resolveServerUrl(), name, 'get', undefined, password);
+      const settings = await requestRemoteAdminSettings(
+        resolveServerUrl(),
+        name,
+        'get',
+        undefined,
+        password,
+        'classic'
+      );
       const clean = sanitizeGameplayConfig(settings);
       setGameConfig(clean);
       setDraftConfig(clean);
@@ -735,6 +853,30 @@ export function App() {
     }
     setShowAdminSettings(true);
   }, []);
+
+  const handleAdminConfigModeChange = useCallback(
+    async (mode: PlayRoomMode) => {
+      setAdminConfigMode(mode);
+      setAdminSettingsSaving(true);
+      setAdminSettingsError(null);
+      try {
+        const settings = await requestRemoteAdminSettings(
+          resolveServerUrl(),
+          adminSettingsNameRef.current,
+          'get',
+          undefined,
+          adminPasswordRef.current,
+          mode
+        );
+        setDraftConfig(sanitizeGameplayConfig(settings));
+      } catch (error) {
+        setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось загрузить настройки');
+      } finally {
+        setAdminSettingsSaving(false);
+      }
+    },
+    []
+  );
 
   const handleDraftConfigChange = useCallback((key: keyof GameplayConfig, value: number) => {
     setDraftConfig((prev) => ({ ...prev, [key]: value }));
@@ -756,10 +898,10 @@ export function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'agar-settings.json';
+    link.download = adminConfigMode === 'soloFight' ? 'соло файт.json' : 'agar-settings.json';
     link.click();
     URL.revokeObjectURL(url);
-  }, [draftConfig]);
+  }, [draftConfig, adminConfigMode]);
 
   const handleSaveAdminSettings = useCallback(async () => {
     const clean = sanitizeGameplayConfig(draftConfig);
@@ -772,10 +914,13 @@ export function App() {
         adminSettingsNameRef.current,
         'update',
         clean,
-        adminPasswordRef.current
+        adminPasswordRef.current,
+        adminConfigMode
       );
       const synced = sanitizeGameplayConfig(settings);
-      setGameConfig(synced);
+      if (adminConfigMode === playMode || mode === 'menu') {
+        setGameConfig(synced);
+      }
       setDraftConfig(synced);
       setAdminSaveNotice('Сохранено. Панель остаётся открытой — можно править дальше.');
     } catch (error) {
@@ -783,13 +928,77 @@ export function App() {
     } finally {
       setAdminSettingsSaving(false);
     }
-  }, [draftConfig]);
+  }, [draftConfig, adminConfigMode, playMode, mode]);
 
   const handleSelectSkin = useCallback((skin: SkinInfo | null) => {
     const id = skin?.id ?? null;
     setSelectedSkinId(id);
     saveSelectedSkinId(id);
+    selectedSkinIdRef.current = id;
     setShowSkinPicker(false);
+    if (sessionKindRef.current === 'multiplayer' && mpRef.current) {
+      mpRef.current.setSkin(id);
+      mpRef.current.rename(playerNameRef.current, adminPasswordRef.current, id);
+    }
+    for (const oid of ownedIdsRef.current) {
+      engineRef.current?.updatePlayerSkin(oid, id || undefined);
+    }
+  }, []);
+
+  const handleMentionNick = useCallback((name: string) => {
+    if (sessionKindRef.current !== 'multiplayer') return;
+    setChatMention(`${name}: `);
+    setChatOpen(true);
+  }, []);
+
+  const handleMultibox = useCallback(() => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (modeRef.current !== 'playing') return;
+    if (playModeRef.current === 'soloFight') return; // дуэль 1v1 — без мультибокса
+    if (sessionKindRef.current === 'multiplayer') {
+      const owned = ownedIdsRef.current;
+      if (owned.length < 2) {
+        mpRef.current?.multiboxSpawn();
+      } else {
+        mpRef.current?.multiboxSwitch();
+      }
+      return;
+    }
+    // Solo: max 2 boxes
+    if (!engineRef.current || !playerIdRef.current) return;
+    const engine = engineRef.current;
+    const state = engine.getState();
+    const owned = ownedIdsRef.current.filter((id) =>
+      state.players.some((p) => p.id === id && p.cells.length > 0)
+    );
+    if (owned.length === 0 && playerIdRef.current) {
+      ownedIdsRef.current = [playerIdRef.current];
+    }
+    const liveOwned = ownedIdsRef.current.filter((id) =>
+      state.players.some((p) => p.id === id && p.cells.length > 0)
+    );
+    ownedIdsRef.current = liveOwned.length > 0 ? liveOwned : [playerIdRef.current];
+
+    if (ownedIdsRef.current.length < 2) {
+      const primary = state.players.find((p) => p.id === playerIdRef.current);
+      if (!primary || primary.cells.length === 0) return;
+      const box = engine.addPlayer(primary.name, false, {
+        color: primary.color,
+        skin: primary.skin || selectedSkinIdRef.current || undefined,
+      });
+      ownedIdsRef.current = [...ownedIdsRef.current, box.id];
+      playerIdRef.current = box.id;
+      currentPlayerRef.current = box;
+      setCurrentPlayer(box);
+      return;
+    }
+    const idx = ownedIdsRef.current.indexOf(playerIdRef.current);
+    const next = ownedIdsRef.current[(idx + 1) % ownedIdsRef.current.length];
+    const nextPlayer = state.players.find((p) => p.id === next && p.cells.length > 0);
+    if (!nextPlayer) return;
+    playerIdRef.current = nextPlayer.id;
+    currentPlayerRef.current = nextPlayer;
+    setCurrentPlayer(nextPlayer);
   }, []);
 
   const handlePlayerPrefsChange = useCallback((next: PlayerPrefs) => {
@@ -798,7 +1007,8 @@ export function App() {
   }, []);
 
   const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
-  const roomStats = useRoomStats(showMenuOverlay);
+  // Only true main menu should open lobby watcher WS (ESC overlay must not double-count as lobby)
+  const roomStats = useRoomStats(mode === 'menu', playMode);
   const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
   const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
   const hudScale = hudSizeScale(playerPrefs.hudSize);
@@ -867,6 +1077,8 @@ export function App() {
         skinUrl={selectedSkinUrl}
         prefs={playerPrefs}
         frozen={frozen && mode === 'playing'}
+        ownedIdsRef={ownedIdsRef}
+        onMultibox={handleMultibox}
       />
 
       {showMenuOverlay && (
@@ -875,6 +1087,8 @@ export function App() {
           onNameChange={setMenuName}
           password={menuPassword}
           onPasswordChange={setMenuPassword}
+          playMode={playMode}
+          onPlayModeChange={setPlayMode}
           onStart={handleStartMultiplayer}
           onSpectate={mode === 'menu' ? handleSpectateClassic : undefined}
           spectateDisabled={mode === 'playing'}
@@ -900,10 +1114,12 @@ export function App() {
       <AdminSettingsPanel
         open={showAdminSettings}
         settings={draftConfig}
-        sourceLabel="multiplayer server"
+        sourceLabel={adminConfigMode === 'soloFight' ? 'solo fight server' : 'classic server'}
         isSaving={adminSettingsSaving}
         error={adminSettingsError}
         saveNotice={adminSaveNotice}
+        configMode={adminConfigMode}
+        onConfigModeChange={handleAdminConfigModeChange}
         onClose={() => {
           setShowAdminSettings(false);
           setAdminSaveNotice(null);
@@ -929,7 +1145,15 @@ export function App() {
           }}
         >
           <div style={{ zoom: hudScale } as React.CSSProperties}>
-            <Leaderboard entries={leaderboard} currentPlayerName={currentPlayer?.name || playerNameRef.current} />
+            {playMode === 'soloFight' && soloFightHud ? (
+              <SoloFightHud {...soloFightHud} />
+            ) : (
+              <Leaderboard
+                entries={leaderboard}
+                currentPlayerName={currentPlayer?.name || playerNameRef.current}
+                onClickNick={sessionKind === 'multiplayer' ? handleMentionNick : undefined}
+              />
+            )}
           </div>
           {hudState && (
             <div style={{ zoom: hudScale } as React.CSSProperties}>
@@ -969,6 +1193,9 @@ export function App() {
             }}
             onSend={handleSendChat}
             onInputFocusChange={setChatFocused}
+            onClickNick={handleMentionNick}
+            mentionPrefix={chatMention}
+            onMentionConsumed={() => setChatMention(null)}
           />
         </div>
       )}
@@ -993,7 +1220,9 @@ export function App() {
       {mode === 'spectating' && (
         <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2 select-none">
           <div className="text-white font-bold text-lg">Режим наблюдения</div>
-          <div className="text-gray-400 text-xs">Классик · ESC — выход</div>
+          <div className="text-gray-400 text-xs">
+            {playMode === 'soloFight' ? 'Соло файт' : 'Классик'} · ESC — выход
+          </div>
         </div>
       )}
     </div>

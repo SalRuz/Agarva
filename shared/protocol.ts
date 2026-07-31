@@ -6,6 +6,10 @@ export interface JoinMessage {
   name: string;
   /** Required when joining as an admin nickname */
   password?: string;
+  /** Equipped skin id (filename), optional */
+  skin?: string;
+  /** Room mode (default classic) */
+  mode?: 'classic' | 'soloFight';
 }
 
 export interface InputMessage {
@@ -30,6 +34,7 @@ export interface FreezeMessage {
 
 export interface SpectateMessage {
   type: 'spectate';
+  mode?: 'classic' | 'soloFight';
 }
 
 export interface PingMessage {
@@ -55,11 +60,13 @@ export interface AdminIdentifyMessage {
 
 export interface AdminGetSettingsMessage {
   type: 'adminGetSettings';
+  mode?: 'classic' | 'soloFight';
 }
 
 export interface AdminUpdateSettingsMessage {
   type: 'adminUpdateSettings';
   settings: GameplayConfig;
+  mode?: 'classic' | 'soloFight';
 }
 
 export interface AdminSpawnVirusMessage {
@@ -99,6 +106,16 @@ export interface RenameMessage {
   type: 'rename';
   name: string;
   password?: string;
+  /** Equipped skin id (filename), optional */
+  skin?: string;
+}
+
+export interface MultiboxSpawnMessage {
+  type: 'multiboxSpawn';
+}
+
+export interface MultiboxSwitchMessage {
+  type: 'multiboxSwitch';
 }
 
 export interface ChatSendMessage {
@@ -108,6 +125,7 @@ export interface ChatSendMessage {
 
 export interface LobbyMessage {
   type: 'lobby';
+  mode?: 'classic' | 'soloFight';
 }
 
 export type ClientMessage =
@@ -130,6 +148,8 @@ export type ClientMessage =
   | AdminSpawnBotMessage
   | ResetStarterMessage
   | RenameMessage
+  | MultiboxSpawnMessage
+  | MultiboxSwitchMessage
   | ChatSendMessage
   | LobbyMessage;
 
@@ -156,6 +176,8 @@ export interface NetPlayer {
   cells: NetCell[];
   /** 1 = frozen in place */
   fr?: number;
+  /** Equipped skin id */
+  skin?: string;
 }
 
 export interface NetFood {
@@ -195,7 +217,10 @@ export interface StateMessage {
   food: NetFood[];
   viruses: NetVirus[];
   ejected: NetEjected[];
-  leaderboard: LeaderboardEntry[];
+  /** Omitted on some ticks — client should keep last leaderboard */
+  leaderboard?: LeaderboardEntry[];
+  /** All player ids owned by this session (multibox); active is `you` */
+  ownedIds?: string[];
 }
 
 export interface DiedMessage {
@@ -234,6 +259,7 @@ export interface ChatBroadcastMessage {
 export interface SettingsMessage {
   type: 'settings';
   settings: GameplayConfig;
+  mode?: 'classic' | 'soloFight';
 }
 
 export interface RoomInfoMessage {
@@ -242,6 +268,16 @@ export interface RoomInfoMessage {
   players: number;
   /** Connected clients in menu / spectating / dead (not actively playing) */
   lobby: number;
+  mode?: 'classic' | 'soloFight';
+}
+
+export interface SoloFightHudMessage {
+  type: 'soloFightHud';
+  phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+  /** Seconds left in countdown (ceil), or 0 */
+  countdown: number;
+  a: { name: string; score: number };
+  b: { name: string; score: number };
 }
 
 export type ServerMessage =
@@ -254,4 +290,5 @@ export type ServerMessage =
   | AdminStatusMessage
   | SettingsMessage
   | ChatBroadcastMessage
-  | RoomInfoMessage;
+  | RoomInfoMessage
+  | SoloFightHudMessage;

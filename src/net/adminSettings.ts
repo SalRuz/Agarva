@@ -1,13 +1,15 @@
 import type { GameplayConfig } from '../../shared/gameConfig';
 
 type AdminSettingsAction = 'get' | 'update';
+export type AdminSettingsMode = 'classic' | 'soloFight';
 
 export function requestRemoteAdminSettings(
   url: string,
   name: string,
   action: AdminSettingsAction,
   settings?: GameplayConfig,
-  password?: string
+  password?: string,
+  mode: AdminSettingsMode = 'classic'
 ): Promise<GameplayConfig> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
@@ -56,7 +58,9 @@ export function requestRemoteAdminSettings(
         }
         ws.send(
           JSON.stringify(
-            action === 'get' ? { type: 'adminGetSettings' } : { type: 'adminUpdateSettings', settings }
+            action === 'get'
+              ? { type: 'adminGetSettings', mode }
+              : { type: 'adminUpdateSettings', settings, mode }
           )
         );
         return;

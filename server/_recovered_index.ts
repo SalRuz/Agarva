@@ -1,19 +1,15 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { execSync } from 'node:child_process';
 import { GameEngine } from '../shared/GameEngine';
-import {
-  defaultGameplayConfig,
-  sanitizeGameplayConfig,
-  type GameplayConfig,
-} from '../shared/gameConfig';
+import { defaultGameplayConfig, sanitizeGameplayConfig, type GameplayConfig } from '../shared/gameConfig';
 import {
   DEFAULT_SERVER_PORT,
   CHAT_MAX_LENGTH,
   CHAT_RATE_LIMIT_MS,
   ADMIN_PASSWORD,
 } from '../shared/constants';
-import { getPlayerCenter, isAdminName, createFood } from '../shared/physics';
-import { getEntityViewRadius, isEntityNearView } from '../shared/sectors';
+import { getPlayerCenter, distance, isAdminName, createFood } from '../shared/physics';
+import { getEntityViewRadius, isWithinViewRadius, isEntityNearView } from '../shared/sectors';
 import type { ClientMessage, ServerMessage, NetPlayer, StateMessage } from '../shared/protocol';
 import type { Player } from '../shared/types';
 import {
@@ -52,11 +48,6 @@ interface ClientSession {
   lastName: string;
   lastColor: string;
   lastSkin: string;
-  /** Last skin id sent per player id (omit unchanged skins from packets) */
-  sentSkins: Map<string, string>;
-  /** Tick counter for throttling heavy extras */
-  tickCount: number;
-  lastSfHudKey: string;
 }
 
 function parseMode(mode?: string): RoomMode {
@@ -73,6 +64,13 @@ function clearSessionPlayers(session: ClientSession, engine: GameEngine) {
   }
   session.playerIds = [];
   session.activeIndex = 0;
+}
+
+function sanitizeSkinId(skin: unknown): string {
+  return String(skin ?? '')
+    .trim()
+    .slice(0, 64)
+    .replace(/[\\/<>\0]/g, '');
 }
 
 function checkAdminPassword(password: unknown): boolean {
@@ -106,7 +104,7 @@ function tryFreePort(port: number): boolean {
         });
         if (!/node\.exe/i.test(task)) continue;
         execSync(`taskkill /PID ${pid} /F`, { stdio: ['pipe', 'pipe', 'pipe'] });
-        console.log(`[agar-server] Freed port ${port} (old node PID ${pid})`);
+        console.log(`[agar-server] Освободил порт ${port} (старый node PID ${pid})`);
         killed = true;
       } catch {
         // ignore
@@ -120,14 +118,14 @@ function tryFreePort(port: number): boolean {
 
 function printEaddrInUseHelp(port: number) {
   console.error('');
-  console.error(`[agar-server] Error: port ${port} already in use (EADDRINUSE).`);
-  console.error('Possible causes: server already running, or leftover node process.');
+  console.error(`[agar-server] Ошибка: порт ${port} уже занят (EADDRINUSE).`);
+  console.error('Возможные причины: сервер уже запущен, или остался старый процесс node.');
   console.error('');
-  console.error('Windows - find and kill process:');
+  console.error('Windows — найти и убить процесс:');
   console.error(`  netstat -ano | findstr :${port}`);
   console.error('  taskkill /PID <pid> /F');
   console.error('');
-  console.error('Or set another port:');
+  console.error('Или задайте другой порт:');
   console.error(`  set PORT=3002 && npm run server`);
   console.error('');
 }
@@ -170,8 +168,6 @@ function startServer(attempt = 0) {
 
   function send(ws: WebSocket, msg: ServerMessage) {
     if (ws.readyState === WebSocket.OPEN) {
-      // Drop when client can't drain - prevents ping spikes from queue growth
-      if (ws.bufferedAmount > 512_000) return;
       ws.send(JSON.stringify(msg));
     }
   }
@@ -189,11 +185,7 @@ function startServer(attempt = 0) {
     }
   }
 
-  function toNetPlayer(
-    p: Player,
-    session: ClientSession,
-    cellFilter?: (c: Player['cells'][0]) => boolean
-  ): NetPlayer {
+  function toNetPlayer(p: Player, cellFilter?: (c: Player['cells'][0]) => boolean): NetPlayer {
     const cells = cellFilter ? p.cells.filter(cellFilter) : p.cells;
     const net: NetPlayer = {
       id: p.id,
@@ -209,39 +201,11 @@ function startServer(attempt = 0) {
       })),
       fr: p.frozen ? 1 : 0,
     };
-    const skin = p.skin || '';
-    const prev = session.sentSkins.get(p.id);
-    if (skin && skin !== prev) {
-      net.skin = skin;
-      session.sentSkins.set(p.id, skin);
-    } else if (!skin && prev) {
-      net.skin = '';
-      session.sentSkins.delete(p.id);
-    }
+    if (p.skin) net.skin = p.skin;
     return net;
   }
 
-  function collectInViewCapped<T extends { x: number; y: number }>(
-    items: T[],
-    cx: number,
-    cy: number,
-    viewR2: number,
-    max: number,
-    mapFn: (item: T) => unknown
-  ): unknown[] {
-    const out: unknown[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      const dx = it.x - cx;
-      const dy = it.y - cy;
-      if (dx * dx + dy * dy > viewR2) continue;
-      out.push(mapFn(it));
-      if (out.length >= max) break;
-    }
-    return out;
-  }
-
-  function buildStateFor(session: ClientSession, includeLeaderboard: boolean): StateMessage {
+  function buildStateFor(session: ClientSession): StateMessage {
     const engine = engineFor(session.room);
     const cfg = configFor(session.room);
     const state = engine.getState();
@@ -270,75 +234,64 @@ function startServer(attempt = 0) {
 
     const viewMult = playing ? cfg.playViewRadiusMult : cfg.spectateViewRadiusMult;
     const viewR = getEntityViewRadius(ww, wh, viewMult);
-    const viewR2 = viewR * viewR;
+    const inView = (x: number, y: number) => isWithinViewRadius(x, y, center.x, center.y, viewR);
     const cellInView = (x: number, y: number, r: number) =>
       isEntityNearView(x, y, r, center.x, center.y, viewR);
 
-    const food = collectInViewCapped(
-      state.food,
-      center.x,
-      center.y,
-      viewR2,
-      cfg.foodNetMax,
-      (f) => ({
+    const food = state.food
+      .filter((f) => inView(f.x, f.y))
+      .sort((a, b) => distance(center, a) - distance(center, b))
+      .slice(0, cfg.foodNetMax)
+      .map((f) => ({
         id: f.id,
         x: Math.round(f.x),
         y: Math.round(f.y),
         c: f.color,
-      })
-    ) as StateMessage['food'];
+      }));
 
-    const viruses: StateMessage['viruses'] = [];
-    for (const v of state.viruses) {
-      if (!cellInView(v.x, v.y, v.radius)) continue;
-      viruses.push({
+    const viruses = state.viruses
+      .filter((v) => cellInView(v.x, v.y, v.radius))
+      .map((v) => ({
         id: v.id,
         x: Math.round(v.x * 10) / 10,
         y: Math.round(v.y * 10) / 10,
         r: Math.round(v.radius),
         ch: v.charge,
-      });
-    }
+      }));
 
-    const ejected = collectInViewCapped(
-      state.ejectedMass,
-      center.x,
-      center.y,
-      viewR2,
-      cfg.ejectNetMax,
-      (e) => ({
+    const ejected = state.ejectedMass
+      .filter((e) => inView(e.x, e.y))
+      .sort((a, b) => distance(center, a) - distance(center, b))
+      .slice(0, cfg.ejectNetMax)
+      .map((e) => ({
         id: e.id,
         x: Math.round(e.x * 10) / 10,
         y: Math.round(e.y * 10) / 10,
         r: Math.round(e.radius * 10) / 10,
         c: e.color,
-      })
-    ) as StateMessage['ejected'];
+      }));
 
     const youId = youPlayer?.id;
     const players = state.players
       .filter((p) => p.cells.length > 0 && p.id !== youId)
       .map((p) =>
         ownedSet.has(p.id)
-          ? toNetPlayer(p, session)
-          : toNetPlayer(p, session, (c) => cellInView(c.x, c.y, c.radius))
+          ? toNetPlayer(p)
+          : toNetPlayer(p, (c) => cellInView(c.x, c.y, c.radius))
       )
       .filter((p) => p.cells.length > 0);
 
-    const msg: StateMessage = {
+    return {
       type: 'state',
       t: Date.now(),
-      you: playing ? toNetPlayer(youPlayer!, session) : null,
+      you: playing ? toNetPlayer(youPlayer!) : null,
       players,
       food,
       viruses,
       ejected,
+      leaderboard: engine.getLeaderboard(),
       ownedIds: session.playerIds.length > 0 ? [...session.playerIds] : undefined,
     };
-    if (includeLeaderboard) {
-      msg.leaderboard = engine.getLeaderboard();
-    }
-    return msg;
   }
 
   // Try to free leftover node listener once before bind
@@ -379,7 +332,12 @@ function startServer(attempt = 0) {
     }
   }
 
-  function getRoomInfo(mode: RoomMode): { type: 'roomInfo'; players: number; lobby: number; mode: RoomMode } {
+  function getRoomInfo(mode: RoomMode = 'classic'): {
+    type: 'roomInfo';
+    players: number;
+    lobby: number;
+    mode: RoomMode;
+  } {
     let players = 0;
     let lobby = 0;
     const engine = engineFor(mode);
@@ -390,17 +348,13 @@ function startServer(attempt = 0) {
         lobby += 1;
         continue;
       }
-      if (mode === 'soloFight') {
-        if (sfDuelists.includes(session) && session.joined) players += 1;
-        else lobby += 1;
-        continue;
+      if (session.joined && session.playerIds.length > 0) {
+        const alive = session.playerIds.some((id) => {
+          const p = state.players.find((x) => x.id === id);
+          return !!(p && p.cells.length > 0 && !p.isBot);
+        });
+        if (alive) players += 1;
       }
-      const alive = session.playerIds.some((id) => {
-        const p = state.players.find((x) => x.id === id);
-        return !!(p && p.cells.length > 0 && !p.isBot);
-      });
-      if (alive) players += 1;
-      else lobby += 1;
     }
     return { type: 'roomInfo', players, lobby, mode };
   }
@@ -408,6 +362,7 @@ function startServer(attempt = 0) {
   function broadcastRoomInfo() {
     for (const [ws, session] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
+      if (!session.lobbyOnly) continue;
       send(ws, getRoomInfo(session.room));
     }
   }
@@ -426,9 +381,8 @@ function startServer(attempt = 0) {
     }
   }
 
-  function awardSoloFightPoint(winnerName: string, loserName?: string) {
+  function awardSoloFightPoint(winnerName: string) {
     sfState.scores.set(winnerName, (sfState.scores.get(winnerName) ?? 0) + 1);
-    if (loserName) sfState.scores.set(loserName, 0);
     sfState.phase = 'between';
     sfState.betweenEndsAt = Date.now() + SOLO_FIGHT_BETWEEN_MS;
     freezeSfFighters(true);
@@ -451,6 +405,7 @@ function startServer(attempt = 0) {
     freezeSfFighters(true);
   }
 
+  /** Fighter died in combat — award point to surviving opponent before session clears. */
   function handleSoloFightDeath(deadSession: ClientSession) {
     if (!sfDuelists.includes(deadSession)) return;
     if (sfState.phase !== 'fighting') {
@@ -461,7 +416,7 @@ function startServer(attempt = 0) {
       (s) => s !== deadSession && s.joined && s.playerIds.length > 0
     );
     if (othersAlive.length === 1) {
-      awardSoloFightPoint(othersAlive[0].lastName, deadSession.lastName);
+      awardSoloFightPoint(othersAlive[0].lastName);
     } else if (othersAlive.length === 0) {
       sfState.phase = 'between';
       sfState.betweenEndsAt = Date.now() + SOLO_FIGHT_BETWEEN_MS;
@@ -469,6 +424,7 @@ function startServer(attempt = 0) {
     syncSfMetaFromDuelists();
   }
 
+  /** Fighter left / closed — adjust phase; clear scores if none left. */
   function handleSoloFightLeave(session: ClientSession) {
     if (!sfDuelists.includes(session)) return;
     const wasFighting = sfState.phase === 'fighting';
@@ -489,7 +445,6 @@ function startServer(attempt = 0) {
       const winner = sfDuelists[0];
       if (wasFighting && winner.joined && winner.playerIds.length > 0) {
         sfState.scores.set(winner.lastName, (sfState.scores.get(winner.lastName) ?? 0) + 1);
-        sfState.scores.set(session.lastName, 0);
       }
       sfState.phase = 'waiting';
       sfState.countdownEndsAt = 0;
@@ -580,6 +535,7 @@ function startServer(attempt = 0) {
   }
 
   function joinSoloFight(session: ClientSession, name: string, skin: string) {
+    // Capacity by registered duelists (covers between-round dead sessions)
     const openDuelists = sfDuelists.filter((s) => s.ws.readyState === WebSocket.OPEN);
     sfDuelists = openDuelists;
 
@@ -594,9 +550,9 @@ function startServer(attempt = 0) {
       session.viewY = st.worldHeight / 2;
       sendWelcome(session, `spec-${Date.now().toString(36)}`, soloFightEngine, false);
       send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
-      send(session.ws, buildStateFor(session, true));
+      send(session.ws, buildStateFor(session));
       send(session.ws, makeSoloFightHud(sfState));
-      send(session.ws, { type: 'error', message: 'Solo Fight is full - spectating' });
+      send(session.ws, { type: 'error', message: 'Solo Fight is full — spectating' });
       broadcastRoomInfo();
       return;
     }
@@ -606,9 +562,9 @@ function startServer(attempt = 0) {
     session.spectating = false;
     const st = soloFightEngine.getState();
     const spawns = soloFightSpawnPoints(st.worldWidth, st.worldHeight);
+    const slot = sfDuelists.length; // 0 or 1
 
-    if (sfDuelists.length === 0) {
-      clearSessionPlayers(session, soloFightEngine);
+    if (slot === 0) {
       const player = soloFightEngine.addPlayer(name, false, {
         x: spawns[0].x,
         y: spawns[0].y,
@@ -618,13 +574,14 @@ function startServer(attempt = 0) {
       session.playerIds = [player.id];
       session.activeIndex = 0;
       session.joined = true;
-      session.lastName = name;
       session.lastColor = player.color;
-      session.lastSkin = skin || '';
       sfDuelists = [session];
       sfState.phase = 'waiting';
+      sfState.countdownEndsAt = 0;
+      sfState.betweenEndsAt = 0;
       sfState.names = [name];
       sfState.fighterPlayerIds = [player.id];
+      // Keep scores if rematch same names; clear if fresh room was emptied
       refreshAdmin(session);
       sendWelcome(session, player.id, soloFightEngine, session.isAdmin);
       send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
@@ -633,8 +590,7 @@ function startServer(attempt = 0) {
       return;
     }
 
-    // Second fighter
-    clearSessionPlayers(session, soloFightEngine);
+    // Second fighter → countdown
     const player = soloFightEngine.addPlayer(name, false, {
       x: spawns[1].x,
       y: spawns[1].y,
@@ -644,23 +600,27 @@ function startServer(attempt = 0) {
     session.playerIds = [player.id];
     session.activeIndex = 0;
     session.joined = true;
-    session.lastName = name;
     session.lastColor = player.color;
-    session.lastSkin = skin || '';
     sfDuelists.push(session);
-    syncSfMetaFromDuelists();
+
+    // Freeze both, set names
     freezeSfFighters(true);
+    sfState.names = sfDuelists.map((s) => s.lastName);
+    // Ensure first name is current
+    sfState.names[sfDuelists.length - 1] = name;
+    sfState.names = [sfDuelists[0].lastName, name];
+    sfState.fighterPlayerIds = sfDuelists.flatMap((s) => s.playerIds);
     sfState.phase = 'countdown';
     sfState.countdownEndsAt = Date.now() + SOLO_FIGHT_COUNTDOWN_MS;
+    sfState.betweenEndsAt = 0;
+
     refreshAdmin(session);
     sendWelcome(session, player.id, soloFightEngine, session.isAdmin);
     if (session.isAdmin) {
       console.log(`[agar-server] admin online (soloFight): ${session.lastName}`);
     }
     send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
-    for (const d of sfDuelists) {
-      send(d.ws, makeSoloFightHud(sfState));
-    }
+    send(session.ws, makeSoloFightHud(sfState));
     broadcastRoomInfo();
   }
 
@@ -702,6 +662,7 @@ function startServer(attempt = 0) {
             session.activeIndex = idx >= 0 ? idx : 0;
           }
           if (session.playerIds.length === 0) {
+            // Solo Fight scoring before clearing join state
             if (session.room === 'soloFight') {
               handleSoloFightDeath(session);
             }
@@ -715,22 +676,16 @@ function startServer(attempt = 0) {
           }
         }
 
+        // Menu lobby watchers: roomInfo only (no game snapshots)
         if (session.lobbyOnly) continue;
-        session.tickCount = (session.tickCount + 1) | 0;
-        if (ws.bufferedAmount > 256_000) continue;
-        const includeLb = session.tickCount % 5 === 0;
-        send(ws, buildStateFor(session, includeLb));
+        send(ws, buildStateFor(session));
         if (session.room === 'soloFight') {
-          const hud = makeSoloFightHud(sfState);
-          const key = `${hud.phase}|${hud.countdown}|${hud.a.name}|${hud.a.score}|${hud.b.name}|${hud.b.score}`;
-          if (key !== session.lastSfHudKey || session.tickCount % 4 === 0) {
-            session.lastSfHudKey = key;
-            send(ws, hud);
-          }
+          send(ws, makeSoloFightHud(sfState));
         }
       }
 
       roomInfoAcc += getTickMs();
+      // Throttle roomInfo (~2s) — lobby UI does not need 1 Hz
       if (roomInfoAcc >= 2000) {
         roomInfoAcc = 0;
         broadcastRoomInfo();
@@ -743,10 +698,10 @@ function startServer(attempt = 0) {
     const c = classicEngine.getState();
     const s = soloFightEngine.getState();
     console.log(`[agar-server] listening on 0.0.0.0:${PORT} (ws://127.0.0.1:${PORT})`);
-    console.log(`[agar-server] behind nginx: proxy /ws -> this port (clients use wss://YOUR_DOMAIN/ws)`);
+    console.log(`[agar-server] behind nginx: proxy /ws → this port (clients use wss://YOUR_DOMAIN/ws)`);
     console.log(`[agar-server] PORT env: ${process.env.PORT || '(default ' + DEFAULT_SERVER_PORT + ')'}`);
-    console.log(`[agar-server] ADMIN nicknames: salruz (pass required)`);
-    console.log(`[agar-server] classic ${c.worldWidth}x${c.worldHeight}, soloFight ${s.worldWidth}x${s.worldHeight}`);
+    console.log(`[agar-server] ADMIN nicknames: салруз / salruz (pass required; Q, 1=TP, 2=reset, 3=virus, 4=merge, 5=kick, 6=bot)`);
+    console.log(`[agar-server] classic ${c.worldWidth}×${c.worldHeight}, soloFight ${s.worldWidth}×${s.worldHeight}`);
   });
 
   wss.on('error', (err: NodeJS.ErrnoException) => {
@@ -755,7 +710,7 @@ function startServer(attempt = 0) {
       if (attempt === 0) {
         const freed = tryFreePort(PORT);
         if (freed) {
-          console.log('[agar-server] Retrying after freeing port...');
+          console.log('[agar-server] Повторный запуск после освобождения порта…');
           setTimeout(() => startServer(1), 400);
           return;
         }
@@ -775,6 +730,7 @@ function startServer(attempt = 0) {
       joined: false,
       isAdmin: false,
       adminAuthed: false,
+      // Default: treat as lobby watcher until join/spectate — avoids sending full state to bare sockets
       lobbyOnly: true,
       spectating: false,
       room: 'classic',
@@ -784,9 +740,6 @@ function startServer(attempt = 0) {
       lastName: 'Player',
       lastColor: '#4ECDC4',
       lastSkin: '',
-      sentSkins: new Map(),
-      tickCount: 0,
-      lastSfHudKey: '',
     };
     clients.set(ws, session);
 
@@ -808,7 +761,7 @@ function startServer(attempt = 0) {
           if (isAdminName(session.lastName)) {
             session.adminAuthed = checkAdminPassword((msg as { password?: string }).password);
             if (!session.adminAuthed) {
-              send(ws, { type: 'error', message: 'Wrong password for salruz' });
+              send(ws, { type: 'error', message: 'Неверный пароль для salruz' });
               send(ws, { type: 'adminStatus', ok: false });
               break;
             }
@@ -823,14 +776,15 @@ function startServer(attempt = 0) {
           const mode = parseMode(msg.mode);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
-            clearSessionPlayers(session, soloFightEngine);
-          } else {
-            clearSessionPlayers(session, engine());
           }
+          clearSessionPlayers(session, engine());
           session.room = mode;
           session.lobbyOnly = true;
           session.spectating = false;
           session.joined = false;
+          const st = engineFor(mode).getState();
+          session.viewX = st.worldWidth / 2;
+          session.viewY = st.worldHeight / 2;
           send(ws, getRoomInfo(mode));
           break;
         }
@@ -838,15 +792,14 @@ function startServer(attempt = 0) {
           const mode = parseMode(msg.mode);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
-            clearSessionPlayers(session, soloFightEngine);
-          } else {
-            clearSessionPlayers(session, engine());
           }
+          clearSessionPlayers(session, engine());
           session.room = mode;
           session.lobbyOnly = false;
           session.spectating = true;
           session.joined = false;
-          const st = engineFor(mode).getState();
+          const eng = engineFor(mode);
+          const st = eng.getState();
           session.viewX = st.worldWidth / 2;
           session.viewY = st.worldHeight / 2;
           send(ws, {
@@ -856,7 +809,7 @@ function startServer(attempt = 0) {
             isAdmin: false,
           });
           send(ws, { type: 'settings', settings: configFor(mode), mode });
-          send(ws, buildStateFor(session, true));
+          send(ws, buildStateFor(session));
           if (mode === 'soloFight') {
             send(ws, makeSoloFightHud(sfState));
           }
@@ -867,23 +820,23 @@ function startServer(attempt = 0) {
           const mode = parseMode(msg.mode);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
-            clearSessionPlayers(session, soloFightEngine);
-          } else if (session.joined && session.playerIds.length > 0) {
-            clearSessionPlayers(session, engine());
           }
-
+          clearSessionPlayers(session, engine());
+          session.room = mode;
+          session.lobbyOnly = false;
+          session.spectating = false;
           const name = (msg.name || session.lastName || 'Player').trim().slice(0, 15) || 'Player';
           if (isAdminName(name)) {
             session.adminAuthed = checkAdminPassword(msg.password);
             if (!session.adminAuthed) {
-              send(ws, { type: 'error', message: 'Wrong password for salruz' });
+              send(ws, { type: 'error', message: 'Неверный пароль для salruz' });
               break;
             }
           } else {
             session.adminAuthed = false;
           }
           session.lastName = name;
-          const skin = String(msg.skin || '').trim();
+          const skin = sanitizeSkinId((msg as { skin?: string }).skin) || session.lastSkin;
           session.lastSkin = skin;
 
           if (mode === 'soloFight') {
@@ -891,9 +844,6 @@ function startServer(attempt = 0) {
             break;
           }
 
-          session.room = 'classic';
-          session.lobbyOnly = false;
-          session.spectating = false;
           const player = classicEngine.addPlayer(name, false, { skin: skin || undefined });
           session.playerIds = [player.id];
           session.activeIndex = 0;
@@ -909,6 +859,7 @@ function startServer(attempt = 0) {
           break;
         }
         case 'adminAuth': {
+          // Nickname + password based admin; keep message for client handshake
           refreshAdmin(session);
           send(ws, { type: 'adminStatus', ok: session.isAdmin });
           break;
@@ -960,15 +911,14 @@ function startServer(attempt = 0) {
           ) {
             restartTickLoop();
           }
-          send(ws, { type: 'settings', settings: configFor(mode), mode });
           break;
         }
         case 'adminAddMass': {
           refreshAdmin(session);
-          const id = activePlayerId(session);
-          if (!session.isAdmin || !id) return;
+          const pid = activePlayerId(session);
+          if (!session.isAdmin || !pid) return;
           const amount = Math.max(1, Math.min(5000, Number(msg.amount) || cfg().adminMassBoost));
-          engine().addMass(id, amount);
+          engine().addMass(pid, amount);
           break;
         }
         case 'adminSpawnVirus': {
@@ -979,16 +929,16 @@ function startServer(attempt = 0) {
         }
         case 'adminTeleport': {
           refreshAdmin(session);
-          const id = activePlayerId(session);
-          if (!session.isAdmin || !id) return;
-          engine().teleportPlayer(id, Number(msg.x) || 0, Number(msg.y) || 0);
+          const pid = activePlayerId(session);
+          if (!session.isAdmin || !pid) return;
+          engine().teleportPlayer(pid, Number(msg.x) || 0, Number(msg.y) || 0);
           break;
         }
         case 'adminForceMerge': {
           refreshAdmin(session);
-          const id = activePlayerId(session);
-          if (!session.isAdmin || !id) return;
-          engine().forceMergePlayer(id);
+          const pid = activePlayerId(session);
+          if (!session.isAdmin || !pid) return;
+          engine().forceMergePlayer(pid);
           break;
         }
         case 'adminKickAt': {
@@ -1007,20 +957,19 @@ function startServer(attempt = 0) {
         }
         case 'resetStarter': {
           refreshAdmin(session);
-          const id = activePlayerId(session);
-          if (!session.isAdmin || !id) return;
-          engine().resetToStarter(id);
+          const pid = activePlayerId(session);
+          if (!session.isAdmin || !pid) return;
+          engine().resetToStarter(pid);
           break;
         }
         case 'rename': {
-          const id = activePlayerId(session);
-          if (!id) return;
+          if (session.playerIds.length === 0) return;
           const name = String(msg.name || '').trim().slice(0, 15);
           if (!name) return;
           if (isAdminName(name)) {
             session.adminAuthed = checkAdminPassword(msg.password);
             if (!session.adminAuthed) {
-              send(ws, { type: 'error', message: 'Wrong password for salruz' });
+              send(ws, { type: 'error', message: 'Неверный пароль для salruz' });
               send(ws, { type: 'adminStatus', ok: false });
               break;
             }
@@ -1028,13 +977,18 @@ function startServer(attempt = 0) {
             session.adminAuthed = false;
           }
           session.lastName = name;
-          engine().updatePlayerName(id, name);
-          if (msg.skin !== undefined) {
-            const skin = String(msg.skin || '').trim();
+          const skin = sanitizeSkinId((msg as { skin?: string }).skin);
+          if (skin || (msg as { skin?: string }).skin === '') {
             session.lastSkin = skin;
-            for (const pid of session.playerIds) {
-              engine().updatePlayerSkin(pid, skin || undefined);
+          }
+          for (const id of session.playerIds) {
+            engine().updatePlayerName(id, name);
+            if ((msg as { skin?: string }).skin !== undefined) {
+              engine().updatePlayerSkin(id, session.lastSkin || undefined);
             }
+          }
+          if (session.room === 'soloFight' && sfDuelists.includes(session)) {
+            syncSfMetaFromDuelists();
           }
           refreshAdmin(session);
           send(ws, { type: 'adminStatus', ok: session.isAdmin });
@@ -1042,27 +996,39 @@ function startServer(attempt = 0) {
         }
         case 'multiboxSpawn': {
           if (session.room === 'soloFight') return;
-          if (!session.joined) return;
-          const state = engine().getState();
-          const primaryId = activePlayerId(session);
-          const primary = primaryId ? state.players.find((p) => p.id === primaryId) : undefined;
-          if (!primary || primary.cells.length === 0) return;
+          if (!session.joined || session.playerIds.length === 0) return;
           if (session.playerIds.length >= 2) return;
+          const primaryId = activePlayerId(session);
+          const primary = primaryId
+            ? engine().getState().players.find((p) => p.id === primaryId)
+            : undefined;
+          if (!primary || primary.cells.length === 0) return;
           const box = engine().addPlayer(primary.name, false, {
             color: primary.color,
             skin: primary.skin || session.lastSkin || undefined,
           });
           session.playerIds.push(box.id);
           session.activeIndex = session.playerIds.length - 1;
+          session.lastColor = box.color;
           break;
         }
         case 'multiboxSwitch': {
-          if (session.room === 'soloFight') return;
-          if (session.playerIds.length < 2) return;
-          session.activeIndex = (session.activeIndex + 1) % session.playerIds.length;
+          if (!session.joined || session.playerIds.length < 2) return;
+          const state = engine().getState();
+          const n = session.playerIds.length;
+          for (let step = 1; step <= n; step++) {
+            const next = (session.activeIndex + step) % n;
+            const id = session.playerIds[next];
+            const p = state.players.find((x) => x.id === id);
+            if (p && p.cells.length > 0) {
+              session.activeIndex = next;
+              break;
+            }
+          }
           break;
         }
         case 'chat': {
+          // Works after death too (connection kept; lastName/color remembered)
           if (!session.lastName) return;
           const now = Date.now();
           if (now - session.lastChatAt < CHAT_RATE_LIMIT_MS) return;
@@ -1089,48 +1055,38 @@ function startServer(attempt = 0) {
             session.viewX = mx;
             session.viewY = my;
           }
-          const id = activePlayerId(session);
-          if (!id) return;
-          engine().updatePlayerTarget(id, mx, my);
+          const pid = activePlayerId(session);
+          if (!pid) return;
+          engine().updatePlayerTarget(pid, mx, my);
           break;
         }
         case 'split': {
-          const id = activePlayerId(session);
-          if (!id) return;
-          if (
-            session.room === 'soloFight' &&
-            (sfState.phase === 'waiting' || sfState.phase === 'countdown')
-          ) {
-            return;
-          }
-          engine().splitPlayer(id);
+          const pid = activePlayerId(session);
+          if (!pid) return;
+          engine().splitPlayer(pid);
           break;
         }
         case 'eject': {
-          const id = activePlayerId(session);
-          if (!id) return;
-          if (
-            session.room === 'soloFight' &&
-            (sfState.phase === 'waiting' || sfState.phase === 'countdown')
-          ) {
-            return;
-          }
-          engine().ejectMass(id);
+          const pid = activePlayerId(session);
+          if (!pid) return;
+          engine().ejectMass(pid);
           break;
         }
         case 'freeze': {
-          const id = activePlayerId(session);
-          if (!id) return;
+          const pid = activePlayerId(session);
+          if (!pid) return;
+          // Solo Fight: ignore client freeze toggle during waiting/countdown (server re-freezes)
           if (
             session.room === 'soloFight' &&
             (sfState.phase === 'waiting' || sfState.phase === 'countdown')
           ) {
+            engine().setPlayerFrozen(pid, true);
             return;
           }
-          const player = engine().getState().players.find((p) => p.id === id);
+          const player = engine().getState().players.find((p) => p.id === pid);
           if (!player) return;
           const next = typeof msg.frozen === 'boolean' ? msg.frozen : !player.frozen;
-          engine().setPlayerFrozen(id, next);
+          engine().setPlayerFrozen(pid, next);
           break;
         }
         case 'ping': {
@@ -1142,19 +1098,23 @@ function startServer(attempt = 0) {
       }
     });
 
-    const cleanup = () => {
+    ws.on('close', () => {
       if (session.room === 'soloFight' && sfDuelists.includes(session)) {
         handleSoloFightLeave(session);
-        clearSessionPlayers(session, soloFightEngine);
-      } else {
-        clearSessionPlayers(session, engineFor(session.room));
       }
+      clearSessionPlayers(session, engineFor(session.room));
       clients.delete(ws);
       broadcastRoomInfo();
-    };
+    });
 
-    ws.on('close', cleanup);
-    ws.on('error', cleanup);
+    ws.on('error', () => {
+      if (session.room === 'soloFight' && sfDuelists.includes(session)) {
+        handleSoloFightLeave(session);
+      }
+      clearSessionPlayers(session, engineFor(session.room));
+      clients.delete(ws);
+      broadcastRoomInfo();
+    });
   });
 
   restartTickLoop();

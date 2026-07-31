@@ -3,9 +3,10 @@ import { HudPanel } from './HudPanel';
 interface LeaderboardProps {
   entries: { name: string; score: number; isBot: boolean }[];
   currentPlayerName?: string;
+  onClickNick?: (name: string) => void;
 }
 
-export function Leaderboard({ entries, currentPlayerName }: LeaderboardProps) {
+export function Leaderboard({ entries, currentPlayerName, onClickNick }: LeaderboardProps) {
   return (
     <div className="absolute top-4 right-4 z-30">
       <HudPanel
@@ -25,15 +26,21 @@ export function Leaderboard({ entries, currentPlayerName }: LeaderboardProps) {
                     : 'text-white'
               }`}
             >
-              <span className="flex items-center gap-2">
-                <span className="w-5 text-center font-mono">
+              <span className="flex items-center gap-2 min-w-0">
+                <span className="w-5 text-center font-mono shrink-0">
                   {index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}.`}
                 </span>
-                <span className="truncate max-w-[100px]">
+                <button
+                  type="button"
+                  className="truncate max-w-[100px] text-left bg-transparent border-0 p-0 hover:underline cursor-pointer"
+                  style={{ color: 'inherit' }}
+                  onClick={() => onClickNick?.(entry.name)}
+                  title="Упомянуть в чате"
+                >
                   {entry.isBot ? '🤖' : '👤'} {entry.name}
-                </span>
+                </button>
               </span>
-              <span className="font-mono">{entry.score}</span>
+              <span className="font-mono shrink-0">{entry.score}</span>
             </li>
           ))}
         </ul>

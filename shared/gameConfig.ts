@@ -18,6 +18,19 @@ export interface GameplayConfig {
   moveStopBase: number;
   moveStopRadiusFrac: number;
   splitBoost: number;
+  /** Global launch sharpness (1 = default; >1 sharper/faster start, <1 softer) */
+  splitLaunchSharpness: number;
+  /** Sharpness bias for smaller split pieces (multiplies global) */
+  splitLaunchSharpnessSmall: number;
+  /** Sharpness bias for larger split pieces (multiplies global) */
+  splitLaunchSharpnessLarge: number;
+  /**
+   * Nick font size as a fraction of cell radius (e.g. 0.38).
+   * Clamped per-draw so names stay readable without filling the ball.
+   */
+  nameScale: number;
+  /** Outline thickness relative to font size (e.g. 0.08 = thin). */
+  nameStrokeWidth: number;
   splitFriction: number;
   splitSpawnOffset: number;
   boostPassMult: number;
@@ -44,11 +57,21 @@ export interface GameplayConfig {
   virusMaxCharge: number;
   virusCount: number;
   virusPopSpeed: number;
+  /** Extra launch sharpness for smaller virus-pop fragments (multiplies virusPopSpeed) */
+  virusPopSharpnessSmall: number;
+  /** Extra launch sharpness for larger virus-pop fragments */
+  virusPopSharpnessLarge: number;
+  /** Spawn/spread distance mult for smaller virus-pop fragments */
+  virusPopRangeSmall: number;
+  /** Spawn/spread distance mult for larger virus-pop fragments */
+  virusPopRangeLarge: number;
   virusSplitSpeed: number;
   virusFriction: number;
   virusEjectCoverage: number;
   /** Coverage fraction required for a player cell to absorb/pop a virus */
   virusAbsorbCoverage: number;
+  /** 1 = flying virus bounces off ejected mass (W); 0 = W ignored while flying */
+  virusBounceFromEject: number;
   ejectLoss: number;
   ejectGain: number;
   ejectPickupMinMass: number;
@@ -100,8 +123,8 @@ export interface GameplayConfig {
 }
 
 export const defaultGameplayConfig: GameplayConfig = {
-  worldWidth: 15000,
-  worldHeight: 15000,
+  worldWidth: 20000,
+  worldHeight: 20000,
   initialMass: 15,
   minSplitMass: 40,
   maxCellsPerPlayer: 16,
@@ -117,6 +140,11 @@ export const defaultGameplayConfig: GameplayConfig = {
   moveStopBase: 10,
   moveStopRadiusFrac: 0.06,
   splitBoost: 57,
+  splitLaunchSharpness: 1,
+  splitLaunchSharpnessSmall: 1,
+  splitLaunchSharpnessLarge: 2.5,
+  nameScale: 0.28,
+  nameStrokeWidth: 0.02,
   splitFriction: 0.93,
   splitSpawnOffset: 1.15,
   boostPassMult: 1.25,
@@ -136,17 +164,22 @@ export const defaultGameplayConfig: GameplayConfig = {
   foodViewPerSumRadius: 5.5,
   foodViewPerMaxRadius: 4,
   foodViewMax: 9000,
-  foodNetMax: 320,
+  foodNetMax: 220,
   virusMass: 130,
   virusBonusMass: 100,
   virusMinEatMass: 130,
   virusMaxCharge: 7,
   virusCount: 64,
   virusPopSpeed: 15,
+  virusPopSharpnessSmall: 1,
+  virusPopSharpnessLarge: 100,
+  virusPopRangeSmall: 1,
+  virusPopRangeLarge: 300,
   virusSplitSpeed: 25,
   virusFriction: 0.956,
   virusEjectCoverage: 0.7,
-  virusAbsorbCoverage: 0.7,
+  virusAbsorbCoverage: 0.6,
+  virusBounceFromEject: 1,
   ejectLoss: 16,
   ejectGain: 15,
   ejectPickupMinMass: 1,
@@ -157,7 +190,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   ejectGracePeriod: 200,
   ejectFriction: 0.945,
   ejectMaxCount: 3000,
-  ejectNetMax: 140,
+  ejectNetMax: 90,
   massDecayPerSec: 0.002,
   massDecayMin: 50,
   botAiIntervalMs: 250,
@@ -172,8 +205,8 @@ export const defaultGameplayConfig: GameplayConfig = {
   cameraZoomPower: 0.4,
   cameraBaseScale: 0.9,
   spectatePanSpeed: 28,
-  spectateMinZoom: 0.35,
-  spectateMaxZoom: 40,
+  spectateMinZoom: 0.05,
+  spectateMaxZoom: 250,
   playViewRadiusMult: 1.2,
   spectateViewRadiusMult: 1.2,
   squeezeThroughEnabled: 0,
@@ -215,6 +248,11 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.moveStopBase = Math.max(0, out.moveStopBase);
   out.moveStopRadiusFrac = Math.max(0, out.moveStopRadiusFrac);
   out.splitBoost = Math.max(0, out.splitBoost);
+  out.splitLaunchSharpness = Math.max(0, out.splitLaunchSharpness);
+  out.splitLaunchSharpnessSmall = Math.max(0, out.splitLaunchSharpnessSmall);
+  out.splitLaunchSharpnessLarge = Math.max(0, out.splitLaunchSharpnessLarge);
+  out.nameScale = clampRange(out.nameScale, 0.1, 1.2);
+  out.nameStrokeWidth = clampRange(out.nameStrokeWidth, 0, 0.5);
   out.splitFriction = clampRange(out.splitFriction, 0, 0.9999);
   out.splitSpawnOffset = Math.max(0, out.splitSpawnOffset);
   out.boostPassMult = Math.max(0.1, out.boostPassMult);
@@ -241,10 +279,15 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.virusMaxCharge = Math.max(1, Math.round(out.virusMaxCharge));
   out.virusCount = Math.max(0, Math.round(out.virusCount));
   out.virusPopSpeed = Math.max(0, out.virusPopSpeed);
+  out.virusPopSharpnessSmall = Math.max(0, out.virusPopSharpnessSmall);
+  out.virusPopSharpnessLarge = Math.max(0, out.virusPopSharpnessLarge);
+  out.virusPopRangeSmall = Math.max(0, out.virusPopRangeSmall);
+  out.virusPopRangeLarge = Math.max(0, out.virusPopRangeLarge);
   out.virusSplitSpeed = Math.max(0, out.virusSplitSpeed);
   out.virusFriction = clampRange(out.virusFriction, 0, 0.9999);
   out.virusEjectCoverage = clamp01(out.virusEjectCoverage);
   out.virusAbsorbCoverage = clamp01(out.virusAbsorbCoverage);
+  out.virusBounceFromEject = out.virusBounceFromEject >= 0.5 ? 1 : 0;
   out.ejectLoss = Math.max(0.1, out.ejectLoss);
   out.ejectGain = Math.max(0.1, out.ejectGain);
   out.ejectPickupMinMass = Math.max(0, out.ejectPickupMinMass);
@@ -281,6 +324,21 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.cursorSlowdownRadiusMult = Math.max(0.2, out.cursorSlowdownRadiusMult);
   return out;
 }
+
+/** Defaults for «Соло файт» duel room (10k×10k, no bots, 5k start mass). */
+export const defaultSoloFightConfig: GameplayConfig = sanitizeGameplayConfig({
+  ...defaultGameplayConfig,
+  worldWidth: 10000,
+  worldHeight: 10000,
+  initialMass: 5000,
+  botCountMp: 0,
+  foodCountMp: 1600,
+  foodRespawnThreshold: 700,
+  foodRespawnBatch: 60,
+  virusCount: 24,
+  foodNetMax: 180,
+  ejectNetMax: 80,
+});
 
 function clamp01(value: number): number {
   return clampRange(value, 0, 1);

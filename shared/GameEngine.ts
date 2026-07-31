@@ -18,6 +18,7 @@ import {
   createFood,
   createVirus,
   splitCell,
+  getSplitLaunchSpeed,
   clamp,
   applyMass,
   getRandomBotName,
@@ -189,15 +190,28 @@ export class GameEngine {
     this.state.players.splice(idx, 1);
   }
 
-  addPlayer(name: string, isBot = false): Player {
-    const color = randomColor();
+  addPlayer(
+    name: string,
+    isBot = false,
+    opts?: { color?: string; skin?: string; x?: number; y?: number }
+  ): Player {
+    const color = opts?.color || randomColor();
     const r = getRadius(this.config.initialMass);
     let spawnX = Math.random() * this.WW;
     let spawnY = Math.random() * this.WH;
     let spawnColor = color;
     let usedEjectSpawn = false;
 
-    if (!isBot && this.state.ejectedMass.length > 0 && Math.random() < 0.5) {
+    if (
+      typeof opts?.x === 'number' &&
+      typeof opts?.y === 'number' &&
+      Number.isFinite(opts.x) &&
+      Number.isFinite(opts.y)
+    ) {
+      spawnX = clamp(opts.x, r, this.WW - r);
+      spawnY = clamp(opts.y, r, this.WH - r);
+      usedEjectSpawn = true;
+    } else if (!isBot && !opts?.color && this.state.ejectedMass.length > 0 && Math.random() < 0.5) {
       const idx = Math.floor(Math.random() * this.state.ejectedMass.length);
       const picked = this.state.ejectedMass[idx];
       if (!this.isSpawnBlocked(picked.x, picked.y, r)) {
@@ -238,11 +252,12 @@ export class GameEngine {
       color: spawnColor,
       score: Math.floor(this.config.initialMass),
       isBot,
-      targetX: this.WW / 2,
-      targetY: this.WH / 2,
+      targetX: spawnX,
+      targetY: spawnY,
       lastSplit: 0,
       lastEject: 0,
       frozen: false,
+      skin: opts?.skin || undefined,
     };
     this.markCellBirth(player.cells[0].id, Date.now(), this.config.initialMass);
     this.state.players.push(player);
@@ -311,6 +326,13 @@ export class GameEngine {
     if (player && newName.trim()) {
       player.name = newName.trim().slice(0, 15);
     }
+  }
+
+  updatePlayerSkin(playerId: string, skin: string | undefined) {
+    const player = this.state.players.find((p) => p.id === playerId);
+    if (!player) return;
+    const cleaned = skin ? String(skin).trim().slice(0, 64) : '';
+    player.skin = cleaned || undefined;
   }
 
   updatePlayerTarget(playerId: string, targetX: number, targetY: number) {
@@ -516,6 +538,7 @@ export class GameEngine {
       parent.radius * 0.65,
       newRadius * Math.max(this.config.splitSpawnOffset, 0.9)
     );
+    const launch = getSplitLaunchSpeed(halfMass, this.config);
     return {
       id: generateId(),
       x: parent.x + dirX * offset,
@@ -524,8 +547,8 @@ export class GameEngine {
       visualRadius: newRadius * 0.62,
       targetRadius: newRadius,
       color: parent.color,
-      velocityX: dirX * this.config.splitBoost,
-      velocityY: dirY * this.config.splitBoost,
+      velocityX: dirX * launch,
+      velocityY: dirY * launch,
       splitDirX: dirX,
       splitDirY: dirY,
       splitMaxSpeed: 0,
@@ -735,18 +758,26 @@ export class GameEngine {
     for (let p = 1; p < masses.length; p++) {
       const angle = (Math.PI * 2 * (p - 1)) / (masses.length - 1);
       const r = getRadius(masses[p]);
+      const isLarge = masses[p] >= masses[0] * 0.55;
+      const sharpness = isLarge
+        ? Math.max(0, this.config.virusPopSharpnessLarge)
+        : Math.max(0, this.config.virusPopSharpnessSmall);
+      const range = isLarge
+        ? Math.max(0, this.config.virusPopRangeLarge)
+        : Math.max(0, this.config.virusPopRangeSmall);
+      const launch = this.config.virusPopSpeed * 2 * sharpness;
+      const spawnDist = cell.radius * 0.35 * range;
       // Spawn from the central piece, then fly outward.
       const newCell: Cell = {
         id: generateId(),
-        x: cx,
-        y: cy,
+        x: cx + Math.cos(angle) * spawnDist,
+        y: cy + Math.sin(angle) * spawnDist,
         radius: r,
         visualRadius: r * 0.35,
         targetRadius: r,
         color: cell.color,
-        // Increase spread amount as requested.
-        velocityX: Math.cos(angle) * this.config.virusPopSpeed * 2,
-        velocityY: Math.sin(angle) * this.config.virusPopSpeed * 2,
+        velocityX: Math.cos(angle) * launch,
+        velocityY: Math.sin(angle) * launch,
         splitDirX: Math.cos(angle),
         splitDirY: Math.sin(angle),
         splitMaxSpeed: 0,
@@ -1067,43 +1098,98 @@ export class GameEngine {
       let hitVirus = false;
       for (const virus of this.state.viruses) {
         if (virusesToRemove.has(virus.id)) continue;
-        // Only feed relatively settled viruses
-        if (Math.abs(virus.velocityX) + Math.abs(virus.velocityY) > 2) continue;
 
-        // Absorb only when eject is ≥70% inside the virus (visually enters first)
-        if (coversCell(virus, mass, this.config.virusEjectCoverage)) {
-          virus.charge++;
-          this.state.ejectedMass.splice(i, 1);
-          this.previousMassPositions.delete(mass.id);
+        const virusSpeed = Math.abs(virus.velocityX) + Math.abs(virus.velocityY);
+        const flying = virusSpeed > 2;
 
-          if (virus.charge >= this.config.virusMaxCharge) {
-            virus.charge = 0;
+        // Absorb / bounce only when eject is deep enough inside the virus
+        if (!coversCell(virus, mass, this.config.virusEjectCoverage)) continue;
 
-            const moveDirX = mass.x - prevPos.x;
-            const moveDirY = mass.y - prevPos.y;
-            const moveLen = Math.sqrt(moveDirX ** 2 + moveDirY ** 2);
+        // Flying virus: bounce off W (reflect velocity away from impact)
+        if (flying) {
+          if (this.config.virusBounceFromEject < 0.5) continue;
 
-            const dirX = moveLen > 0 ? moveDirX / moveLen : mass.dirX || 0;
-            const dirY = moveLen > 0 ? moveDirY / moveLen : mass.dirY || 1;
+          const moveDirX = mass.x - prevPos.x;
+          const moveDirY = mass.y - prevPos.y;
+          const moveLen = Math.sqrt(moveDirX ** 2 + moveDirY ** 2);
+          const hitNx = moveLen > 0.01 ? moveDirX / moveLen : mass.dirX || 0;
+          const hitNy = moveLen > 0.01 ? moveDirY / moveLen : mass.dirY || 1;
 
-            const newVirus: Virus = {
-              id: generateId(),
-              x: virus.x + dirX * virus.radius * 1.2,
-              y: virus.y + dirY * virus.radius * 1.2,
-              radius: virus.radius,
-              charge: 0,
-              velocityX: dirX * this.config.virusSplitSpeed,
-              velocityY: dirY * this.config.virusSplitSpeed,
-              splitDirX: dirX,
-              splitDirY: dirY,
-              splitMaxSpeed: 0,
-            };
-            this.state.viruses.push(newVirus);
+          // Reflect current flight direction (bounce opposite way)
+          virus.velocityX = -virus.velocityX;
+          virus.velocityY = -virus.velocityY;
+          // Nudge slightly opposite to W so a near-stopped virus still deflects
+          const push = Math.max(virusSpeed * 0.15, this.config.virusSplitSpeed * 0.35);
+          virus.velocityX -= hitNx * push;
+          virus.velocityY -= hitNy * push;
+
+          const vlen = Math.sqrt(virus.velocityX ** 2 + virus.velocityY ** 2);
+          if (vlen > 0.05) {
+            virus.splitDirX = virus.velocityX / vlen;
+            virus.splitDirY = virus.velocityY / vlen;
           }
 
+          // Consuming W on bounce also charges the virus (+1)
+          virus.charge++;
+          if (virus.charge >= this.config.virusMaxCharge) {
+            virus.charge = 0;
+            const dirX = virus.splitDirX || hitNx || 0;
+            const dirY = virus.splitDirY || hitNy || 1;
+            const dlen = Math.sqrt(dirX * dirX + dirY * dirY) || 1;
+            const nx = dirX / dlen;
+            const ny = dirY / dlen;
+            this.state.viruses.push({
+              id: generateId(),
+              x: virus.x + nx * virus.radius * 1.2,
+              y: virus.y + ny * virus.radius * 1.2,
+              radius: virus.radius,
+              charge: 0,
+              velocityX: nx * this.config.virusSplitSpeed,
+              velocityY: ny * this.config.virusSplitSpeed,
+              splitDirX: nx,
+              splitDirY: ny,
+              splitMaxSpeed: 0,
+            });
+          }
+
+          this.state.ejectedMass.splice(i, 1);
+          this.previousMassPositions.delete(mass.id);
           hitVirus = true;
           break;
         }
+
+        // Settled virus: feed / charge as before
+        virus.charge++;
+        this.state.ejectedMass.splice(i, 1);
+        this.previousMassPositions.delete(mass.id);
+
+        if (virus.charge >= this.config.virusMaxCharge) {
+          virus.charge = 0;
+
+          const moveDirX = mass.x - prevPos.x;
+          const moveDirY = mass.y - prevPos.y;
+          const moveLen = Math.sqrt(moveDirX ** 2 + moveDirY ** 2);
+
+          const dirX = moveLen > 0 ? moveDirX / moveLen : mass.dirX || 0;
+          const dirY = moveLen > 0 ? moveDirY / moveLen : mass.dirY || 1;
+
+          const newVirus: Virus = {
+            id: generateId(),
+            x: virus.x + dirX * virus.radius * 1.2,
+            y: virus.y + dirY * virus.radius * 1.2,
+            radius: virus.radius,
+            charge: 0,
+            velocityX: dirX * this.config.virusSplitSpeed,
+            velocityY: dirY * this.config.virusSplitSpeed,
+            splitDirX: dirX,
+            splitDirY: dirY,
+            splitMaxSpeed: 0,
+          };
+          this.state.viruses.push(newVirus);
+        }
+
+        hitVirus = true;
+        break;
       }
 
       if (hitVirus) continue;

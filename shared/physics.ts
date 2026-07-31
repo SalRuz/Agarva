@@ -367,6 +367,20 @@ export function createBotBehavior(config: GameplayConfig = defaultGameplayConfig
  * Split without teleport — slight offset + impulse toward cursor.
  * Min mass 40 → two cells of 20.
  */
+export function getSplitLaunchSpeed(
+  pieceMass: number,
+  config: GameplayConfig = defaultGameplayConfig
+): number {
+  const global = Math.max(0, config.splitLaunchSharpness);
+  const small = Math.max(0, config.splitLaunchSharpnessSmall);
+  const large = Math.max(0, config.splitLaunchSharpnessLarge);
+  const minM = Math.max(1, config.minSplitMass * 0.5);
+  const maxM = Math.max(minM + 1, config.maxCellMass);
+  const t = Math.max(0, Math.min(1, (pieceMass - minM) / (maxM - minM)));
+  const sizeBias = small * (1 - t) + large * t;
+  return config.splitBoost * global * sizeBias;
+}
+
 export function splitCell(
   cell: Cell,
   targetX: number,
@@ -383,6 +397,7 @@ export function splitCell(
   const dirY = Math.sin(angle);
   // Spawn far enough ahead so chain-splits form a line instead of nesting
   const offset = Math.max(oldRadius * 0.65, newRadius * Math.max(config.splitSpawnOffset, 0.9));
+  const launch = getSplitLaunchSpeed(halfMass, config);
 
   cell.radius = newRadius;
   cell.targetRadius = newRadius;
@@ -396,8 +411,8 @@ export function splitCell(
     visualRadius: newRadius * 0.62,
     targetRadius: newRadius,
     color: cell.color,
-    velocityX: dirX * config.splitBoost,
-    velocityY: dirY * config.splitBoost,
+    velocityX: dirX * launch,
+    velocityY: dirY * launch,
     splitDirX: dirX,
     splitDirY: dirY,
     splitMaxSpeed: 0
