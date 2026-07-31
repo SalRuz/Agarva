@@ -62,6 +62,7 @@ interface GameCanvasProps {
   /** Player ids owned by local session (multibox) */
   ownedIdsRef?: MutableRefObject<string[]>;
   onMultibox?: () => void;
+  onSendCoords?: () => void;
 }
 
 export function GameCanvas({
@@ -96,6 +97,7 @@ export function GameCanvas({
   frozen = false,
   ownedIdsRef,
   onMultibox,
+  onSendCoords,
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef({
@@ -134,6 +136,7 @@ export function GameCanvas({
   /** Cache remote skins by id for other players */
   const skinCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const onMultiboxRef = useRef(onMultibox);
+  const onSendCoordsRef = useRef(onSendCoords);
   const lastSpectateDragRef = useRef<{ x: number; y: number } | null>(null);
   const cellVisualsRef = useRef(
     new Map<
@@ -217,7 +220,8 @@ export function GameCanvas({
 
   useEffect(() => {
     onMultiboxRef.current = onMultibox;
-  }, [onMultibox]);
+    onSendCoordsRef.current = onSendCoords;
+  }, [onMultibox, onSendCoords]);
 
   // Leaving spectate: reset wheel zoom so gameplay isn't stuck at ultra-zoom
   useEffect(() => {
@@ -678,7 +682,10 @@ export function GameCanvas({
         ctx.fillStyle = cell.color;
         ctx.fill();
 
-        const skinImg = getSkinImage(skinId, isCurrentPlayer);
+        // Under a split-heavy crowd, clipping/drawing every remote skin costs
+        // more than the circles themselves. Keep the local skin and restore all
+        // remote skins as soon as the scene is lighter.
+        const skinImg = (!heavyScene || isCurrentPlayer) ? getSkinImage(skinId, isCurrentPlayer) : null;
         if (skinImg && r > 8) {
           ctx.save();
           ctx.beginPath();
@@ -697,7 +704,7 @@ export function GameCanvas({
 
         // Nickname centered in cell; mass sits under the name (not shared center)
         const textMinR = 8;
-        if (r > textMinR) {
+        if (r > textMinR && (!heavyScene || isCurrentPlayer || r >= 18)) {
           const showMass = prefs.showMass;
           const nameScale = Math.max(0.15, Math.min(0.55, cfg.nameScale || 0.28));
           const strokeFrac = Math.max(0, cfg.nameStrokeWidth ?? 0.02);
@@ -719,7 +726,7 @@ export function GameCanvas({
             ctx.strokeText(playerName, x, y);
           }
           ctx.fillText(playerName, x, y);
-          if (showMass && r > 14) {
+          if (showMass && r > 14 && (!heavyScene || isCurrentPlayer || r >= 30)) {
             const mass = Math.floor(getMass(cell.radius));
             const massFont = Math.max(8, Math.round(fontSize * 0.72));
             const massY = y + fontSize * 0.72;
@@ -746,9 +753,9 @@ export function GameCanvas({
       }
       // Keep aiming at the screen cursor even if the mouse isn't moving
       // (otherwise world target is fixed and the cell stops under it).
+      // Aim continues while chat is open — inputBlocked only gates keys/clicks.
       if (
         !isSpectatingRef.current &&
-        !inputBlockedRef.current &&
         !isPausedRef.current &&
         mouseScreenRef.current.valid
       ) {
@@ -907,6 +914,16 @@ export function GameCanvas({
       ) {
         e.preventDefault();
         onMultiboxRef.current?.();
+        return;
+      }
+
+      if (
+        gameplayKeysEnabledRef.current &&
+        !isMouseBind(p.keyCoords) &&
+        e.code === p.keyCoords
+      ) {
+        e.preventDefault();
+        onSendCoordsRef.current?.();
         return;
       }
 

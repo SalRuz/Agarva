@@ -19,8 +19,14 @@ const SECTIONS: SectionDef[] = [
   {
     title: 'Мир и сервер',
     fields: [
-      { key: 'worldWidth', label: 'Ширина карты', help: 'Физическая ширина мира.', step: 100 },
-      { key: 'worldHeight', label: 'Высота карты', help: 'Физическая высота мира.', step: 100 },
+      { key: 'worldWidth', label: 'Ширина карты', help: 'Физическая ширина мира (классик).', step: 100 },
+      { key: 'worldHeight', label: 'Высота карты', help: 'Физическая высота мира (классик).', step: 100 },
+      {
+        key: 'soloFightWorldSize',
+        label: 'Масштаб карты соло файта',
+        help: 'Сторона квадратной карты режима «Соло файт» (физика как в классике).',
+        step: 100,
+      },
       { key: 'serverTickHz', label: 'Tick rate сервера', help: 'Частота обновления сервера в секунду.', step: 1 },
       { key: 'foodNetMax', label: 'Лимит еды в снапшоте', help: 'Сколько кусочков еды максимум отправлять клиенту.', step: 1 },
       { key: 'ejectNetMax', label: 'Лимит W в снапшоте', help: 'Сколько W максимум отправлять клиенту.', step: 1 },
@@ -53,6 +59,8 @@ const SECTIONS: SectionDef[] = [
       { key: 'splitLaunchSharpness', label: 'Резкость вылета (общая)', help: 'Множитель резкости/плавности вылета частей (1 = по умолчанию; >1 резче и быстрее старт, <1 мягче).', step: 0.05 },
       { key: 'splitLaunchSharpnessSmall', label: 'Резкость мелких частей', help: 'Доп. множитель для более мелких осколков при делении.', step: 0.05 },
       { key: 'splitLaunchSharpnessLarge', label: 'Резкость крупных частей', help: 'Доп. множитель для более крупных осколков при делении.', step: 0.05 },
+      { key: 'centerCursorSplitChainEnabled', label: 'Цепь при курсоре в центре (0/1)', help: '1 = пробел при курсоре в центре сохраняет одно направление и строит цепь; 0 = прежнее раздельное направление частей.', step: 1 },
+      { key: 'splitInheritVelocityEnabled', label: 'Наследование скорости при сплите (0/1)', help: '1 = новая часть получает скорость родителя плюс импульс; 0 = только новый импульс, как в старой физике.', step: 1 },
       { key: 'splitFriction', label: 'Трение деления', help: 'Как быстро затухает сплит-буст.', step: 0.001 },
       { key: 'splitSpawnOffset', label: 'Смещение новой части', help: 'На каком расстоянии новая часть появляется при делении.', step: 0.01 },
       { key: 'mergeBaseMs', label: 'База таймера слияния', help: 'Базовая часть merge-таймера в миллисекундах.', step: 100 },
@@ -214,8 +222,6 @@ interface AdminSettingsPanelProps {
   sourceLabel: string;
   error?: string | null;
   saveNotice?: string | null;
-  configMode: 'classic' | 'soloFight';
-  onConfigModeChange: (mode: 'classic' | 'soloFight') => void;
   onClose: () => void;
   onChange: (key: ConfigKey, value: number) => void;
   onSave: () => void;
@@ -230,8 +236,6 @@ export function AdminSettingsPanel({
   sourceLabel,
   error,
   saveNotice,
-  configMode,
-  onConfigModeChange,
   onClose,
   onChange,
   onSave,
@@ -259,27 +263,8 @@ export function AdminSettingsPanel({
             <h2 className="text-3xl font-bold text-white">Админские настройки</h2>
             <p className="text-sm text-slate-300 mt-1">
               Источник: {sourceLabel}. Полей: {totalFields}. Изменения применяются после `Сохранить`.
+              Физика «Соло файт» всегда совпадает с классиком; отдельно задаётся только масштаб карты режима.
             </p>
-            <div className="flex gap-2 mt-3">
-              <button
-                type="button"
-                onClick={() => onConfigModeChange('classic')}
-                className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
-                  configMode === 'classic' ? 'bg-sky-600 text-white' : 'bg-white/10 text-white/70 hover:bg-white/15'
-                }`}
-              >
-                Классик
-              </button>
-              <button
-                type="button"
-                onClick={() => onConfigModeChange('soloFight')}
-                className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
-                  configMode === 'soloFight' ? 'bg-rose-600 text-white' : 'bg-white/10 text-white/70 hover:bg-white/15'
-                }`}
-              >
-                Соло файт
-              </button>
-            </div>
           </div>
           <button
             type="button"

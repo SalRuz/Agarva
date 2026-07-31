@@ -4,6 +4,8 @@ import { GameEngine } from '../shared/GameEngine';
 import {
   defaultGameplayConfig,
   sanitizeGameplayConfig,
+  syncSoloFightFromClassic,
+  SOLO_FIGHT_START_MASS,
   type GameplayConfig,
 } from '../shared/gameConfig';
 import {
@@ -12,22 +14,43 @@ import {
   CHAT_RATE_LIMIT_MS,
   ADMIN_PASSWORD,
 } from '../shared/constants';
-import { getPlayerCenter, isAdminName, createFood } from '../shared/physics';
+import { getPlayerCenter, isAdminName, createFood, getTotalMass } from '../shared/physics';
 import { getEntityViewRadius, isEntityNearView } from '../shared/sectors';
 import type { ClientMessage, ServerMessage, NetPlayer, StateMessage } from '../shared/protocol';
+import type { FightTeam } from '../shared/protocol';
 import type { Player } from '../shared/types';
 import {
   type RoomMode,
   createSoloFightEngine,
   createEmptySoloFightState,
   makeSoloFightHud,
+  makeSoloFightTop,
   soloFightSpawnPoints,
   SOLO_FIGHT_COUNTDOWN_MS,
-  SOLO_FIGHT_BETWEEN_MS,
+  SOLO_FIGHT_RESET_MS,
+  SOLO_FIGHT_DURATION_MS,
+  isSoloFightJoinBlocked,
   type SoloFightState,
 } from './soloFight';
+import {
+  type TeamFightMode,
+  type TeamFightState,
+  createEmptyTeamFightState,
+  createTeamFightEngine,
+  makeTeamFightHud,
+  makeTeamFightTop,
+  syncTeamFightFromClassic,
+  teamFightSpawnPoint,
+  teamSizeFor,
+  TEAM_FIGHT_COUNTDOWN_MS,
+  TEAM_FIGHT_DURATION_MS,
+  TEAM_FIGHT_RESET_MS,
+  TEAM_FIGHT_START_MASS,
+} from './teamFight';
 
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
+/** Physics remains at 30 Hz; state snapshots use 20 Hz (2 out of 3 ticks). */
+const STATE_SEND_MODULO = 3;
 
 interface ClientSession {
   ws: WebSocket;
@@ -45,6 +68,7 @@ interface ClientSession {
   spectating: boolean;
   /** Which engine/room this session belongs to */
   room: RoomMode;
+  team?: FightTeam;
   /** View center for FOV when not controlling a live player */
   viewX: number;
   viewY: number;
@@ -60,7 +84,7 @@ interface ClientSession {
 }
 
 function parseMode(mode?: string): RoomMode {
-  return mode === 'soloFight' ? 'soloFight' : 'classic';
+  return mode === 'soloFight' || mode === 'duoFight' || mode === 'trioFight' ? mode : 'classic';
 }
 
 function activePlayerId(session: ClientSession): string | null {
@@ -151,21 +175,40 @@ function startServer(attempt = 0) {
     config: classicConfig,
   });
 
-  const sfCreated = createSoloFightEngine();
+  const sfCreated = createSoloFightEngine(syncSoloFightFromClassic(classicConfig));
   let soloFightConfig: GameplayConfig = sfCreated.config;
   const soloFightEngine = sfCreated.engine;
   const sfState: SoloFightState = createEmptySoloFightState();
   /** Registered duelists (kept through death until leave / both gone) */
   let sfDuelists: ClientSession[] = [];
+  /** Guard against re-entrant match end (death + timeout same tick) */
+  let sfMatchEnding = false;
+  const duoCreated = createTeamFightEngine(syncTeamFightFromClassic(classicConfig));
+  const trioCreated = createTeamFightEngine(syncTeamFightFromClassic(classicConfig));
+  let duoFightConfig = duoCreated.config;
+  let trioFightConfig = trioCreated.config;
+  const duoFightEngine = duoCreated.engine;
+  const trioFightEngine = trioCreated.engine;
+  const teamStates: Record<TeamFightMode, TeamFightState> = {
+    duoFight: createEmptyTeamFightState(),
+    trioFight: createEmptyTeamFightState(),
+  };
+  const teamFighters: Record<TeamFightMode, ClientSession[]> = { duoFight: [], trioFight: [] };
 
   const clients = new Map<WebSocket, ClientSession>();
 
   function engineFor(room: RoomMode): GameEngine {
-    return room === 'soloFight' ? soloFightEngine : classicEngine;
+    if (room === 'soloFight') return soloFightEngine;
+    if (room === 'duoFight') return duoFightEngine;
+    if (room === 'trioFight') return trioFightEngine;
+    return classicEngine;
   }
 
   function configFor(room: RoomMode): GameplayConfig {
-    return room === 'soloFight' ? soloFightConfig : classicConfig;
+    if (room === 'soloFight') return soloFightConfig;
+    if (room === 'duoFight') return duoFightConfig;
+    if (room === 'trioFight') return trioFightConfig;
+    return classicConfig;
   }
 
   function send(ws: WebSocket, msg: ServerMessage) {
@@ -173,12 +216,6 @@ function startServer(attempt = 0) {
       // Drop when client can't drain - prevents ping spikes from queue growth
       if (ws.bufferedAmount > 512_000) return;
       ws.send(JSON.stringify(msg));
-    }
-  }
-
-  function broadcast(msg: ServerMessage) {
-    for (const [ws] of clients) {
-      send(ws, msg);
     }
   }
 
@@ -221,24 +258,51 @@ function startServer(attempt = 0) {
     return net;
   }
 
-  function collectInViewCapped<T extends { x: number; y: number }>(
+  function collectClosestInViewCapped<T extends { x: number; y: number }, U>(
     items: T[],
     cx: number,
     cy: number,
     viewR2: number,
     max: number,
-    mapFn: (item: T) => unknown
-  ): unknown[] {
-    const out: unknown[] = [];
+    mapFn: (item: T) => U
+  ): U[] {
+    const candidates: { item: T; distance2: number }[] = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       const dx = it.x - cx;
       const dy = it.y - cy;
-      if (dx * dx + dy * dy > viewR2) continue;
-      out.push(mapFn(it));
-      if (out.length >= max) break;
+      const distance2 = dx * dx + dy * dy;
+      if (distance2 > viewR2) continue;
+      candidates.push({ item: it, distance2 });
     }
-    return out;
+    if (candidates.length > max) {
+      // Keep only the nearest max candidates in expected O(n) time. Sorting all
+      // in-FOV food every client tick was expensive in dense multiplayer scenes.
+      let left = 0;
+      let right = candidates.length - 1;
+      const target = max - 1;
+      while (left < right) {
+        const pivot = candidates[(left + right) >> 1].distance2;
+        let i = left;
+        let j = right;
+        while (i <= j) {
+          while (candidates[i].distance2 < pivot) i++;
+          while (candidates[j].distance2 > pivot) j--;
+          if (i <= j) {
+            [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+            i++;
+            j--;
+          }
+        }
+        if (target <= j) right = j;
+        else if (target >= i) left = i;
+        else break;
+      }
+      candidates.length = max;
+    }
+    // Sort only the capped result so its order remains stable as the FOV moves.
+    candidates.sort((a, b) => a.distance2 - b.distance2);
+    return candidates.map(({ item }) => mapFn(item));
   }
 
   function buildStateFor(session: ClientSession, includeLeaderboard: boolean): StateMessage {
@@ -274,7 +338,7 @@ function startServer(attempt = 0) {
     const cellInView = (x: number, y: number, r: number) =>
       isEntityNearView(x, y, r, center.x, center.y, viewR);
 
-    const food = collectInViewCapped(
+    const food = collectClosestInViewCapped(
       state.food,
       center.x,
       center.y,
@@ -286,7 +350,7 @@ function startServer(attempt = 0) {
         y: Math.round(f.y),
         c: f.color,
       })
-    ) as StateMessage['food'];
+    );
 
     const viruses: StateMessage['viruses'] = [];
     for (const v of state.viruses) {
@@ -300,7 +364,7 @@ function startServer(attempt = 0) {
       });
     }
 
-    const ejected = collectInViewCapped(
+    const ejected = collectClosestInViewCapped(
       state.ejectedMass,
       center.x,
       center.y,
@@ -313,7 +377,7 @@ function startServer(attempt = 0) {
         r: Math.round(e.radius * 10) / 10,
         c: e.color,
       })
-    ) as StateMessage['ejected'];
+    );
 
     const youId = youPlayer?.id;
     const players = state.players
@@ -367,32 +431,54 @@ function startServer(attempt = 0) {
     while (state.players.filter((p) => p.isBot).length < config.botCountMp) {
       engine.addPlayer(`Bot${Math.floor(Math.random() * 9999)}`, true);
     }
-    if (state.food.length < config.foodCountMp) {
-      state.food.push(
-        ...createFood(
-          config.foodCountMp - state.food.length,
-          state.worldWidth,
-          state.worldHeight,
-          config
-        )
-      );
+    // Only refill when arena loot is enabled (SF waiting keeps targets at 0)
+    if (engine.isArenaLootEnabled()) {
+      if (state.food.length < config.foodCountMp) {
+        state.food.push(
+          ...createFood(
+            config.foodCountMp - state.food.length,
+            state.worldWidth,
+            state.worldHeight,
+            config
+          )
+        );
+      }
+    } else {
+      engine.clearArenaLoot();
     }
   }
 
-  function getRoomInfo(mode: RoomMode): { type: 'roomInfo'; players: number; lobby: number; mode: RoomMode } {
+  function applyClassicConfigAndSyncSf(next: GameplayConfig) {
+    classicConfig = sanitizeGameplayConfig(next);
+    syncWorldAndPopulation(classicEngine, classicConfig);
+    soloFightConfig = syncSoloFightFromClassic(classicConfig);
+    syncWorldAndPopulation(soloFightEngine, soloFightConfig);
+    duoFightConfig = syncTeamFightFromClassic(classicConfig);
+    trioFightConfig = syncTeamFightFromClassic(classicConfig);
+    syncWorldAndPopulation(duoFightEngine, duoFightConfig);
+    syncWorldAndPopulation(trioFightEngine, trioFightConfig);
+    if (sfState.phase !== 'countdown' && sfState.phase !== 'fighting') {
+      soloFightEngine.clearArenaLoot();
+    }
+  }
+
+  function getRoomInfo(mode: RoomMode): { type: 'roomInfo'; players: number; lobby: number; mode: RoomMode; blue?: number; red?: number } {
     let players = 0;
     let lobby = 0;
     const engine = engineFor(mode);
     const state = engine.getState();
     for (const session of clients.values()) {
       if (session.room !== mode) continue;
-      if (session.lobbyOnly) {
-        lobby += 1;
-        continue;
-      }
+      // Menu watchers are not counted at all
+      if (session.lobbyOnly) continue;
       if (mode === 'soloFight') {
         if (sfDuelists.includes(session) && session.joined) players += 1;
-        else lobby += 1;
+        else if (session.spectating) lobby += 1;
+        continue;
+      }
+      if (isTeamFight(mode)) {
+        if (teamFighters[mode].includes(session) && (session.joined || teamStates[mode].phase === 'ended')) players += 1;
+        else if (session.spectating) lobby += 1;
         continue;
       }
       const alive = session.playerIds.some((id) => {
@@ -400,7 +486,17 @@ function startServer(attempt = 0) {
         return !!(p && p.cells.length > 0 && !p.isBot);
       });
       if (alive) players += 1;
-      else lobby += 1;
+      else if (session.spectating) lobby += 1;
+    }
+    if (isTeamFight(mode)) {
+      return {
+        type: 'roomInfo',
+        players,
+        lobby,
+        mode,
+        blue: teamFighters[mode].filter((s) => s.team === 'blue').length,
+        red: teamFighters[mode].filter((s) => s.team === 'red').length,
+      };
     }
     return { type: 'roomInfo', players, lobby, mode };
   }
@@ -409,7 +505,18 @@ function startServer(attempt = 0) {
     for (const [ws, session] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
       send(ws, getRoomInfo(session.room));
+      if (session.room === 'soloFight') {
+        send(ws, makeSoloFightTop(sfState));
+      }
+      if (isTeamFight(session.room)) {
+        send(ws, makeTeamFightTop(session.room, teamStates[session.room]));
+      }
     }
+  }
+
+  function broadcastSoloFightTop() {
+    const top = makeSoloFightTop(sfState);
+    broadcastToRoom('soloFight', top);
   }
 
   function syncSfMetaFromDuelists() {
@@ -426,29 +533,63 @@ function startServer(attempt = 0) {
     }
   }
 
-  function awardSoloFightPoint(winnerName: string, loserName?: string) {
-    sfState.scores.set(winnerName, (sfState.scores.get(winnerName) ?? 0) + 1);
-    if (loserName) sfState.scores.set(loserName, 0);
-    sfState.phase = 'between';
-    sfState.betweenEndsAt = Date.now() + SOLO_FIGHT_BETWEEN_MS;
-    freezeSfFighters(true);
+  function broadcastSfHud() {
+    const hud = makeSoloFightHud(sfState);
+    broadcastToRoom('soloFight', hud);
   }
 
-  function resetSoloFightToWaiting() {
-    syncSfMetaFromDuelists();
-    if (sfDuelists.length === 0) {
-      sfState.phase = 'waiting';
-      sfState.countdownEndsAt = 0;
-      sfState.betweenEndsAt = 0;
-      sfState.names = [];
-      sfState.fighterPlayerIds = [];
-      sfState.scores.clear();
+  /** End fight: award winner, freeze fighters, delay arena clear 5s. */
+  function endSoloFightMatch(winnerName: string | null, _loserName?: string | null) {
+    if (sfMatchEnding) return;
+    if (
+      sfState.phase === 'ended' ||
+      sfState.phase === 'resetting' ||
+      sfState.phase === 'waiting'
+    ) {
       return;
     }
+    sfMatchEnding = true;
+
+    if (winnerName) {
+      sfState.scores.set(winnerName, (sfState.scores.get(winnerName) ?? 0) + 1);
+    }
+
+    freezeSfFighters(true);
+    sfState.phase = 'ended';
+    sfState.fightEndsAt = 0;
+    sfState.countdownEndsAt = 0;
+    sfState.betweenEndsAt = 0;
+    sfState.resetEndsAt = Date.now() + SOLO_FIGHT_RESET_MS;
+    syncSfMetaFromDuelists();
+
+    for (const session of sfDuelists) {
+      session.joined = false;
+      session.activeIndex = 0;
+      send(session.ws, { type: 'died' });
+      send(session.ws, makeSoloFightHud(sfState));
+    }
+
+    broadcastSfHud();
+    broadcastRoomInfo();
+    broadcastSoloFightTop();
+    sfMatchEnding = false;
+  }
+
+  function clearSoloFightAfterEnded() {
+    for (const session of [...sfDuelists]) {
+      clearSessionPlayers(session, soloFightEngine);
+      session.joined = false;
+      session.activeIndex = 0;
+    }
+    soloFightEngine.clearArenaLoot();
+    sfDuelists = [];
+    sfState.names = [];
+    sfState.fighterPlayerIds = [];
     sfState.phase = 'waiting';
     sfState.countdownEndsAt = 0;
     sfState.betweenEndsAt = 0;
-    freezeSfFighters(true);
+    sfState.resetEndsAt = 0;
+    sfState.fightEndsAt = 0;
   }
 
   function handleSoloFightDeath(deadSession: ClientSession) {
@@ -461,107 +602,295 @@ function startServer(attempt = 0) {
       (s) => s !== deadSession && s.joined && s.playerIds.length > 0
     );
     if (othersAlive.length === 1) {
-      awardSoloFightPoint(othersAlive[0].lastName, deadSession.lastName);
-    } else if (othersAlive.length === 0) {
-      sfState.phase = 'between';
-      sfState.betweenEndsAt = Date.now() + SOLO_FIGHT_BETWEEN_MS;
+      endSoloFightMatch(othersAlive[0].lastName, deadSession.lastName);
+    } else {
+      endSoloFightMatch(null);
     }
-    syncSfMetaFromDuelists();
   }
 
   function handleSoloFightLeave(session: ClientSession) {
     if (!sfDuelists.includes(session)) return;
     const wasFighting = sfState.phase === 'fighting';
+    const wasCountdown = sfState.phase === 'countdown';
+    const wasEnded = sfState.phase === 'ended';
     const remaining = sfDuelists.filter((s) => s !== session);
+
+    if (wasFighting && remaining.length === 1 && remaining[0].joined) {
+      endSoloFightMatch(remaining[0].lastName, session.lastName);
+      return;
+    }
+
     sfDuelists = remaining;
 
     if (sfDuelists.length === 0) {
-      sfState.scores.clear();
       sfState.phase = 'waiting';
       sfState.countdownEndsAt = 0;
       sfState.betweenEndsAt = 0;
+      sfState.resetEndsAt = 0;
+      sfState.fightEndsAt = 0;
       sfState.names = [];
       sfState.fighterPlayerIds = [];
+      soloFightEngine.clearArenaLoot();
       return;
     }
 
     if (sfDuelists.length === 1) {
-      const winner = sfDuelists[0];
-      if (wasFighting && winner.joined && winner.playerIds.length > 0) {
-        sfState.scores.set(winner.lastName, (sfState.scores.get(winner.lastName) ?? 0) + 1);
-        sfState.scores.set(session.lastName, 0);
+      if (wasCountdown) {
+        sfState.phase = 'waiting';
+        sfState.countdownEndsAt = 0;
+        sfState.fightEndsAt = 0;
+        soloFightEngine.clearArenaLoot();
       }
-      sfState.phase = 'waiting';
-      sfState.countdownEndsAt = 0;
+      if (wasEnded) {
+        // Stay in ended until reset timer; just refresh meta
+      }
       sfState.betweenEndsAt = 0;
+      if (!wasEnded) sfState.resetEndsAt = 0;
       syncSfMetaFromDuelists();
       freezeSfFighters(true);
     }
   }
 
-  function respawnSoloFightRound() {
-    sfDuelists = sfDuelists.filter((s) => s.ws.readyState === WebSocket.OPEN);
-    if (sfDuelists.length < 2) {
-      resetSoloFightToWaiting();
-      return;
+  function checkSoloFightTimeout(now: number) {
+    if (sfState.phase !== 'fighting' || sfState.fightEndsAt <= 0) return;
+    if (now < sfState.fightEndsAt) return;
+
+    const entries = sfDuelists.map((s) => {
+      let mass = 0;
+      for (const id of s.playerIds) {
+        const p = soloFightEngine.getState().players.find((x) => x.id === id);
+        if (p) mass += getTotalMass(p);
+      }
+      return { name: s.lastName, mass };
+    });
+
+    if (entries.length >= 2) {
+      if (entries[0].mass > entries[1].mass) {
+        endSoloFightMatch(entries[0].name, entries[1].name);
+      } else if (entries[1].mass > entries[0].mass) {
+        endSoloFightMatch(entries[1].name, entries[0].name);
+      } else {
+        endSoloFightMatch(null);
+      }
+    } else if (entries.length === 1) {
+      endSoloFightMatch(entries[0].name);
+    } else {
+      endSoloFightMatch(null);
     }
-
-    const ww = soloFightEngine.getState().worldWidth;
-    const wh = soloFightEngine.getState().worldHeight;
-    const spawns = soloFightSpawnPoints(ww, wh);
-    const names: string[] = [];
-    const ids: string[] = [];
-
-    for (let i = 0; i < sfDuelists.length; i++) {
-      const session = sfDuelists[i];
-      clearSessionPlayers(session, soloFightEngine);
-      const spawn = spawns[Math.min(i, spawns.length - 1)];
-      const player = soloFightEngine.addPlayer(session.lastName, false, {
-        x: spawn.x,
-        y: spawn.y,
-        skin: session.lastSkin || undefined,
-        color: session.lastColor || undefined,
-      });
-      soloFightEngine.setPlayerFrozen(player.id, true);
-      session.playerIds = [player.id];
-      session.activeIndex = 0;
-      session.joined = true;
-      session.spectating = false;
-      session.lobbyOnly = false;
-      session.room = 'soloFight';
-      session.lastColor = player.color;
-      names.push(session.lastName);
-      ids.push(player.id);
-      send(session.ws, {
-        type: 'welcome',
-        id: player.id,
-        world: { w: ww, h: wh },
-        isAdmin: session.isAdmin,
-      });
-    }
-
-    sfState.names = names;
-    sfState.fighterPlayerIds = ids;
-    sfState.phase = 'countdown';
-    sfState.countdownEndsAt = Date.now() + SOLO_FIGHT_COUNTDOWN_MS;
-    sfState.betweenEndsAt = 0;
   }
 
   function tickSoloFightPhases() {
     const now = Date.now();
 
-    if (sfState.phase === 'waiting' || sfState.phase === 'countdown') {
+    if (
+      sfState.phase === 'waiting' ||
+      sfState.phase === 'countdown' ||
+      sfState.phase === 'ended'
+    ) {
       freezeSfFighters(true);
     }
 
     if (sfState.phase === 'countdown' && now >= sfState.countdownEndsAt) {
       freezeSfFighters(false);
       sfState.phase = 'fighting';
+      sfState.fightEndsAt = now + SOLO_FIGHT_DURATION_MS;
     }
 
-    if (sfState.phase === 'between' && now >= sfState.betweenEndsAt) {
-      respawnSoloFightRound();
+    if (sfState.phase === 'fighting') {
+      checkSoloFightTimeout(now);
     }
+
+    if (sfState.phase === 'ended' && sfState.resetEndsAt > 0 && now >= sfState.resetEndsAt) {
+      clearSoloFightAfterEnded();
+      broadcastSfHud();
+      broadcastRoomInfo();
+    }
+  }
+
+  function isTeamFight(room: RoomMode): room is TeamFightMode {
+    return room === 'duoFight' || room === 'trioFight';
+  }
+
+  function teamMembers(mode: TeamFightMode, team: FightTeam) {
+    const engine = engineFor(mode);
+    return teamFighters[mode]
+      .filter((s) => s.team === team)
+      .map((s) => ({
+        name: s.lastName,
+        alive: s.playerIds.some((id) => {
+          const p = engine.getState().players.find((x) => x.id === id);
+          return !!p && p.cells.length > 0;
+        }),
+      }));
+  }
+
+  function broadcastTeamMeta(mode: TeamFightMode) {
+    const state = teamStates[mode];
+    const hud = makeTeamFightHud(mode, state, (team) => teamMembers(mode, team));
+    broadcastToRoom(mode, hud);
+    broadcastToRoom(mode, makeTeamFightTop(mode, state));
+  }
+
+  function freezeTeamFighters(mode: TeamFightMode, frozen: boolean) {
+    const engine = engineFor(mode);
+    for (const session of teamFighters[mode]) {
+      for (const id of session.playerIds) engine.setPlayerFrozen(id, frozen);
+    }
+  }
+
+  function clearTeamFightAfterEnded(mode: TeamFightMode) {
+    const engine = engineFor(mode);
+    for (const session of teamFighters[mode]) {
+      clearSessionPlayers(session, engine);
+      session.joined = false;
+      session.team = undefined;
+    }
+    teamFighters[mode] = [];
+    engine.clearArenaLoot();
+    teamStates[mode] = createEmptyTeamFightState();
+  }
+
+  function endTeamFight(mode: TeamFightMode, winner: FightTeam | null) {
+    const state = teamStates[mode];
+    if (state.phase !== 'fighting') return;
+    if (winner) {
+      for (const session of teamFighters[mode]) {
+        if (session.team === winner) {
+          state.scores.set(session.lastName, (state.scores.get(session.lastName) ?? 0) + 1);
+        }
+      }
+    }
+    freezeTeamFighters(mode, true);
+    state.phase = 'ended';
+    state.fightEndsAt = 0;
+    state.countdownEndsAt = 0;
+    state.resetEndsAt = Date.now() + TEAM_FIGHT_RESET_MS;
+    for (const session of teamFighters[mode]) {
+      session.joined = false;
+      send(session.ws, { type: 'died' });
+    }
+    broadcastTeamMeta(mode);
+    broadcastRoomInfo();
+  }
+
+  function checkTeamFightWinner(mode: TeamFightMode) {
+    const aliveTeams = (['blue', 'red'] as FightTeam[]).filter((team) =>
+      teamMembers(mode, team).some((member) => member.alive)
+    );
+    if (aliveTeams.length === 1) endTeamFight(mode, aliveTeams[0]);
+    else if (aliveTeams.length === 0) endTeamFight(mode, null);
+  }
+
+  function tickTeamFight(mode: TeamFightMode, now: number) {
+    const state = teamStates[mode];
+    if (state.phase === 'waiting' || state.phase === 'countdown' || state.phase === 'ended') {
+      freezeTeamFighters(mode, true);
+    }
+    if (state.phase === 'countdown' && now >= state.countdownEndsAt) {
+      state.phase = 'fighting';
+      state.fightEndsAt = now + TEAM_FIGHT_DURATION_MS;
+      freezeTeamFighters(mode, false);
+    }
+    if (state.phase === 'fighting') {
+      if (now >= state.fightEndsAt) {
+        const masses = (['blue', 'red'] as FightTeam[]).map((team) => ({
+          team,
+          mass: teamFighters[mode]
+            .filter((s) => s.team === team)
+            .reduce((sum, s) => sum + s.playerIds.reduce((n, id) => {
+              const p = engineFor(mode).getState().players.find((x) => x.id === id);
+              return n + (p ? getTotalMass(p) : 0);
+            }, 0), 0),
+        }));
+        endTeamFight(mode, masses[0].mass === masses[1].mass ? null : masses[0].mass > masses[1].mass ? 'blue' : 'red');
+      } else {
+        checkTeamFightWinner(mode);
+      }
+    }
+    if (state.phase === 'ended' && now >= state.resetEndsAt) {
+      clearTeamFightAfterEnded(mode);
+      broadcastTeamMeta(mode);
+      broadcastRoomInfo();
+    }
+  }
+
+  function joinTeamFight(session: ClientSession, mode: TeamFightMode, name: string, skin: string, team?: FightTeam) {
+    const state = teamStates[mode];
+    const fighters = teamFighters[mode].filter((s) => s.ws.readyState === WebSocket.OPEN);
+    teamFighters[mode] = fighters;
+    const size = teamSizeFor(mode);
+    if (!team || (team !== 'blue' && team !== 'red')) {
+      session.room = mode;
+      session.lobbyOnly = true;
+      send(session.ws, { type: 'error', message: 'Выберите команду' });
+      send(session.ws, { type: 'roomInfo', players: fighters.length, lobby: 0, mode });
+      broadcastTeamMeta(mode);
+      return;
+    }
+    const onTeam = fighters.filter((s) => s.team === team);
+    if (state.phase !== 'waiting' || onTeam.length >= size || fighters.length >= size * 2) {
+      session.room = mode;
+      session.lobbyOnly = false;
+      session.spectating = true;
+      const st = engineFor(mode).getState();
+      session.viewX = st.worldWidth / 2;
+      session.viewY = st.worldHeight / 2;
+      sendWelcome(session, `spec-${Date.now().toString(36)}`, engineFor(mode), false);
+      send(session.ws, { type: 'settings', settings: configFor(mode), mode });
+      send(session.ws, { type: 'error', message: 'Команда или бой уже заполнены — режим наблюдения' });
+      broadcastTeamMeta(mode);
+      broadcastRoomInfo();
+      return;
+    }
+    session.room = mode;
+    session.team = team;
+    session.lobbyOnly = false;
+    session.spectating = false;
+    clearSessionPlayers(session, engineFor(mode));
+    const st = engineFor(mode).getState();
+    const spawn = teamFightSpawnPoint(st.worldWidth, st.worldHeight, team, onTeam.length, size);
+    const player = engineFor(mode).addPlayer(name, false, { ...spawn, skin: skin || undefined, mass: TEAM_FIGHT_START_MASS });
+    engineFor(mode).setPlayerFrozen(player.id, true);
+    session.playerIds = [player.id];
+    session.activeIndex = 0;
+    session.joined = true;
+    session.lastName = name;
+    session.lastColor = player.color;
+    session.lastSkin = skin || '';
+    fighters.push(session);
+    teamFighters[mode] = fighters;
+    if (fighters.length === size * 2) {
+      state.phase = 'countdown';
+      state.countdownEndsAt = Date.now() + TEAM_FIGHT_COUNTDOWN_MS;
+      engineFor(mode).populateArenaLoot();
+    } else {
+      engineFor(mode).clearArenaLoot();
+    }
+    refreshAdmin(session);
+    sendWelcome(session, player.id, engineFor(mode), session.isAdmin);
+    send(session.ws, { type: 'settings', settings: configFor(mode), mode });
+    broadcastTeamMeta(mode);
+    broadcastRoomInfo();
+  }
+
+  function leaveTeamFight(session: ClientSession, mode: TeamFightMode) {
+    if (!teamFighters[mode].includes(session)) return;
+    const state = teamStates[mode];
+    teamFighters[mode] = teamFighters[mode].filter((s) => s !== session);
+    clearSessionPlayers(session, engineFor(mode));
+    session.team = undefined;
+    if (state.phase === 'fighting') {
+      checkTeamFightWinner(mode);
+    } else if (state.phase === 'countdown') {
+      state.phase = 'waiting';
+      state.countdownEndsAt = 0;
+      engineFor(mode).clearArenaLoot();
+    }
+    if (teamFighters[mode].length === 0) {
+      teamStates[mode] = createEmptyTeamFightState();
+      engineFor(mode).clearArenaLoot();
+    }
+    broadcastTeamMeta(mode);
   }
 
   function sendWelcome(
@@ -579,25 +908,36 @@ function startServer(attempt = 0) {
     });
   }
 
+  function spectateSoloFight(session: ClientSession, reason?: string) {
+    session.room = 'soloFight';
+    session.lobbyOnly = false;
+    session.spectating = true;
+    session.joined = false;
+    clearSessionPlayers(session, soloFightEngine);
+    const st = soloFightEngine.getState();
+    session.viewX = st.worldWidth / 2;
+    session.viewY = st.worldHeight / 2;
+    sendWelcome(session, `spec-${Date.now().toString(36)}`, soloFightEngine, false);
+    send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
+    send(session.ws, buildStateFor(session, true));
+    send(session.ws, makeSoloFightHud(sfState));
+    send(session.ws, makeSoloFightTop(sfState));
+    if (reason) send(session.ws, { type: 'error', message: reason });
+    broadcastRoomInfo();
+  }
+
   function joinSoloFight(session: ClientSession, name: string, skin: string) {
     const openDuelists = sfDuelists.filter((s) => s.ws.readyState === WebSocket.OPEN);
     sfDuelists = openDuelists;
 
-    if (sfDuelists.length >= 2) {
-      session.room = 'soloFight';
-      session.lobbyOnly = false;
-      session.spectating = true;
-      session.joined = false;
-      clearSessionPlayers(session, soloFightEngine);
-      const st = soloFightEngine.getState();
-      session.viewX = st.worldWidth / 2;
-      session.viewY = st.worldHeight / 2;
-      sendWelcome(session, `spec-${Date.now().toString(36)}`, soloFightEngine, false);
-      send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
-      send(session.ws, buildStateFor(session, true));
-      send(session.ws, makeSoloFightHud(sfState));
-      send(session.ws, { type: 'error', message: 'Solo Fight is full - spectating' });
-      broadcastRoomInfo();
+    // Only allow joining as a fighter while waiting with a free slot
+    if (isSoloFightJoinBlocked(sfState.phase) || sfDuelists.length >= 2) {
+      spectateSoloFight(
+        session,
+        sfDuelists.length >= 2 || isSoloFightJoinBlocked(sfState.phase)
+          ? 'Solo Fight is full - spectating'
+          : undefined
+      );
       return;
     }
 
@@ -613,6 +953,7 @@ function startServer(attempt = 0) {
         x: spawns[0].x,
         y: spawns[0].y,
         skin: skin || undefined,
+        mass: SOLO_FIGHT_START_MASS,
       });
       soloFightEngine.setPlayerFrozen(player.id, true);
       session.playerIds = [player.id];
@@ -623,12 +964,15 @@ function startServer(attempt = 0) {
       session.lastSkin = skin || '';
       sfDuelists = [session];
       sfState.phase = 'waiting';
+      sfState.fightEndsAt = 0;
       sfState.names = [name];
       sfState.fighterPlayerIds = [player.id];
+      soloFightEngine.clearArenaLoot();
       refreshAdmin(session);
       sendWelcome(session, player.id, soloFightEngine, session.isAdmin);
       send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
       send(session.ws, makeSoloFightHud(sfState));
+      send(session.ws, makeSoloFightTop(sfState));
       broadcastRoomInfo();
       return;
     }
@@ -639,6 +983,7 @@ function startServer(attempt = 0) {
       x: spawns[1].x,
       y: spawns[1].y,
       skin: skin || undefined,
+      mass: SOLO_FIGHT_START_MASS,
     });
     soloFightEngine.setPlayerFrozen(player.id, true);
     session.playerIds = [player.id];
@@ -652,6 +997,8 @@ function startServer(attempt = 0) {
     freezeSfFighters(true);
     sfState.phase = 'countdown';
     sfState.countdownEndsAt = Date.now() + SOLO_FIGHT_COUNTDOWN_MS;
+    sfState.fightEndsAt = 0;
+    soloFightEngine.populateArenaLoot();
     refreshAdmin(session);
     sendWelcome(session, player.id, soloFightEngine, session.isAdmin);
     if (session.isAdmin) {
@@ -660,6 +1007,7 @@ function startServer(attempt = 0) {
     send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
     for (const d of sfDuelists) {
       send(d.ws, makeSoloFightHud(sfState));
+      send(d.ws, makeSoloFightTop(sfState));
     }
     broadcastRoomInfo();
   }
@@ -669,9 +1017,22 @@ function startServer(attempt = 0) {
     let roomInfoAcc = 0;
     tickTimer = setInterval(() => {
       if (!listening) return;
-      classicEngine.update();
-      soloFightEngine.update();
+      // The two rooms have independent engines. Updating the 20-bot, 5400-food
+      // classic world during a Solo Fight wastes a full simulation tick per frame.
+      let hasClassicSession = false;
+      for (const session of clients.values()) {
+        if (session.room === 'classic' && !session.lobbyOnly) {
+          hasClassicSession = true;
+          break;
+        }
+      }
+      if (hasClassicSession) classicEngine.update();
+      if (sfState.phase !== 'waiting') soloFightEngine.update();
+      if (teamStates.duoFight.phase !== 'waiting') duoFightEngine.update();
+      if (teamStates.trioFight.phase !== 'waiting') trioFightEngine.update();
       tickSoloFightPhases();
+      tickTeamFight('duoFight', Date.now());
+      tickTeamFight('trioFight', Date.now());
 
       for (const [ws, session] of clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
@@ -703,10 +1064,20 @@ function startServer(attempt = 0) {
           }
           if (session.playerIds.length === 0) {
             if (session.room === 'soloFight') {
-              handleSoloFightDeath(session);
+              if (sfState.phase === 'fighting' && sfDuelists.includes(session)) {
+                handleSoloFightDeath(session);
+              } else if (sfDuelists.includes(session)) {
+                handleSoloFightLeave(session);
+              }
             }
-            send(ws, { type: 'died' });
-            session.joined = false;
+            if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+              if (teamStates[session.room].phase === 'fighting') checkTeamFightWinner(session.room);
+            }
+            // Avoid double-died when endSoloFightMatch already notified
+            if (session.joined) {
+              send(ws, { type: 'died' });
+              session.joined = false;
+            }
             session.activeIndex = 0;
             if (session.room === 'soloFight' && !session.lobbyOnly) {
               send(ws, makeSoloFightHud(sfState));
@@ -718,11 +1089,23 @@ function startServer(attempt = 0) {
         if (session.lobbyOnly) continue;
         session.tickCount = (session.tickCount + 1) | 0;
         if (ws.bufferedAmount > 256_000) continue;
-        const includeLb = session.tickCount % 5 === 0;
+        // Send two snapshots every three simulation ticks: inputs/physics stay
+        // responsive at 30 Hz, while remote JSON traffic and stringify work drop
+        // by a third. Client interpolation already covers the skipped tick.
+        if (session.tickCount % STATE_SEND_MODULO === 0) continue;
+        const includeLb = session.tickCount % (STATE_SEND_MODULO * 5) === 1;
         send(ws, buildStateFor(session, includeLb));
         if (session.room === 'soloFight') {
           const hud = makeSoloFightHud(sfState);
-          const key = `${hud.phase}|${hud.countdown}|${hud.a.name}|${hud.a.score}|${hud.b.name}|${hud.b.score}`;
+          const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.a.name}|${hud.a.score}|${hud.b.name}|${hud.b.score}`;
+          if (key !== session.lastSfHudKey || session.tickCount % 4 === 0) {
+            session.lastSfHudKey = key;
+            send(ws, hud);
+          }
+        }
+        if (isTeamFight(session.room)) {
+          const hud = makeTeamFightHud(session.room, teamStates[session.room], (team) => teamMembers(session.room as TeamFightMode, team));
+          const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.blue.alive}|${hud.red.alive}`;
           if (key !== session.lastSfHudKey || session.tickCount % 4 === 0) {
             session.lastSfHudKey = key;
             send(ws, hud);
@@ -824,6 +1207,8 @@ function startServer(attempt = 0) {
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
             clearSessionPlayers(session, soloFightEngine);
+          } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+            leaveTeamFight(session, session.room);
           } else {
             clearSessionPlayers(session, engine());
           }
@@ -832,6 +1217,14 @@ function startServer(attempt = 0) {
           session.spectating = false;
           session.joined = false;
           send(ws, getRoomInfo(mode));
+          if (mode === 'soloFight') {
+            send(ws, makeSoloFightTop(sfState));
+            send(ws, makeSoloFightHud(sfState));
+          }
+          if (isTeamFight(mode)) {
+            send(ws, makeTeamFightTop(mode, teamStates[mode]));
+            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team)));
+          }
           break;
         }
         case 'spectate': {
@@ -839,6 +1232,8 @@ function startServer(attempt = 0) {
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
             clearSessionPlayers(session, soloFightEngine);
+          } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+            leaveTeamFight(session, session.room);
           } else {
             clearSessionPlayers(session, engine());
           }
@@ -859,6 +1254,11 @@ function startServer(attempt = 0) {
           send(ws, buildStateFor(session, true));
           if (mode === 'soloFight') {
             send(ws, makeSoloFightHud(sfState));
+            send(ws, makeSoloFightTop(sfState));
+          }
+          if (isTeamFight(mode)) {
+            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team)));
+            send(ws, makeTeamFightTop(mode, teamStates[mode]));
           }
           broadcastRoomInfo();
           break;
@@ -868,6 +1268,8 @@ function startServer(attempt = 0) {
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
             clearSessionPlayers(session, soloFightEngine);
+          } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+            leaveTeamFight(session, session.room);
           } else if (session.joined && session.playerIds.length > 0) {
             clearSessionPlayers(session, engine());
           }
@@ -888,6 +1290,10 @@ function startServer(attempt = 0) {
 
           if (mode === 'soloFight') {
             joinSoloFight(session, name, skin);
+            break;
+          }
+          if (isTeamFight(mode)) {
+            joinTeamFight(session, mode, name, skin, msg.team);
             break;
           }
 
@@ -916,43 +1322,41 @@ function startServer(attempt = 0) {
         case 'adminGetSettings': {
           refreshAdmin(session);
           if (!session.isAdmin) return;
-          const mode = parseMode(msg.mode);
-          send(ws, { type: 'settings', settings: configFor(mode), mode });
+          // Solo Fight physics lives on classic; always return classic (includes soloFightWorldSize)
+          send(ws, { type: 'settings', settings: classicConfig, mode: 'classic' });
           break;
         }
         case 'adminUpdateSettings': {
           refreshAdmin(session);
           if (!session.isAdmin) return;
-          const mode = parseMode(msg.mode);
-          const next = sanitizeGameplayConfig(msg.settings);
           const prevClassicTick = classicConfig.serverTickHz;
           const prevSfTick = soloFightConfig.serverTickHz;
-          if (mode === 'soloFight') {
-            soloFightConfig = next;
-            syncWorldAndPopulation(soloFightEngine, soloFightConfig);
-            broadcastToRoom('soloFight', {
-              type: 'settings',
-              settings: soloFightConfig,
-              mode: 'soloFight',
-            });
-            broadcastToRoom('soloFight', {
-              type: 'world',
-              w: soloFightConfig.worldWidth,
-              h: soloFightConfig.worldHeight,
-            });
-          } else {
-            classicConfig = next;
-            syncWorldAndPopulation(classicEngine, classicConfig);
-            broadcastToRoom('classic', {
-              type: 'settings',
-              settings: classicConfig,
-              mode: 'classic',
-            });
-            broadcastToRoom('classic', {
-              type: 'world',
-              w: classicConfig.worldWidth,
-              h: classicConfig.worldHeight,
-            });
+          // Always update classic; soloFightWorldSize (if present) drives SF sync
+          applyClassicConfigAndSyncSf(msg.settings);
+          broadcastToRoom('classic', {
+            type: 'settings',
+            settings: classicConfig,
+            mode: 'classic',
+          });
+          broadcastToRoom('classic', {
+            type: 'world',
+            w: classicConfig.worldWidth,
+            h: classicConfig.worldHeight,
+          });
+          broadcastToRoom('soloFight', {
+            type: 'settings',
+            settings: soloFightConfig,
+            mode: 'soloFight',
+          });
+          broadcastToRoom('soloFight', {
+            type: 'world',
+            w: soloFightConfig.worldWidth,
+            h: soloFightConfig.worldHeight,
+          });
+          for (const mode of ['duoFight', 'trioFight'] as TeamFightMode[]) {
+            const cfg = configFor(mode);
+            broadcastToRoom(mode, { type: 'settings', settings: cfg, mode });
+            broadcastToRoom(mode, { type: 'world', w: cfg.worldWidth, h: cfg.worldHeight });
           }
           if (
             classicConfig.serverTickHz !== prevClassicTick ||
@@ -960,7 +1364,7 @@ function startServer(attempt = 0) {
           ) {
             restartTickLoop();
           }
-          send(ws, { type: 'settings', settings: configFor(mode), mode });
+          send(ws, { type: 'settings', settings: classicConfig, mode: 'classic' });
           break;
         }
         case 'adminAddMass': {
@@ -1000,7 +1404,7 @@ function startServer(attempt = 0) {
         case 'adminSpawnBot': {
           refreshAdmin(session);
           if (!session.isAdmin) return;
-          if (session.room === 'soloFight') return;
+          if (session.room !== 'classic') return;
           const mass = Math.max(10, Math.min(50000, Number(msg.mass) || 500));
           engine().spawnBotAt(Number(msg.x) || 0, Number(msg.y) || 0, mass);
           break;
@@ -1041,7 +1445,7 @@ function startServer(attempt = 0) {
           break;
         }
         case 'multiboxSpawn': {
-          if (session.room === 'soloFight') return;
+          if (session.room !== 'classic') return;
           if (!session.joined) return;
           const state = engine().getState();
           const primaryId = activePlayerId(session);
@@ -1057,7 +1461,7 @@ function startServer(attempt = 0) {
           break;
         }
         case 'multiboxSwitch': {
-          if (session.room === 'soloFight') return;
+          if (session.room !== 'classic') return;
           if (session.playerIds.length < 2) return;
           session.activeIndex = (session.activeIndex + 1) % session.playerIds.length;
           break;
@@ -1079,7 +1483,7 @@ function startServer(attempt = 0) {
           }
           const name = live?.name || session.lastName || 'Player';
           const color = live?.color || session.lastColor || '#4ECDC4';
-          broadcast({ type: 'chat', name, text, t: now, color });
+          broadcastToRoom(session.room, { type: 'chat', name, text, t: now, color });
           break;
         }
         case 'input': {
@@ -1103,6 +1507,7 @@ function startServer(attempt = 0) {
           ) {
             return;
           }
+          if (isTeamFight(session.room) && teamStates[session.room].phase !== 'fighting') return;
           engine().splitPlayer(id);
           break;
         }
@@ -1115,6 +1520,7 @@ function startServer(attempt = 0) {
           ) {
             return;
           }
+          if (isTeamFight(session.room) && teamStates[session.room].phase !== 'fighting') return;
           engine().ejectMass(id);
           break;
         }
@@ -1127,6 +1533,7 @@ function startServer(attempt = 0) {
           ) {
             return;
           }
+          if (isTeamFight(session.room) && teamStates[session.room].phase !== 'fighting') return;
           const player = engine().getState().players.find((p) => p.id === id);
           if (!player) return;
           const next = typeof msg.frozen === 'boolean' ? msg.frozen : !player.frozen;
@@ -1146,6 +1553,8 @@ function startServer(attempt = 0) {
       if (session.room === 'soloFight' && sfDuelists.includes(session)) {
         handleSoloFightLeave(session);
         clearSessionPlayers(session, soloFightEngine);
+      } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+        leaveTeamFight(session, session.room);
       } else {
         clearSessionPlayers(session, engineFor(session.room));
       }

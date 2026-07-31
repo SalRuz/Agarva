@@ -13,7 +13,7 @@ interface PlayerSettingsPanelProps {
   onClose: () => void;
 }
 
-type BindTarget = 'keySplit' | 'keyEject' | 'keyFreeze' | 'keyMultibox' | null;
+type BindTarget = 'keySplit' | 'keyEject' | 'keyFreeze' | 'keyMultibox' | 'keyCoords' | null;
 
 export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSettingsPanelProps) {
   const [listening, setListening] = useState<BindTarget>(null);
@@ -203,6 +203,7 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
           {bindBtn('keyEject', 'Выброс массы', prefs.keyEject)}
           {bindBtn('keyFreeze', 'Стоп / продолжить', prefs.keyFreeze)}
           {bindBtn('keyMultibox', 'Мультибокс', prefs.keyMultibox)}
+          {bindBtn('keyCoords', 'Координаты в чат', prefs.keyCoords)}
         </section>
       </div>
     </div>

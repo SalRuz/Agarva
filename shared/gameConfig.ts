@@ -3,6 +3,8 @@ import { ADMIN_MASS_BOOST } from './constants';
 export interface GameplayConfig {
   worldWidth: number;
   worldHeight: number;
+  /** Solo Fight map edge length (square). Classic physics; SF uses this for world size. */
+  soloFightWorldSize: number;
   initialMass: number;
   minSplitMass: number;
   maxCellsPerPlayer: number;
@@ -24,6 +26,13 @@ export interface GameplayConfig {
   splitLaunchSharpnessSmall: number;
   /** Sharpness bias for larger split pieces (multiplies global) */
   splitLaunchSharpnessLarge: number;
+  /**
+   * 1 = a cursor held at the player center keeps one stable split direction,
+   * creating the classic in-place split chain. 0 = legacy per-cell targeting.
+   */
+  centerCursorSplitChainEnabled: number;
+  /** 1 = split pieces keep the parent launch velocity; 0 = launch impulse only. */
+  splitInheritVelocityEnabled: number;
   /**
    * Nick font size as a fraction of cell radius (e.g. 0.38).
    * Clamped per-draw so names stay readable without filling the ball.
@@ -122,9 +131,13 @@ export interface GameplayConfig {
   cursorSlowdownRadiusMult: number;
 }
 
+/** Spawn mass for Solo Fight duelists only — not used in physics config. */
+export const SOLO_FIGHT_START_MASS = 5000;
+
 export const defaultGameplayConfig: GameplayConfig = {
   worldWidth: 20000,
   worldHeight: 20000,
+  soloFightWorldSize: 10000,
   initialMass: 15,
   minSplitMass: 40,
   maxCellsPerPlayer: 16,
@@ -143,6 +156,8 @@ export const defaultGameplayConfig: GameplayConfig = {
   splitLaunchSharpness: 1,
   splitLaunchSharpnessSmall: 1,
   splitLaunchSharpnessLarge: 2.5,
+  centerCursorSplitChainEnabled: 1,
+  splitInheritVelocityEnabled: 1,
   nameScale: 0.28,
   nameStrokeWidth: 0.02,
   splitFriction: 0.93,
@@ -164,7 +179,9 @@ export const defaultGameplayConfig: GameplayConfig = {
   foodViewPerSumRadius: 5.5,
   foodViewPerMaxRadius: 4,
   foodViewMax: 9000,
-  foodNetMax: 220,
+  // Capped snapshots: enough density to navigate, without sending hundreds of
+  // repeated JSON food records on every remote state update.
+  foodNetMax: 140,
   virusMass: 130,
   virusBonusMass: 100,
   virusMinEatMass: 130,
@@ -190,7 +207,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   ejectGracePeriod: 200,
   ejectFriction: 0.945,
   ejectMaxCount: 3000,
-  ejectNetMax: 90,
+  ejectNetMax: 60,
   massDecayPerSec: 0.002,
   massDecayMin: 50,
   botAiIntervalMs: 250,
@@ -233,6 +250,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
 
   out.worldWidth = Math.max(2000, Math.round(out.worldWidth));
   out.worldHeight = Math.max(2000, Math.round(out.worldHeight));
+  out.soloFightWorldSize = Math.max(2000, Math.round(out.soloFightWorldSize));
   out.initialMass = Math.max(1, out.initialMass);
   out.minSplitMass = Math.max(2, out.minSplitMass);
   out.maxCellsPerPlayer = Math.max(2, Math.round(out.maxCellsPerPlayer));
@@ -251,6 +269,8 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.splitLaunchSharpness = Math.max(0, out.splitLaunchSharpness);
   out.splitLaunchSharpnessSmall = Math.max(0, out.splitLaunchSharpnessSmall);
   out.splitLaunchSharpnessLarge = Math.max(0, out.splitLaunchSharpnessLarge);
+  out.centerCursorSplitChainEnabled = out.centerCursorSplitChainEnabled >= 0.5 ? 1 : 0;
+  out.splitInheritVelocityEnabled = out.splitInheritVelocityEnabled >= 0.5 ? 1 : 0;
   out.nameScale = clampRange(out.nameScale, 0.1, 1.2);
   out.nameStrokeWidth = clampRange(out.nameStrokeWidth, 0, 0.5);
   out.splitFriction = clampRange(out.splitFriction, 0, 0.9999);
@@ -325,20 +345,29 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   return out;
 }
 
-/** Defaults for «Соло файт» duel room (10k×10k, no bots, 5k start mass). */
-export const defaultSoloFightConfig: GameplayConfig = sanitizeGameplayConfig({
-  ...defaultGameplayConfig,
-  worldWidth: 10000,
-  worldHeight: 10000,
-  initialMass: 5000,
-  botCountMp: 0,
-  foodCountMp: 1600,
-  foodRespawnThreshold: 700,
-  foodRespawnBatch: 60,
-  virusCount: 24,
-  foodNetMax: 180,
-  ejectNetMax: 80,
-});
+/**
+ * Derive Solo Fight config from classic: same physics (including initialMass),
+ * square map from `soloFightWorldSize`, no bots, food/virus scaled by map area.
+ */
+export function syncSoloFightFromClassic(classic: GameplayConfig): GameplayConfig {
+  const size = Math.max(2000, Math.round(classic.soloFightWorldSize || 10000));
+  const classicArea = Math.max(1, classic.worldWidth * classic.worldHeight);
+  const density = (size * size) / classicArea;
+  return sanitizeGameplayConfig({
+    ...classic,
+    worldWidth: size,
+    worldHeight: size,
+    botCountMp: 0,
+    botCountSolo: 0,
+    foodCountMp: Math.max(0, Math.round(classic.foodCountMp * density)),
+    foodCountSolo: Math.max(0, Math.round(classic.foodCountSolo * density)),
+    foodRespawnThreshold: Math.max(0, Math.round(classic.foodRespawnThreshold * density)),
+    virusCount: Math.max(0, Math.round(classic.virusCount * density)),
+  });
+}
+
+/** Defaults for «Соло файт» — classic physics + SF world size / no bots. */
+export const defaultSoloFightConfig: GameplayConfig = syncSoloFightFromClassic(defaultGameplayConfig);
 
 function clamp01(value: number): number {
   return clampRange(value, 0, 1);

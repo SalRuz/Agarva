@@ -46,6 +46,13 @@ export interface GameEngineOptions {
   config?: Partial<GameplayConfig>;
 }
 
+interface CellSpatialItem {
+  x: number;
+  y: number;
+  player: Player;
+  cell: Cell;
+}
+
 export class GameEngine {
   private state: GameState;
   private botAI: BotAI;
@@ -54,12 +61,25 @@ export class GameEngine {
   private cellMergeReadyAt: Map<string, number> = new Map();
   /** Temporarily pin a cell position (so virus-pop main piece stays centered) */
   private cellPinnedUntil: Map<string, number> = new Map();
+  /** Most recent non-central mouse direction, used for center-cursor split chains. */
+  private lastMeaningfulAim: Map<string, { x: number; y: number }> = new Map();
+  /** Players whose latest mouse input was on/very near their center. */
+  private centerCursorAimPlayers: Set<string> = new Set();
   private lastUpdate: number = Date.now();
   private previousMassPositions: Map<string, { x: number; y: number }> = new Map();
   private foodHash = new SpatialHash<Food>(SPATIAL_CELL_SIZE);
   private foodQueryBuf: Food[] = [];
   private foodHashDirty = true;
+  /**
+   * Broad-phase for cell interactions. A coarser grid keeps queries cheap even
+   * for large split pieces, while avoiding every W testing every player cell.
+   */
+  private cellHash = new SpatialHash<CellSpatialItem>(400);
+  private cellHashItems: CellSpatialItem[] = [];
+  private cellQueryBuf: CellSpatialItem[] = [];
+  private maxCellRadius = 0;
   private foodTargetCount: number;
+  private virusTargetCount: number;
   private config: GameplayConfig;
   private multiplayerMode: boolean;
 
@@ -71,7 +91,7 @@ export class GameEngine {
 
     const botCount = opts.botCount ?? this.config.botCountSolo;
     this.foodTargetCount = opts.foodCount ?? (this.multiplayerMode ? this.config.foodCountMp : this.config.foodCountSolo);
-    const virusCount = opts.virusCount ?? this.config.virusCount;
+    this.virusTargetCount = opts.virusCount ?? this.config.virusCount;
     const worldW = opts.worldWidth ?? this.config.worldWidth;
     const worldH = opts.worldHeight ?? this.config.worldHeight;
 
@@ -79,7 +99,7 @@ export class GameEngine {
     this.state = {
       players: [],
       food: createFood(this.foodTargetCount, worldW, worldH, this.config),
-      viruses: createVirus(virusCount, [], worldW, worldH, [], this.config),
+      viruses: createVirus(this.virusTargetCount, [], worldW, worldH, [], this.config),
       ejectedMass: [],
       worldWidth: worldW,
       worldHeight: worldH,
@@ -121,6 +141,20 @@ export class GameEngine {
     this.foodHashDirty = false;
   }
 
+  private rebuildCellHash() {
+    const items = this.cellHashItems;
+    items.length = 0;
+    let maxRadius = 0;
+    for (const player of this.state.players) {
+      for (const cell of player.cells) {
+        items.push({ x: cell.x, y: cell.y, player, cell });
+        if (cell.radius > maxRadius) maxRadius = cell.radius;
+      }
+    }
+    this.maxCellRadius = maxRadius;
+    this.cellHash.rebuild(items);
+  }
+
   getState(): GameState {
     return this.state;
   }
@@ -132,7 +166,14 @@ export class GameEngine {
   setConfig(next: Partial<GameplayConfig> | GameplayConfig): GameplayConfig {
     this.config = sanitizeGameplayConfig({ ...this.config, ...next });
     this.botAI.setConfig(this.config);
-    this.foodTargetCount = this.multiplayerMode ? this.config.foodCountMp : this.config.foodCountSolo;
+    // Only restore loot targets when loot is currently enabled (non-zero).
+    // clearArenaLoot keeps targets at 0 until populateArenaLoot.
+    if (this.foodTargetCount > 0) {
+      this.foodTargetCount = this.multiplayerMode ? this.config.foodCountMp : this.config.foodCountSolo;
+    }
+    if (this.virusTargetCount > 0) {
+      this.virusTargetCount = this.config.virusCount;
+    }
     this.setWorldSize(this.config.worldWidth, this.config.worldHeight);
     return this.getConfig();
   }
@@ -169,7 +210,7 @@ export class GameEngine {
       this.state.food.push(...createFood(foodMissing, width, height, this.config));
     }
 
-    const virusMissing = Math.max(0, this.config.virusCount - this.state.viruses.length);
+    const virusMissing = Math.max(0, this.virusTargetCount - this.state.viruses.length);
     if (virusMissing > 0) {
       this.state.viruses.push(...createVirus(virusMissing, [], width, height, this.state.players, this.config));
     }
@@ -186,6 +227,8 @@ export class GameEngine {
     for (const cell of player.cells) {
       this.clearCellBirth(cell.id);
     }
+    this.lastMeaningfulAim.delete(playerId);
+    this.centerCursorAimPlayers.delete(playerId);
     if (player.isBot) this.botAI.cleanup(playerId);
     this.state.players.splice(idx, 1);
   }
@@ -193,10 +236,14 @@ export class GameEngine {
   addPlayer(
     name: string,
     isBot = false,
-    opts?: { color?: string; skin?: string; x?: number; y?: number }
+    opts?: { color?: string; skin?: string; x?: number; y?: number; mass?: number }
   ): Player {
     const color = opts?.color || randomColor();
-    const r = getRadius(this.config.initialMass);
+    const startMass =
+      typeof opts?.mass === 'number' && Number.isFinite(opts.mass) && opts.mass > 0
+        ? opts.mass
+        : this.config.initialMass;
+    const r = getRadius(startMass);
     let spawnX = Math.random() * this.WW;
     let spawnY = Math.random() * this.WH;
     let spawnColor = color;
@@ -250,7 +297,7 @@ export class GameEngine {
         },
       ],
       color: spawnColor,
-      score: Math.floor(this.config.initialMass),
+      score: Math.floor(startMass),
       isBot,
       targetX: spawnX,
       targetY: spawnY,
@@ -259,18 +306,21 @@ export class GameEngine {
       frozen: false,
       skin: opts?.skin || undefined,
     };
-    this.markCellBirth(player.cells[0].id, Date.now(), this.config.initialMass);
+    this.markCellBirth(player.cells[0].id, Date.now(), startMass);
     this.state.players.push(player);
     return player;
   }
 
-  /** True if (x,y) would spawn inside/near an existing player cell. */
+  /** True if (x,y) would spawn inside/near an existing player cell or virus. */
   private isSpawnBlocked(x: number, y: number, radius: number, margin = 1.35): boolean {
     const minDist = radius * margin;
     for (const other of this.state.players) {
       for (const cell of other.cells) {
         if (distance({ x, y }, cell) < cell.radius + minDist) return true;
       }
+    }
+    for (const virus of this.state.viruses) {
+      if (distance({ x, y }, virus) < virus.radius + minDist) return true;
     }
     return false;
   }
@@ -294,12 +344,82 @@ export class GameEngine {
           clearance = Math.min(clearance, distance({ x, y }, cell) - cell.radius - radius);
         }
       }
+      for (const virus of this.state.viruses) {
+        clearance = Math.min(clearance, distance({ x, y }, virus) - virus.radius - radius);
+      }
       if (clearance > bestClearance) {
         bestClearance = clearance;
         best = { x, y };
       }
     }
     return best;
+  }
+
+  /**
+   * Full arena reload: remove human players, clear food/ejected/viruses, refill from config.
+   * Bots (if any) are left intact.
+   */
+  resetArenaContents() {
+    const humans = this.state.players.filter((p) => !p.isBot);
+    for (const p of humans) {
+      this.removePlayer(p.id);
+    }
+    this.foodTargetCount = this.multiplayerMode ? this.config.foodCountMp : this.config.foodCountSolo;
+    this.virusTargetCount = this.config.virusCount;
+    for (const m of this.state.ejectedMass) {
+      this.previousMassPositions.delete(m.id);
+    }
+    this.state.ejectedMass = [];
+    this.state.food = [];
+    this.state.viruses = [];
+    this.state.food = createFood(this.foodTargetCount, this.WW, this.WH, this.config);
+    this.state.viruses = createVirus(
+      this.virusTargetCount,
+      [],
+      this.WW,
+      this.WH,
+      this.state.players,
+      this.config
+    );
+    this.foodHashDirty = true;
+    this.rebuildFoodHash();
+  }
+
+  /** Clear food, ejected mass, and viruses; disable refill until populateArenaLoot. */
+  clearArenaLoot() {
+    for (const m of this.state.ejectedMass) {
+      this.previousMassPositions.delete(m.id);
+    }
+    this.state.ejectedMass = [];
+    this.state.food = [];
+    this.state.viruses = [];
+    this.foodTargetCount = 0;
+    this.virusTargetCount = 0;
+    this.foodHashDirty = true;
+    this.rebuildFoodHash();
+  }
+
+  /** Refill food/viruses from config targets (viruses avoid player cells). */
+  populateArenaLoot() {
+    this.foodTargetCount = this.multiplayerMode ? this.config.foodCountMp : this.config.foodCountSolo;
+    this.virusTargetCount = this.config.virusCount;
+    const foodMissing = Math.max(0, this.foodTargetCount - this.state.food.length);
+    if (foodMissing > 0) {
+      this.state.food.push(...createFood(foodMissing, this.WW, this.WH, this.config));
+    }
+    const virusMissing = Math.max(0, this.virusTargetCount - this.state.viruses.length);
+    if (virusMissing > 0) {
+      this.state.viruses.push(
+        ...createVirus(virusMissing, [], this.WW, this.WH, this.state.players, this.config)
+      );
+    }
+    this.foodHashDirty = true;
+    this.rebuildFoodHash();
+  }
+
+  /** True when food/virus respawn targets are active. */
+  isArenaLootEnabled(): boolean {
+    return this.foodTargetCount > 0 || this.virusTargetCount > 0;
   }
 
   setPlayerFrozen(playerId: string, frozen: boolean) {
@@ -338,6 +458,19 @@ export class GameEngine {
   updatePlayerTarget(playerId: string, targetX: number, targetY: number) {
     const player = this.state.players.find((p) => p.id === playerId);
     if (player) {
+      const center = getPlayerCenter(player);
+      const dx = targetX - center.x;
+      const dy = targetY - center.y;
+      const maxRadius = player.cells.reduce((max, cell) => Math.max(max, cell.radius), 0);
+      const centerEpsilon = Math.max(8, maxRadius * 0.08);
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq <= centerEpsilon * centerEpsilon) {
+        this.centerCursorAimPlayers.add(playerId);
+      } else {
+        const distance = Math.sqrt(distanceSq);
+        this.lastMeaningfulAim.set(playerId, { x: dx / distance, y: dy / distance });
+        this.centerCursorAimPlayers.delete(playerId);
+      }
       player.targetX = targetX;
       player.targetY = targetY;
     }
@@ -469,12 +602,13 @@ export class GameEngine {
     const player = this.state.players.find((p) => p.id === playerId);
     if (!player || player.frozen || player.cells.length >= this.config.maxCellsPerPlayer) return;
     const now = Date.now();
+    const splitTarget = this.getSplitTarget(player);
 
     const newCells: Cell[] = [];
     const toSplit = [...player.cells];
     for (const cell of toSplit) {
       if (player.cells.length + newCells.length >= this.config.maxCellsPerPlayer) break;
-      const newCell = splitCell(cell, player.targetX, player.targetY, this.config);
+      const newCell = splitCell(cell, splitTarget.x, splitTarget.y, this.config);
       if (newCell) {
         newCells.push(newCell);
         this.markCellBirth(newCell.id, now, getMass(newCell.radius));
@@ -483,6 +617,46 @@ export class GameEngine {
     }
     player.cells.push(...newCells);
     player.lastSplit = now;
+  }
+
+  /**
+   * A target fixed at the player center stops being centered as split pieces
+   * move. Keep a single aim vector for that input, otherwise each new piece
+   * starts launching back toward the old center and the chain collapses.
+   */
+  private getSplitTarget(player: Player): { x: number; y: number } {
+    if (
+      this.config.centerCursorSplitChainEnabled < 0.5 ||
+      !this.centerCursorAimPlayers.has(player.id)
+    ) {
+      return { x: player.targetX, y: player.targetY };
+    }
+
+    const direction = this.lastMeaningfulAim.get(player.id) || this.getStableSplitDirection(player);
+    const center = getPlayerCenter(player);
+    const range = Math.max(this.WW, this.WH) * 2;
+    return {
+      x: center.x + direction.x * range,
+      y: center.y + direction.y * range,
+    };
+  }
+
+  /** Prefer existing flight momentum; use a deterministic axis for a fresh cell. */
+  private getStableSplitDirection(player: Player): { x: number; y: number } {
+    let fastest: Cell | undefined;
+    let speedSq = 0;
+    for (const cell of player.cells) {
+      const currentSpeedSq = cell.velocityX * cell.velocityX + cell.velocityY * cell.velocityY;
+      if (currentSpeedSq > speedSq) {
+        fastest = cell;
+        speedSq = currentSpeedSq;
+      }
+    }
+    if (fastest && speedSq > 0.01) {
+      const speed = Math.sqrt(speedSq);
+      return { x: fastest.velocityX / speed, y: fastest.velocityY / speed };
+    }
+    return { x: 1, y: 0 };
   }
 
   /**
@@ -889,9 +1063,12 @@ export class GameEngine {
           cell.visualRadius < cell.targetRadius ? this.config.visualGrowLerp : this.config.visualShrinkLerp;
         cell.visualRadius += (cell.targetRadius - cell.visualRadius) * visualLerp * delta;
 
-        const mass = getMass(cell.radius);
-        if (mass > this.config.massDecayMin) {
-          applyMass(cell, mass * (1 - this.config.massDecayPerSec * dtSec), this.config);
+        // Skip mass decay while frozen (e.g. Solo Fight waiting for opponent)
+        if (!player.frozen) {
+          const mass = getMass(cell.radius);
+          if (mass > this.config.massDecayMin) {
+            applyMass(cell, mass * (1 - this.config.massDecayPerSec * dtSec), this.config);
+          }
         }
       }
 
@@ -1045,21 +1222,28 @@ export class GameEngine {
       this.foodHashDirty = true;
     }
 
-    // Eat players
-    for (let i = 0; i < this.state.players.length; i++) {
-      const hunter = this.state.players[i];
-      for (let j = 0; j < this.state.players.length; j++) {
-        if (i === j) continue;
-        const prey = this.state.players[j];
-        for (const hunterCell of hunter.cells) {
-          for (let k = prey.cells.length - 1; k >= 0; k--) {
-            const preyCell = prey.cells[k];
-            if (canEat(hunterCell, preyCell, this.config)) {
-              this.addMassWithAutoSplit(hunter, hunterCell, getMass(preyCell.radius), now);
-              prey.cells.splice(k, 1);
-              this.clearCellBirth(preyCell.id);
-            }
-          }
+    // Rebuild once after movement. The prior all-pairs player/eject checks
+    // became quadratic when several players had 16 virus-pop pieces.
+    this.rebuildCellHash();
+
+    // Eat players: only inspect cells close enough to overlap the hunter.
+    for (const hunter of this.state.players) {
+      for (const hunterCell of hunter.cells) {
+        const nearby = this.cellHash.queryRadius(
+          hunterCell.x,
+          hunterCell.y,
+          hunterCell.radius + this.maxCellRadius,
+          this.cellQueryBuf
+        );
+        for (const candidate of nearby) {
+          if (candidate.player === hunter) continue;
+          const preyCells = candidate.player.cells;
+          const preyIndex = preyCells.indexOf(candidate.cell);
+          if (preyIndex === -1) continue; // It was eaten earlier this tick.
+          if (!canEat(hunterCell, candidate.cell, this.config)) continue;
+          this.addMassWithAutoSplit(hunter, hunterCell, getMass(candidate.cell.radius), now);
+          preyCells.splice(preyIndex, 1);
+          this.clearCellBirth(candidate.cell.id);
         }
       }
     }
@@ -1195,41 +1379,47 @@ export class GameEngine {
       if (hitVirus) continue;
 
       let eaten = false;
-      for (const player of this.state.players) {
-        for (const cell of player.cells) {
-          // Only the ejecting cell is blocked during grace (other own pieces can feed)
-          if (
-            player.id === mass.ownerId &&
-            cell.id === mass.ownerCellId &&
-            now - mass.createdAt < this.config.ejectGracePeriod
-          ) {
-            continue;
-          }
-
-          // Inner radius: absorb only once W path enters well inside the cell
-          const innerR = Math.max(cell.radius * 0.45, cell.radius - mass.radius);
-          const hit =
-            canEatEjectedMass(cell, mass, this.config) ||
-            (getMass(cell.radius) >= this.config.ejectPickupMinMass &&
-              lineCircleIntersect(
-                prevPos.x,
-                prevPos.y,
-                mass.x,
-                mass.y,
-                cell.x,
-                cell.y,
-                innerR
-              ));
-
-          if (hit) {
-            this.addMassWithAutoSplit(player, cell, this.config.ejectGain, now);
-            this.state.ejectedMass.splice(i, 1);
-            this.previousMassPositions.delete(mass.id);
-            eaten = true;
-            break;
-          }
+      const nearbyCells = this.cellHash.queryRadius(
+        mass.x,
+        mass.y,
+        mass.radius + this.maxCellRadius,
+        this.cellQueryBuf
+      );
+      for (const candidate of nearbyCells) {
+        const player = candidate.player;
+        const cell = candidate.cell;
+        if (!player.cells.includes(cell)) continue;
+        // Only the ejecting cell is blocked during grace (other own pieces can feed)
+        if (
+          player.id === mass.ownerId &&
+          cell.id === mass.ownerCellId &&
+          now - mass.createdAt < this.config.ejectGracePeriod
+        ) {
+          continue;
         }
-        if (eaten) break;
+
+        // Inner radius: absorb only once W path enters well inside the cell
+        const innerR = Math.max(cell.radius * 0.45, cell.radius - mass.radius);
+        const hit =
+          canEatEjectedMass(cell, mass, this.config) ||
+          (getMass(cell.radius) >= this.config.ejectPickupMinMass &&
+            lineCircleIntersect(
+              prevPos.x,
+              prevPos.y,
+              mass.x,
+              mass.y,
+              cell.x,
+              cell.y,
+              innerR
+            ));
+
+        if (hit) {
+          this.addMassWithAutoSplit(player, cell, this.config.ejectGain, now);
+          this.state.ejectedMass.splice(i, 1);
+          this.previousMassPositions.delete(mass.id);
+          eaten = true;
+          break;
+        }
       }
 
       if (!eaten) {
@@ -1273,7 +1463,7 @@ export class GameEngine {
 
     if (virusesToRemove.size > 0) {
       this.state.viruses = this.state.viruses.filter((v) => !virusesToRemove.has(v.id));
-      const missing = this.config.virusCount - this.state.viruses.length;
+      const missing = this.virusTargetCount - this.state.viruses.length;
       if (missing > 0) {
         this.state.viruses.push(...createVirus(missing, [], WW, WH, this.state.players, this.config));
       }
@@ -1306,9 +1496,18 @@ export class GameEngine {
       }
     }
 
-    if (this.state.food.length < this.config.foodRespawnThreshold) {
-      this.state.food.push(...createFood(this.config.foodRespawnBatch, WW, WH, this.config));
-      this.foodHashDirty = true;
+    if (
+      this.foodTargetCount > 0 &&
+      this.state.food.length < this.config.foodRespawnThreshold
+    ) {
+      const batch = Math.min(
+        this.config.foodRespawnBatch,
+        Math.max(0, this.foodTargetCount - this.state.food.length)
+      );
+      if (batch > 0) {
+        this.state.food.push(...createFood(batch, WW, WH, this.config));
+        this.foodHashDirty = true;
+      }
     }
 
     // Auto-split after all mass changes this tick

@@ -5,6 +5,7 @@ import { Leaderboard } from './components/Leaderboard';
 import { Minimap } from './components/Minimap';
 import { StartScreen, useRoomStats, type PlayRoomMode } from './components/StartScreen';
 import { SoloFightHud } from './components/SoloFightHud';
+import { TeamFightHud } from './components/TeamFightHud';
 import { HUD } from './components/HUD';
 import { ChatPanel, type ChatLine } from './components/ChatPanel';
 import { AdminSettingsPanel } from './components/AdminSettingsPanel';
@@ -21,6 +22,7 @@ import {
   type GameplayConfig,
 } from '../shared/gameConfig';
 import { isAdminName } from '../shared/physics';
+import { getSectorLabelAt } from '../shared/sectors';
 import { requestRemoteAdminSettings } from './net/adminSettings';
 import {
   loadSelectedSkinId,
@@ -52,19 +54,29 @@ export function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatLine[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
-  const [chatFocused, setChatFocused] = useState(false);
+  const [, setChatFocused] = useState(false);
   const [lastScore, setLastScore] = useState(0);
   const [fps, setFps] = useState<number | null>(null);
   const [pingMs, setPingMs] = useState<number | null>(null);
   const [gameConfig, setGameConfig] = useState<GameplayConfig>(() => cloneGameplayConfig(defaultGameplayConfig));
   const [draftConfig, setDraftConfig] = useState<GameplayConfig>(() => cloneGameplayConfig(defaultGameplayConfig));
-  const [adminConfigMode, setAdminConfigMode] = useState<PlayRoomMode>('classic');
   const [playMode, setPlayMode] = useState<PlayRoomMode>('classic');
+  /** Mode of the live MP session (may differ from menu playMode while switching) */
+  const [connectedPlayMode, setConnectedPlayMode] = useState<PlayRoomMode>('classic');
   const [soloFightHud, setSoloFightHud] = useState<{
-    phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+    phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
     countdown: number;
+    fightSecondsLeft?: number;
     a: { name: string; score: number };
     b: { name: string; score: number };
+  } | null>(null);
+  const [teamFightHud, setTeamFightHud] = useState<{
+    mode: 'duoFight' | 'trioFight';
+    phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
+    countdown: number;
+    fightSecondsLeft?: number;
+    blue: { alive: number; total: number; members: string[] };
+    red: { alive: number; total: number; members: string[] };
   } | null>(null);
   const [showAdminSettings, setShowAdminSettings] = useState(false);
   const [showPlayerSettings, setShowPlayerSettings] = useState(false);
@@ -107,8 +119,10 @@ export function App() {
   const peakMassRef = useRef(0);
   const frozenRef = useRef(false);
   const showAdminSettingsRef = useRef(false);
-  const adminConfigModeRef = useRef<PlayRoomMode>('classic');
   const playModeRef = useRef<PlayRoomMode>('classic');
+  /** True while the main menu deliberately keeps a live MP spectator connection. */
+  const menuOverLiveRef = useRef(false);
+  const soloFightHudKeyRef = useRef('');
 
   useEffect(() => {
     modeRef.current = mode;
@@ -117,10 +131,6 @@ export function App() {
   useEffect(() => {
     showAdminSettingsRef.current = showAdminSettings;
   }, [showAdminSettings]);
-
-  useEffect(() => {
-    adminConfigModeRef.current = adminConfigMode;
-  }, [adminConfigMode]);
 
   useEffect(() => {
     playModeRef.current = playMode;
@@ -291,12 +301,8 @@ export function App() {
             return;
           }
         }
-        if (spectateReturnModeRef.current === 'dead') {
-          setMode('dead');
-        } else {
-          // Leave MP spectate back to menu
-          handleBackToMenuRef.current();
-        }
+        // Always main menu (with live background if still connected) — never death overlay
+        handleBackToMenuRef.current();
       }
     };
     window.addEventListener('keydown', handleEsc);
@@ -335,7 +341,25 @@ export function App() {
 
   const attachMpCallbacks = useCallback(
     (opts?: { spectate?: boolean }) => ({
-      onWelcome: (id: string, _world: { w: number; h: number }, adminFlag?: boolean) => {
+      onWelcome: (id: string, world: { w: number; h: number }, adminFlag?: boolean) => {
+        if (gameStateRef.current) {
+          gameStateRef.current.worldWidth = world.w;
+          gameStateRef.current.worldHeight = world.h;
+        }
+        // `enterSpectate()` responds with welcome too. Keep the deliberately opened
+        // menu visible instead of treating that acknowledgement as a fresh game join.
+        if (menuOverLiveRef.current && modeRef.current === 'menu') {
+          playerIdRef.current = null;
+          ownedIdsRef.current = [];
+          currentPlayerRef.current = undefined;
+          setCurrentPlayer(undefined);
+          setIsConnecting(false);
+          setIsAdmin(false);
+          isAdminRef.current = false;
+          setShowEscapeMenu(false);
+          setFrozen(false);
+          return;
+        }
         playerIdRef.current = opts?.spectate ? null : id;
         if (!opts?.spectate && id) ownedIdsRef.current = [id];
         setIsConnecting(false);
@@ -368,28 +392,33 @@ export function App() {
           { name: msg.name, text: msg.text, t: msg.t, color: msg.color },
         ]);
       },
-      onSettings: (settings: GameplayConfig, settingsMode?: PlayRoomMode) => {
+      onSettings: (settings: GameplayConfig) => {
         const clean = sanitizeGameplayConfig(settings);
         setGameConfig(clean);
-        setDraftConfig((prev) => {
-          if (
-            showAdminSettingsRef.current &&
-            settingsMode &&
-            settingsMode !== adminConfigModeRef.current
-          ) {
-            return prev;
-          }
-          return clean;
-        });
+        if (!showAdminSettingsRef.current) {
+          setDraftConfig(clean);
+        }
       },
       onSoloFightHud: (hud: {
-        phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+        phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
         countdown: number;
+        fightSecondsLeft?: number;
         a: { name: string; score: number };
         b: { name: string; score: number };
       }) => {
+        const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.a.name}|${hud.a.score}|${hud.b.name}|${hud.b.score}`;
+        if (key === soloFightHudKeyRef.current) return;
+        soloFightHudKeyRef.current = key;
         setSoloFightHud(hud);
       },
+      onTeamFightHud: (hud: {
+        mode: 'duoFight' | 'trioFight';
+        phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
+        countdown: number;
+        fightSecondsLeft?: number;
+        blue: { alive: number; total: number; members: string[] };
+        red: { alive: number; total: number; members: string[] };
+      }) => setTeamFightHud(hud),
       onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[], ownedIds?: string[]) => {
         gameStateRef.current = state;
         if (ownedIds && ownedIds.length > 0) {
@@ -450,14 +479,17 @@ export function App() {
   );
 
   const handleStartMultiplayer = useCallback(
-    (name: string, serverUrl: string, password?: string, mode: PlayRoomMode = 'classic') => {
+    (name: string, serverUrl: string, password?: string, mode: PlayRoomMode = 'classic', team?: 'blue' | 'red') => {
       setConnectionError(null);
       setIsConnecting(true);
       engineRef.current = null;
+      menuOverLiveRef.current = false;
       disconnectMultiplayer();
       setShowEscapeMenu(false);
+      soloFightHudKeyRef.current = '';
       setSoloFightHud(null);
       setPlayMode(mode);
+      setConnectedPlayMode(mode);
 
       setSessionKind('multiplayer');
       sessionKindRef.current = 'multiplayer';
@@ -480,9 +512,10 @@ export function App() {
         selectedSkinIdRef.current || undefined
       );
       client.setRoomMode(mode);
+      client.setRoomTeam(team);
       mpRef.current = client;
       mpRenderRef.current = () => client.getRenderState();
-      client.connect(serverUrlRef.current, { mode });
+      client.connect(serverUrlRef.current, { mode, team });
     },
     [disconnectMultiplayer, attachMpCallbacks]
   );
@@ -492,10 +525,13 @@ export function App() {
       setConnectionError(null);
       setIsConnecting(true);
       engineRef.current = null;
+      menuOverLiveRef.current = false;
       disconnectMultiplayer();
       setShowEscapeMenu(false);
+      soloFightHudKeyRef.current = '';
       setSoloFightHud(null);
       setPlayMode(mode);
+      setConnectedPlayMode(mode);
       setSessionKind('multiplayer');
       sessionKindRef.current = 'multiplayer';
       serverUrlRef.current = resolveServerUrl();
@@ -526,9 +562,9 @@ export function App() {
   );
 
   const handleMouseMove = useCallback((x: number, y: number) => {
-    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (showEscapeMenuRef.current) return;
+    // Keep steering while chat is open — only block when escape menu is up
     if (sessionKindRef.current === 'multiplayer') {
-      // Always send view center (playing target OR spectate FOV)
       mpRef.current?.sendInput(x, y);
       return;
     }
@@ -687,7 +723,7 @@ export function App() {
         client.respawn(name);
         setMode('playing');
       } else {
-        handleStartMultiplayer(name, serverUrlRef.current, adminPasswordRef.current);
+        handleStartMultiplayer(name, serverUrlRef.current, adminPasswordRef.current, playMode);
       }
       return;
     }
@@ -714,8 +750,9 @@ export function App() {
   }, [currentPlayer, sessionKind, handleStartMultiplayer]);
 
   const handleSpectate = useCallback(() => {
-    spectateReturnModeRef.current = modeRef.current;
-    spectateReturnPlayerIdRef.current = playerIdRef.current;
+    // From death screen, ESC must open main menu — not return to death UI
+    spectateReturnModeRef.current = modeRef.current === 'dead' ? 'menu' : modeRef.current;
+    spectateReturnPlayerIdRef.current = modeRef.current === 'dead' ? null : playerIdRef.current;
     if (!spectateTargetRef.current) {
       if (lastAliveCenterRef.current) {
         spectateTargetRef.current = { ...lastAliveCenterRef.current };
@@ -741,10 +778,6 @@ export function App() {
         }
       }
     }
-    // Seed camera immediately for mouse follow
-    if (spectateTargetRef.current) {
-      // no-op: GameCanvas reads spectateTargetRef
-    }
     playerIdRef.current = null;
     currentPlayerRef.current = undefined;
     setCurrentPlayer(undefined);
@@ -752,7 +785,6 @@ export function App() {
     setShowEscapeMenu(false);
     setFrozen(false);
 
-    // If already on MP after death, keep connection and ensure view inputs flow
     if (sessionKindRef.current === 'multiplayer' && mpRef.current) {
       const st = spectateTargetRef.current;
       if (st) mpRef.current.sendInput(st.x, st.y);
@@ -773,7 +805,11 @@ export function App() {
     };
     if (modeRef.current === 'menu' || modeRef.current === 'dead') {
       if (modeRef.current === 'menu') {
-        handleSpectateClassic();
+        if (sessionKindRef.current === 'multiplayer' && mpRef.current) {
+          mpRef.current.sendInput(spectateTargetRef.current.x, spectateTargetRef.current.y);
+        } else {
+          handleSpectateClassic();
+        }
       } else {
         handleSpectate();
       }
@@ -782,7 +818,36 @@ export function App() {
 
   const handleBackToMenu = useCallback(() => {
     const keptName = playerNameRef.current || menuName;
+    // From death / play: keep multiplayer world + chat as spectator under main menu
+    if (sessionKindRef.current === 'multiplayer' && mpRef.current) {
+      menuOverLiveRef.current = true;
+      if (lastAliveCenterRef.current) {
+        spectateTargetRef.current = { ...lastAliveCenterRef.current };
+      }
+      mpRef.current.enterSpectate();
+      const st = spectateTargetRef.current;
+      if (st) mpRef.current.sendInput(st.x, st.y);
+      playerIdRef.current = null;
+      currentPlayerRef.current = undefined;
+      setCurrentPlayer(undefined);
+      ownedIdsRef.current = [];
+      setMode('menu');
+      setShowEscapeMenu(false);
+      setConnectionError(null);
+      setIsConnecting(false);
+      setMenuName(keptName);
+      playerNameRef.current = keptName;
+      peakMassRef.current = 0;
+      setFrozen(false);
+      soloFightHudKeyRef.current = '';
+      setSoloFightHud(null);
+      setChatMention(null);
+      spectateReturnModeRef.current = 'menu';
+      spectateReturnPlayerIdRef.current = null;
+      return;
+    }
     if (sessionKindRef.current === 'multiplayer') {
+      menuOverLiveRef.current = false;
       disconnectMultiplayer();
       startMenuEngine();
     } else if (playerIdRef.current && engineRef.current) {
@@ -806,6 +871,7 @@ export function App() {
     peakMassRef.current = 0;
     setChatOpen(false);
     setFrozen(false);
+    soloFightHudKeyRef.current = '';
     setSoloFightHud(null);
     spectateTargetRef.current = null;
     ownedIdsRef.current = [];
@@ -833,7 +899,6 @@ export function App() {
     setAdminSettingsError(null);
     setAdminSaveNotice(null);
     setAdminSettingsSaving(true);
-    setAdminConfigMode('classic');
     try {
       const settings = await requestRemoteAdminSettings(
         resolveServerUrl(),
@@ -853,30 +918,6 @@ export function App() {
     }
     setShowAdminSettings(true);
   }, []);
-
-  const handleAdminConfigModeChange = useCallback(
-    async (mode: PlayRoomMode) => {
-      setAdminConfigMode(mode);
-      setAdminSettingsSaving(true);
-      setAdminSettingsError(null);
-      try {
-        const settings = await requestRemoteAdminSettings(
-          resolveServerUrl(),
-          adminSettingsNameRef.current,
-          'get',
-          undefined,
-          adminPasswordRef.current,
-          mode
-        );
-        setDraftConfig(sanitizeGameplayConfig(settings));
-      } catch (error) {
-        setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось загрузить настройки');
-      } finally {
-        setAdminSettingsSaving(false);
-      }
-    },
-    []
-  );
 
   const handleDraftConfigChange = useCallback((key: keyof GameplayConfig, value: number) => {
     setDraftConfig((prev) => ({ ...prev, [key]: value }));
@@ -898,10 +939,10 @@ export function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = adminConfigMode === 'soloFight' ? 'соло файт.json' : 'agar-settings.json';
+    link.download = 'agar-settings.json';
     link.click();
     URL.revokeObjectURL(url);
-  }, [draftConfig, adminConfigMode]);
+  }, [draftConfig]);
 
   const handleSaveAdminSettings = useCallback(async () => {
     const clean = sanitizeGameplayConfig(draftConfig);
@@ -915,12 +956,10 @@ export function App() {
         'update',
         clean,
         adminPasswordRef.current,
-        adminConfigMode
+        'classic'
       );
       const synced = sanitizeGameplayConfig(settings);
-      if (adminConfigMode === playMode || mode === 'menu') {
-        setGameConfig(synced);
-      }
+      setGameConfig(synced);
       setDraftConfig(synced);
       setAdminSaveNotice('Сохранено. Панель остаётся открытой — можно править дальше.');
     } catch (error) {
@@ -928,7 +967,7 @@ export function App() {
     } finally {
       setAdminSettingsSaving(false);
     }
-  }, [draftConfig, adminConfigMode, playMode, mode]);
+  }, [draftConfig]);
 
   const handleSelectSkin = useCallback((skin: SkinInfo | null) => {
     const id = skin?.id ?? null;
@@ -949,6 +988,35 @@ export function App() {
     if (sessionKindRef.current !== 'multiplayer') return;
     setChatMention(`${name}: `);
     setChatOpen(true);
+  }, []);
+
+  const handleSendCoords = useCallback(() => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (sessionKindRef.current !== 'multiplayer') return;
+    const m = modeRef.current;
+    if (m !== 'playing' && m !== 'dead' && m !== 'spectating') return;
+    const state = gameStateRef.current;
+    const you = currentPlayerRef.current;
+    let x = spectateTargetRef.current?.x;
+    let y = spectateTargetRef.current?.y;
+    if (you && you.cells.length > 0) {
+      let sx = 0;
+      let sy = 0;
+      let massSum = 0;
+      for (const cell of you.cells) {
+        const mass = Math.max(1, cell.radius * cell.radius);
+        sx += cell.x * mass;
+        sy += cell.y * mass;
+        massSum += mass;
+      }
+      x = sx / massSum;
+      y = sy / massSum;
+    }
+    if (!state || x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y)) {
+      return;
+    }
+    const label = getSectorLabelAt(x, y, state.worldWidth, state.worldHeight);
+    mpRef.current?.sendChat(label);
   }, []);
 
   const handleMultibox = useCallback(() => {
@@ -1007,8 +1075,9 @@ export function App() {
   }, []);
 
   const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
-  // Only true main menu should open lobby watcher WS (ESC overlay must not double-count as lobby)
-  const roomStats = useRoomStats(mode === 'menu', playMode);
+  const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
+  // Only true main menu without live spectate should open lobby watcher WS
+  const roomStats = useRoomStats(mode === 'menu' && !menuOverLive, playMode);
   const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
   const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
   const hudScale = hudSizeScale(playerPrefs.hudSize);
@@ -1047,16 +1116,14 @@ export function App() {
         sessionKindRef={sessionKindRef}
         mpRenderRef={mpRenderRef}
         spectateTargetRef={spectateTargetRef}
-        isSpectating={mode === 'spectating'}
+        isSpectating={mode === 'spectating' || menuOverLive}
         isPaused={showEscapeMenu}
         inputBlocked={
-          chatFocused ||
-          chatOpen ||
           showAdminSettings ||
           showSkinPicker ||
           showPlayerSettings ||
           showEscapeMenu ||
-          mode === 'menu'
+          (mode === 'menu' && !menuOverLive)
         }
         onMouseMove={handleMouseMove}
         onSplit={handleSplit}
@@ -1079,6 +1146,7 @@ export function App() {
         frozen={frozen && mode === 'playing'}
         ownedIdsRef={ownedIdsRef}
         onMultibox={handleMultibox}
+        onSendCoords={handleSendCoords}
       />
 
       {showMenuOverlay && (
@@ -1093,6 +1161,7 @@ export function App() {
           onSpectate={mode === 'menu' ? handleSpectateClassic : undefined}
           spectateDisabled={mode === 'playing'}
           escapeOverlay={mode === 'playing' && showEscapeMenu}
+          activePlayMode={sessionKind === 'multiplayer' ? connectedPlayMode : undefined}
           onResume={handleResume}
           onAdminSettings={handleOpenAdminSettings}
           onOpenSkins={() => setShowSkinPicker(true)}
@@ -1100,7 +1169,10 @@ export function App() {
           connectionError={connectionError}
           isConnecting={isConnecting}
           roomPlayers={roomStats.players}
-          roomLobby={roomStats.lobby}
+          roomSpectators={roomStats.spectators}
+          roomBlue={roomStats.blue}
+          roomRed={roomStats.red}
+          soloFightTop={roomStats.soloFightTop}
         />
       )}
 
@@ -1114,12 +1186,10 @@ export function App() {
       <AdminSettingsPanel
         open={showAdminSettings}
         settings={draftConfig}
-        sourceLabel={adminConfigMode === 'soloFight' ? 'solo fight server' : 'classic server'}
+        sourceLabel="server"
         isSaving={adminSettingsSaving}
         error={adminSettingsError}
         saveNotice={adminSaveNotice}
-        configMode={adminConfigMode}
-        onConfigModeChange={handleAdminConfigModeChange}
         onClose={() => {
           setShowAdminSettings(false);
           setAdminSaveNotice(null);
@@ -1137,7 +1207,7 @@ export function App() {
         onClose={() => setShowSkinPicker(false)}
       />
 
-      {mode !== 'menu' && !showEscapeMenu && (
+      {(mode !== 'menu' || menuOverLive) && !showEscapeMenu && (
         <div
           className="contents"
           style={{
@@ -1145,7 +1215,9 @@ export function App() {
           }}
         >
           <div style={{ zoom: hudScale } as React.CSSProperties}>
-            {playMode === 'soloFight' && soloFightHud ? (
+            {(connectedPlayMode === 'duoFight' || connectedPlayMode === 'trioFight') && teamFightHud ? (
+              <TeamFightHud {...teamFightHud} />
+            ) : (connectedPlayMode === 'soloFight' || playMode === 'soloFight') && soloFightHud ? (
               <SoloFightHud {...soloFightHud} />
             ) : (
               <Leaderboard
@@ -1161,11 +1233,17 @@ export function App() {
                 gameState={hudState}
                 currentPlayer={currentPlayer}
                 canTeleport={isAdmin && mode === 'playing'}
-                spectateTarget={mode === 'spectating' ? spectateTargetRef.current : null}
+                spectateTarget={
+                  mode === 'spectating' || menuOverLive ? spectateTargetRef.current : null
+                }
                 onHoverWorld={(pos) => {
                   minimapHoverRef.current = pos;
                 }}
-                onPickWorld={mode === 'spectating' || mode === 'dead' ? handleSpectatePick : undefined}
+                onPickWorld={
+                  mode === 'spectating' || mode === 'dead' || menuOverLive
+                    ? handleSpectatePick
+                    : undefined
+                }
               />
             </div>
           )}
@@ -1181,7 +1259,12 @@ export function App() {
         <div style={{ zoom: hudScale } as React.CSSProperties}>
           <ChatPanel
             messages={chatMessages}
-            visible={mode === 'playing' || mode === 'dead' || mode === 'spectating'}
+            visible={
+              mode === 'playing' ||
+              mode === 'dead' ||
+              mode === 'spectating' ||
+              menuOverLive
+            }
             inputOpen={
               chatOpen &&
               (mode === 'playing' || mode === 'dead' || mode === 'spectating') &&
@@ -1221,7 +1304,7 @@ export function App() {
         <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2 select-none">
           <div className="text-white font-bold text-lg">Режим наблюдения</div>
           <div className="text-gray-400 text-xs">
-            {playMode === 'soloFight' ? 'Соло файт' : 'Классик'} · ESC — выход
+            {playMode === 'soloFight' ? 'Соло файт' : playMode === 'duoFight' ? 'Дуо файт' : playMode === 'trioFight' ? 'Трио файт' : 'Классик'} · ESC — выход
           </div>
         </div>
       )}

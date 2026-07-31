@@ -29,13 +29,16 @@ export interface MultiplayerCallbacks {
   onWorld?: (w: number, h: number) => void;
   onAdminStatus?: (ok: boolean) => void;
   onChat?: (msg: ChatBroadcastMessage) => void;
-  onSettings?: (settings: GameplayConfig, mode?: 'classic' | 'soloFight') => void;
+  onSettings?: (settings: GameplayConfig, mode?: 'classic' | 'soloFight' | 'duoFight' | 'trioFight') => void;
   onSoloFightHud?: (hud: {
-    phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+    phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
     countdown: number;
+    fightSecondsLeft?: number;
     a: { name: string; score: number };
     b: { name: string; score: number };
   }) => void;
+  onSoloFightTop?: (entries: { name: string; score: number }[]) => void;
+  onTeamFightHud?: (hud: { mode: 'duoFight' | 'trioFight'; phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting'; countdown: number; fightSecondsLeft?: number; blue: { alive: number; total: number; members: string[] }; red: { alive: number; total: number; members: string[] } }) => void;
 }
 
 interface Snap {
@@ -246,7 +249,8 @@ export class MultiplayerClient {
   private static readonly INPUT_MIN_DELTA = 2;
   private spectateOnly = false;
   private ownedIds: string[] = [];
-  private roomMode: 'classic' | 'soloFight' = 'classic';
+  private roomMode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight' = 'classic';
+  private roomTeam: 'blue' | 'red' | undefined;
   /** Retain skins when server omits unchanged skin fields */
   private skinCache = new Map<string, string>();
   private lastLeaderboard: LeaderboardEntry[] = [];
@@ -258,8 +262,12 @@ export class MultiplayerClient {
     this.skin = skin;
   }
 
-  setRoomMode(mode: 'classic' | 'soloFight') {
+  setRoomMode(mode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight') {
     this.roomMode = mode;
+  }
+
+  setRoomTeam(team: 'blue' | 'red' | undefined) {
+    this.roomTeam = team;
   }
 
   getRoomMode() {
@@ -284,12 +292,14 @@ export class MultiplayerClient {
       name: string;
       password?: string;
       skin?: string;
-      mode: 'classic' | 'soloFight';
+      mode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
+      team?: 'blue' | 'red';
     } = {
       type: 'join',
       name,
       mode: this.roomMode,
     };
+    if (this.roomTeam) msg.team = this.roomTeam;
     if (isAdminName(name) && this.password) msg.password = this.password;
     if (this.skin) msg.skin = this.skin;
     return msg;
@@ -334,9 +344,10 @@ export class MultiplayerClient {
     return interpolateStates(this.snapPrev, this.snapCurr, alpha);
   }
 
-  connect(url: string, opts?: { spectate?: boolean; mode?: 'classic' | 'soloFight' }) {
+  connect(url: string, opts?: { spectate?: boolean; mode?: 'classic' | 'soloFight' | 'duoFight' | 'trioFight'; team?: 'blue' | 'red' }) {
     this.spectateOnly = !!opts?.spectate;
     if (opts?.mode) this.roomMode = opts.mode;
+    if (opts?.team) this.roomTeam = opts.team;
     this.skinCache.clear();
     this.lastLeaderboard = [];
     this.callbacks.onStatus?.('connecting');
@@ -462,9 +473,16 @@ export class MultiplayerClient {
         this.callbacks.onSoloFightHud?.({
           phase: msg.phase,
           countdown: msg.countdown,
+          fightSecondsLeft: msg.fightSecondsLeft,
           a: msg.a,
           b: msg.b,
         });
+        break;
+      case 'soloFightTop':
+        this.callbacks.onSoloFightTop?.(msg.entries);
+        break;
+      case 'teamFightHud':
+        this.callbacks.onTeamFightHud?.(msg);
         break;
       case 'state': {
         const { state, you } = this.buildStateFromMsg(msg);

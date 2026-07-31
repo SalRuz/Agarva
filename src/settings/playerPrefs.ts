@@ -14,6 +14,8 @@ export interface PlayerPrefs {
   keyFreeze: string;
   /** KeyboardEvent.code for multibox spawn/switch (default Tab) */
   keyMultibox: string;
+  /** KeyboardEvent.code for posting map sector to chat (default KeyC) */
+  keyCoords: string;
 }
 
 export const DEFAULT_PLAYER_PREFS: PlayerPrefs = {
@@ -24,6 +26,7 @@ export const DEFAULT_PLAYER_PREFS: PlayerPrefs = {
   keyEject: '',
   keyFreeze: 'KeyF',
   keyMultibox: 'Tab',
+  keyCoords: 'KeyC',
 };
 
 const STORAGE_KEY = 'agarPlayerPrefs';
@@ -83,6 +86,7 @@ export function sanitizePlayerPrefs(input: Partial<PlayerPrefs> | null | undefin
     keyFreeze: typeof base.keyFreeze === 'string' && base.keyFreeze ? base.keyFreeze : 'KeyF',
     keyMultibox:
       typeof base.keyMultibox === 'string' && base.keyMultibox ? base.keyMultibox : 'Tab',
+    keyCoords: typeof base.keyCoords === 'string' && base.keyCoords ? base.keyCoords : 'KeyC',
   };
 }
 

@@ -1,6 +1,10 @@
 /** Simple JSON WebSocket protocol */
 import type { GameplayConfig } from './gameConfig';
 
+export type FightRoomMode = 'soloFight' | 'duoFight' | 'trioFight';
+export type RoomMode = 'classic' | FightRoomMode;
+export type FightTeam = 'blue' | 'red';
+
 export interface JoinMessage {
   type: 'join';
   name: string;
@@ -9,7 +13,9 @@ export interface JoinMessage {
   /** Equipped skin id (filename), optional */
   skin?: string;
   /** Room mode (default classic) */
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
+  /** Required for team fight rooms; selected before joining the match. */
+  team?: FightTeam;
 }
 
 export interface InputMessage {
@@ -34,7 +40,7 @@ export interface FreezeMessage {
 
 export interface SpectateMessage {
   type: 'spectate';
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
 }
 
 export interface PingMessage {
@@ -60,13 +66,13 @@ export interface AdminIdentifyMessage {
 
 export interface AdminGetSettingsMessage {
   type: 'adminGetSettings';
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
 }
 
 export interface AdminUpdateSettingsMessage {
   type: 'adminUpdateSettings';
   settings: GameplayConfig;
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
 }
 
 export interface AdminSpawnVirusMessage {
@@ -125,7 +131,7 @@ export interface ChatSendMessage {
 
 export interface LobbyMessage {
   type: 'lobby';
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
 }
 
 export type ClientMessage =
@@ -259,25 +265,51 @@ export interface ChatBroadcastMessage {
 export interface SettingsMessage {
   type: 'settings';
   settings: GameplayConfig;
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
 }
 
 export interface RoomInfoMessage {
   type: 'roomInfo';
   /** Human players currently alive in the match */
   players: number;
-  /** Connected clients in menu / spectating / dead (not actively playing) */
+  /** Spectators only (not lobbyOnly menu watchers, not playing) */
   lobby: number;
-  mode?: 'classic' | 'soloFight';
+  mode?: RoomMode;
+  /** Team lobby occupancy for Duo/Trio Fight. */
+  blue?: number;
+  red?: number;
 }
 
 export interface SoloFightHudMessage {
   type: 'soloFightHud';
-  phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+  phase: 'waiting' | 'countdown' | 'fighting' | 'ended' | 'resetting' | 'between';
   /** Seconds left in countdown (ceil), or 0 */
   countdown: number;
+  /** Seconds left in the 5-minute fight timer while fighting */
+  fightSecondsLeft?: number;
   a: { name: string; score: number };
   b: { name: string; score: number };
+}
+
+export interface SoloFightTopMessage {
+  type: 'soloFightTop';
+  entries: { name: string; score: number }[];
+}
+
+export interface TeamFightHudMessage {
+  type: 'teamFightHud';
+  mode: 'duoFight' | 'trioFight';
+  phase: 'waiting' | 'countdown' | 'fighting' | 'ended' | 'resetting' | 'between';
+  countdown: number;
+  fightSecondsLeft?: number;
+  blue: { alive: number; total: number; members: string[] };
+  red: { alive: number; total: number; members: string[] };
+}
+
+export interface TeamFightTopMessage {
+  type: 'teamFightTop';
+  mode: FightRoomMode;
+  entries: { name: string; score: number }[];
 }
 
 export type ServerMessage =
@@ -291,4 +323,7 @@ export type ServerMessage =
   | SettingsMessage
   | ChatBroadcastMessage
   | RoomInfoMessage
-  | SoloFightHudMessage;
+  | SoloFightHudMessage
+  | SoloFightTopMessage
+  | TeamFightHudMessage
+  | TeamFightTopMessage;

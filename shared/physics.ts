@@ -401,7 +401,10 @@ export function splitCell(
 
   cell.radius = newRadius;
   cell.targetRadius = newRadius;
-  // Parent visual eases down; new piece starts at half visual
+  // Optional inherited momentum preserves macro split chains. The legacy
+  // launch gives a new piece only the fresh impulse.
+  const inheritedVelocityX = config.splitInheritVelocityEnabled ? cell.velocityX : 0;
+  const inheritedVelocityY = config.splitInheritVelocityEnabled ? cell.velocityY : 0;
 
   return {
     id: generateId(),
@@ -411,8 +414,8 @@ export function splitCell(
     visualRadius: newRadius * 0.62,
     targetRadius: newRadius,
     color: cell.color,
-    velocityX: dirX * launch,
-    velocityY: dirY * launch,
+    velocityX: inheritedVelocityX + dirX * launch,
+    velocityY: inheritedVelocityY + dirY * launch,
     splitDirX: dirX,
     splitDirY: dirY,
     splitMaxSpeed: 0

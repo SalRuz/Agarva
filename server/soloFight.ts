@@ -5,24 +5,37 @@ import {
   sanitizeGameplayConfig,
   type GameplayConfig,
 } from '../shared/gameConfig';
-import type { SoloFightHudMessage } from '../shared/protocol';
+import type { SoloFightHudMessage, SoloFightTopMessage } from '../shared/protocol';
 
-export type RoomMode = 'classic' | 'soloFight';
+export type RoomMode = 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
 
-export type SoloFightPhase = 'waiting' | 'countdown' | 'fighting' | 'between';
+export type SoloFightPhase =
+  | 'waiting'
+  | 'countdown'
+  | 'fighting'
+  | 'ended'
+  | 'resetting'
+  | 'between';
 
 export const SOLO_FIGHT_COUNTDOWN_MS = 5000;
-export const SOLO_FIGHT_BETWEEN_MS = 2500;
-/** Half-distance from center to each fighter — medium gap for ~5k start mass (r≈707). */
-const SPAWN_GAP = 1000;
+/** Seconds after win before arena clear / return to waiting. */
+export const SOLO_FIGHT_RESET_MS = 5000;
+/** @deprecated kept for import compatibility — rematch between-rounds removed */
+export const SOLO_FIGHT_BETWEEN_MS = SOLO_FIGHT_RESET_MS;
+export const SOLO_FIGHT_DURATION_MS = 5 * 60 * 1000;
+/** Half-distance from center to each fighter — wider gap for ~5k start mass. */
+const SPAWN_GAP = 2000;
 
 export interface SoloFightState {
   phase: SoloFightPhase;
   countdownEndsAt: number;
   betweenEndsAt: number;
+  resetEndsAt: number;
+  /** Absolute timestamp when the fight timer expires */
+  fightEndsAt: number;
   /** session socket ids or player session refs tracked externally */
   fighterPlayerIds: string[];
-  scores: Map<string, number>; // by player name
+  scores: Map<string, number>; // by player name — persistent across matches
   names: string[];
 }
 
@@ -32,14 +45,15 @@ export function createSoloFightEngine(config: GameplayConfig = defaultSoloFightC
 } {
   const cfg = sanitizeGameplayConfig(config);
   const engine = new GameEngine({
-    botCount: cfg.botCountMp,
-    foodCount: cfg.foodCountMp,
-    virusCount: cfg.virusCount,
+    botCount: 0,
+    foodCount: 0,
+    virusCount: 0,
     multiplayer: true,
     worldWidth: cfg.worldWidth,
     worldHeight: cfg.worldHeight,
     config: cfg,
   });
+  engine.clearArenaLoot();
   return { engine, config: cfg };
 }
 
@@ -48,6 +62,12 @@ export function makeSoloFightHud(state: SoloFightState): SoloFightHudMessage {
   let countdown = 0;
   if (state.phase === 'countdown') {
     countdown = Math.max(0, Math.ceil((state.countdownEndsAt - now) / 1000));
+  } else if (state.phase === 'ended' && state.resetEndsAt > 0) {
+    countdown = Math.max(0, Math.ceil((state.resetEndsAt - now) / 1000));
+  }
+  let fightSecondsLeft: number | undefined;
+  if (state.phase === 'fighting' && state.fightEndsAt > 0) {
+    fightSecondsLeft = Math.max(0, Math.ceil((state.fightEndsAt - now) / 1000));
   }
   const aName = state.names[0] || '—';
   const bName = state.names[1] || '—';
@@ -55,9 +75,18 @@ export function makeSoloFightHud(state: SoloFightState): SoloFightHudMessage {
     type: 'soloFightHud',
     phase: state.phase,
     countdown,
+    fightSecondsLeft,
     a: { name: aName, score: state.scores.get(aName) ?? 0 },
     b: { name: bName, score: state.scores.get(bName) ?? 0 },
   };
+}
+
+export function makeSoloFightTop(state: SoloFightState, limit = 20): SoloFightTopMessage {
+  const entries = [...state.scores.entries()]
+    .map(([name, score]) => ({ name, score }))
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    .slice(0, limit);
+  return { type: 'soloFightTop', entries };
 }
 
 export function soloFightSpawnPoints(worldW: number, worldH: number): [{ x: number; y: number }, { x: number; y: number }] {
@@ -74,6 +103,8 @@ export function createEmptySoloFightState(): SoloFightState {
     phase: 'waiting',
     countdownEndsAt: 0,
     betweenEndsAt: 0,
+    resetEndsAt: 0,
+    fightEndsAt: 0,
     fighterPlayerIds: [],
     scores: new Map(),
     names: [],
@@ -82,4 +113,13 @@ export function createEmptySoloFightState(): SoloFightState {
 
 export function cloneSoloDefaults(): GameplayConfig {
   return cloneGameplayConfig(defaultSoloFightConfig);
+}
+
+export function isSoloFightJoinBlocked(phase: SoloFightPhase): boolean {
+  return (
+    phase === 'fighting' ||
+    phase === 'countdown' ||
+    phase === 'ended' ||
+    phase === 'resetting'
+  );
 }

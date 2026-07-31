@@ -1,19 +1,31 @@
 interface SoloFightHudProps {
-  phase: 'waiting' | 'countdown' | 'fighting' | 'between';
+  phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
   countdown: number;
+  fightSecondsLeft?: number;
   a: { name: string; score: number };
   b: { name: string; score: number };
 }
 
-export function SoloFightHud({ phase, countdown, a, b }: SoloFightHudProps) {
+function formatFightClock(totalSec: number): string {
+  const s = Math.max(0, Math.floor(totalSec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, '0')}`;
+}
+
+export function SoloFightHud({ phase, countdown, fightSecondsLeft, a, b }: SoloFightHudProps) {
   const phaseLabel =
     phase === 'waiting'
       ? 'Ожидание соперника…'
       : phase === 'countdown'
         ? `Старт через ${countdown}`
-        : phase === 'between'
-          ? 'Следующий раунд…'
-          : 'Бой';
+        : phase === 'ended'
+          ? `Очистка карты через ${countdown}`
+          : phase === 'between' || phase === 'resetting'
+            ? 'Сброс карты…'
+            : typeof fightSecondsLeft === 'number'
+              ? `Бой · ${formatFightClock(fightSecondsLeft)}`
+              : 'Бой';
 
   return (
     <div className="absolute top-4 right-4 z-30 select-none pointer-events-none">
