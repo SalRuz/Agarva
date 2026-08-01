@@ -155,6 +155,14 @@ export interface RegisterAccountMessage {
   password: string;
 }
 
+export interface LoginAccountMessage {
+  type: 'loginAccount';
+  deviceId: string;
+  fingerprint?: string;
+  login: string;
+  password: string;
+}
+
 export interface AdminDownloadDbMessage {
   type: 'adminDownloadDb';
 }
@@ -190,6 +198,7 @@ export type ClientMessage =
   | LobbyMessage
   | SyncProfileMessage
   | RegisterAccountMessage
+  | LoginAccountMessage
   | AdminDownloadDbMessage
   | AdminUploadDbMessage;
 
@@ -367,6 +376,13 @@ export interface RegisterAccountResultMessage {
   accountLogin?: string;
 }
 
+export interface LoginAccountResultMessage {
+  type: 'loginAccountResult';
+  ok: boolean;
+  message: string;
+  accountLogin?: string;
+}
+
 export interface AdminDbExportMessage {
   type: 'adminDbExport';
   json: string;
@@ -395,5 +411,6 @@ export type ServerMessage =
   | TeamFightTopMessage
   | PlayerProfileMessage
   | RegisterAccountResultMessage
+  | LoginAccountResultMessage
   | AdminDbExportMessage
   | AdminDbResultMessage;

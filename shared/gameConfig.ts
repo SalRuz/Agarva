@@ -181,7 +181,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   foodViewMax: 9000,
   // Capped snapshots: enough density to navigate, without sending hundreds of
   // repeated JSON food records on every remote state update.
-  foodNetMax: 140,
+  foodNetMax: 75,
   virusMass: 130,
   virusBonusMass: 100,
   virusMinEatMass: 130,

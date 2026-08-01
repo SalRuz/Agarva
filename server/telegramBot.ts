@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { writeFileSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { RoomMode } from './soloFight';
@@ -34,6 +34,10 @@ function isDev(chatId: number): boolean {
 /** Starts only when TELEGRAM_BOT_TOKEN is configured. */
 export function startTelegramBot(bridge: TelegramGameBridge) {
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  if (process.env.TELEGRAM_BOT_ENABLED?.trim() === '0') {
+    console.log('[telegram] TELEGRAM_BOT_ENABLED=0; bot disabled on this machine');
+    return null;
+  }
   if (!token) {
     console.log('[telegram] TELEGRAM_BOT_TOKEN is not configured; bot disabled');
     return null;
@@ -91,7 +95,7 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
     }
     try {
       const tmp = join(tmpdir(), `agarva-db-${Date.now()}.json`);
-      writeFileSync(tmp, json, 'utf8');
+      await writeFile(tmp, json, 'utf8');
       await bot.sendDocument(chatId, tmp, {
         caption: 'Глобальная БД Agarva (из памяти бота)',
       });
@@ -108,14 +112,9 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
       // Rare auto-backup to TG (~every 12h), never on every write.
       if (meta.reason === 'backup' && devId) {
         const tmp = join(tmpdir(), `agarva-db-auto-${Date.now()}.json`);
-        try {
-          writeFileSync(tmp, json, 'utf8');
-          void bot
-            .sendDocument(devId, tmp, { caption: 'Автобэкап БД Agarva (раз в ~12ч)' })
-            .catch((error: Error) => console.error('[telegram] db backup error:', error.message));
-        } catch (error) {
-          console.error('[telegram] db backup write error:', error);
-        }
+        void writeFile(tmp, json, 'utf8')
+          .then(() => bot.sendDocument(devId, tmp, { caption: 'Автобэкап БД Agarva (раз в ~12ч)' }))
+          .catch((error: Error) => console.error('[telegram] db backup error:', error.message));
       }
     });
   }
@@ -285,7 +284,16 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
       (msg.from?.username ? `@${msg.from.username}` : 'Telegram');
     bridge.sendChat(room, displayName.slice(0, 30), text.slice(0, 200));
   });
-  bot.on('polling_error', (error) => console.error('[telegram] polling error:', error.message));
+  bot.on('polling_error', (error) => {
+    const message = error.message || String(error);
+    if (/409|terminated by other getUpdates|Conflict/i.test(message)) {
+      console.error(
+        '[telegram] polling conflict (409): another process is using this token. Stop the duplicate bot or set TELEGRAM_BOT_ENABLED=0 locally.'
+      );
+      return;
+    }
+    console.error('[telegram] polling error:', message);
+  });
   console.log(`[telegram] bot started${process.env.TELEGRAM_DEV_ID ? `; dev id configured` : ''}`);
   return bot;
 }

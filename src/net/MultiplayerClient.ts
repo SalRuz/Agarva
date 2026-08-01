@@ -48,6 +48,7 @@ export interface MultiplayerCallbacks {
     accountLogin?: string;
   }) => void;
   onRegisterAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
+  onLoginAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
   onAdminDbExport?: (json: string) => void;
   onAdminDbResult?: (ok: boolean, message: string) => void;
 }
@@ -520,6 +521,9 @@ export class MultiplayerClient {
       case 'registerAccountResult':
         this.callbacks.onRegisterAccountResult?.(msg.ok, msg.message, msg.accountLogin);
         break;
+      case 'loginAccountResult':
+        this.callbacks.onLoginAccountResult?.(msg.ok, msg.message, msg.accountLogin);
+        break;
       case 'adminDbExport':
         this.callbacks.onAdminDbExport?.(msg.json);
         break;
@@ -700,6 +704,16 @@ export class MultiplayerClient {
   registerAccount(login: string, password: string) {
     this.send({
       type: 'registerAccount',
+      deviceId: this.deviceId,
+      fingerprint: this.fingerprint,
+      login,
+      password,
+    });
+  }
+
+  loginAccount(login: string, password: string) {
+    this.send({
+      type: 'loginAccount',
       deviceId: this.deviceId,
       fingerprint: this.fingerprint,
       login,

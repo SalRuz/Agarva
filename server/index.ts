@@ -52,10 +52,11 @@ import { PersistentStore, type FightMode } from './persistentStore';
 import { startTelegramBot } from './telegramBot';
 
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
-/** Physics remains at 30 Hz; state snapshots use 15 Hz (every other tick). */
-const STATE_SEND_MODULO = 2;
-/** Hard transport ceiling for food; ejected-mass cap is configured by the admin. */
-const NETWORK_FOOD_MAX = 100;
+/** Physics stays at 30 Hz; mobile snapshots are sent at 10 Hz. */
+const STATE_SEND_MODULO = 3;
+/** Absolute transport ceilings; admin settings cannot exceed these on the wire. */
+const NETWORK_FOOD_MAX = 75;
+const NETWORK_EJECT_MAX = 45;
 
 interface ClientSession {
   ws: WebSocket;
@@ -88,6 +89,8 @@ interface ClientSession {
   /** Tick counter for throttling heavy extras */
   tickCount: number;
   lastSfHudKey: string;
+  /** Last skin per entity sent to this client; removed when it leaves this FOV. */
+  sentSkins: Map<string, string>;
 }
 
 function parseMode(mode?: string): RoomMode {
@@ -255,7 +258,8 @@ function startServer(attempt = 0) {
 
   function toNetPlayer(
     p: Player,
-    cellFilter?: (c: Player['cells'][0]) => boolean
+    cellFilter?: (c: Player['cells'][0]) => boolean,
+    includeSkin = false
   ): NetPlayer {
     const cells = cellFilter ? p.cells.filter(cellFilter) : p.cells;
     const net: NetPlayer = {
@@ -272,9 +276,7 @@ function startServer(attempt = 0) {
       })),
       fr: p.frozen ? 1 : 0,
     };
-    // Include this every snapshot: clients can enter FOV after missing the
-    // original packet, so omitting an unchanged skin is not reliable.
-    net.skin = p.skin || '';
+    if (includeSkin) net.skin = p.skin || '';
     return net;
   }
 
@@ -389,7 +391,7 @@ function startServer(attempt = 0) {
       center.x,
       center.y,
       viewR2,
-      cfg.ejectNetMax,
+      Math.min(cfg.ejectNetMax, NETWORK_EJECT_MAX),
       (e) => ({
         id: e.id,
         x: Math.round(e.x),
@@ -399,20 +401,32 @@ function startServer(attempt = 0) {
       })
     );
 
+    const visibleIds = new Set<string>();
+    const includeSkin = (p: Player) => {
+      visibleIds.add(p.id);
+      const skin = p.skin || '';
+      const shouldSend = skin.length <= 80 && session.sentSkins.get(p.id) !== skin;
+      if (shouldSend) session.sentSkins.set(p.id, skin);
+      return shouldSend;
+    };
     const youId = youPlayer?.id;
     const players = state.players
       .filter((p) => p.cells.length > 0 && p.id !== youId)
-      .map((p) =>
-        ownedSet.has(p.id)
-          ? toNetPlayer(p)
-          : toNetPlayer(p, (c) => cellInView(c.x, c.y, c.radius))
-      )
-      .filter((p) => p.cells.length > 0);
+      .map((p) => {
+        if (ownedSet.has(p.id)) return toNetPlayer(p, undefined, includeSkin(p));
+        const filteredCells = (c: Player['cells'][0]) => cellInView(c.x, c.y, c.radius);
+        if (!p.cells.some(filteredCells)) return null;
+        return toNetPlayer(p, filteredCells, includeSkin(p));
+      })
+      .filter((p): p is NetPlayer => p !== null);
+    for (const id of session.sentSkins.keys()) {
+      if (!visibleIds.has(id) && id !== youId) session.sentSkins.delete(id);
+    }
 
     const msg: StateMessage = {
       type: 'state',
       t: Date.now(),
-      you: playing ? toNetPlayer(youPlayer!) : null,
+      you: playing ? toNetPlayer(youPlayer!, undefined, includeSkin(youPlayer!)) : null,
       players,
       food,
       viruses,
@@ -530,6 +544,8 @@ function startServer(attempt = 0) {
   function broadcastRoomInfo() {
     for (const [ws, session] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
+      // Match clients already receive state/HUD. Room metadata is menu-only.
+      if (!session.lobbyOnly) continue;
       send(ws, getRoomInfo(session.room));
       if (session.room === 'soloFight') {
         send(ws, makeSoloFightTop(sfState));
@@ -1289,11 +1305,10 @@ function startServer(attempt = 0) {
         if (session.lobbyOnly) continue;
         session.tickCount = (session.tickCount + 1) | 0;
         if (ws.bufferedAmount > 256_000) continue;
-        // Physics/input stay at 30 Hz; clients interpolate the 15 Hz snapshots.
-        // This halves the dominant JSON stream without degrading control feel.
+        // Physics/input stay at 30 Hz; clients interpolate 10 Hz snapshots.
         if (session.tickCount % STATE_SEND_MODULO !== 0) continue;
-        // Leaderboard is UI-only, so refresh it at 1.5 Hz instead of every state.
-        const includeLb = session.tickCount % (STATE_SEND_MODULO * 10) === 0;
+        // Leaderboard is UI-only; refresh it once every three seconds.
+        const includeLb = session.tickCount % (STATE_SEND_MODULO * 30) === 0;
         send(ws, buildStateFor(session, includeLb));
         if (session.room === 'soloFight') {
           const hud = makeSoloFightHud(sfState);
@@ -1376,6 +1391,7 @@ function startServer(attempt = 0) {
       joinAnnouncedRoom: null,
       tickCount: 0,
       lastSfHudKey: '',
+      sentSkins: new Map(),
     };
     clients.set(ws, session);
 
@@ -1825,6 +1841,43 @@ function startServer(attempt = 0) {
             type: 'registerAccountResult',
             ok: true,
             message: 'Аккаунт создан',
+            accountLogin: result.profile.accountLogin,
+          });
+          send(ws, {
+            type: 'playerProfile',
+            deviceId,
+            lastNick: result.profile.lastNick,
+            skinId: result.profile.skinId,
+            prefs: result.profile.prefs,
+            accountLogin: result.profile.accountLogin,
+          });
+          break;
+        }
+        case 'loginAccount': {
+          const deviceId =
+            persistentStore.resolveDeviceId(msg.deviceId, msg.fingerprint) ||
+            String(msg.deviceId || '').trim().slice(0, 80);
+          if (!deviceId) {
+            send(ws, { type: 'loginAccountResult', ok: false, message: 'Нет device id' });
+            break;
+          }
+          session.deviceId = deviceId;
+          if (msg.fingerprint) {
+            persistentStore.upsertPlayer(deviceId, { fingerprint: msg.fingerprint, lastNick: session.lastName });
+          }
+          const result = persistentStore.loginAccountOnDevice(
+            deviceId,
+            String(msg.login || ''),
+            String(msg.password || '')
+          );
+          if (!result.ok) {
+            send(ws, { type: 'loginAccountResult', ok: false, message: result.error });
+            break;
+          }
+          send(ws, {
+            type: 'loginAccountResult',
+            ok: true,
+            message: 'Вход выполнен',
             accountLogin: result.profile.accountLogin,
           });
           send(ws, {

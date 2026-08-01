@@ -97,6 +97,8 @@ export function App() {
   });
   const [registerError, setRegisterError] = useState<string | null>(null);
   const [registerBusy, setRegisterBusy] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginBusy, setLoginBusy] = useState(false);
   const [selectedSkinId, setSelectedSkinId] = useState<string | null>(() => loadSelectedSkinId());
   const selectedSkinUrl = resolveSkinUrl(selectedSkinId);
   const [menuName, setMenuName] = useState(() => {
@@ -560,6 +562,22 @@ export function App() {
           return;
         }
         setRegisterError(null);
+        if (login) {
+          setAccountLogin(login);
+          try {
+            localStorage.setItem('agarvaAccountLogin', login);
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+      onLoginAccountResult: (ok: boolean, message: string, login?: string) => {
+        setLoginBusy(false);
+        if (!ok) {
+          setLoginError(message);
+          return;
+        }
+        setLoginError(null);
         if (login) {
           setAccountLogin(login);
           try {
@@ -1307,7 +1325,7 @@ export function App() {
   const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
   const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
   // Only true main menu without live spectate should open lobby watcher WS
-  const roomStats = useRoomStats(mode === 'menu', playMode);
+  const roomStats = useRoomStats(mode === 'menu' && !menuOverLive, playMode);
   const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
   const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
   const hudScale = hudSizeScale(playerPrefs.hudSize);
@@ -1407,6 +1425,8 @@ export function App() {
           accountLogin={accountLogin}
           registerError={registerError}
           registerBusy={registerBusy}
+          loginError={loginError}
+          loginBusy={loginBusy}
           onRegisterAccount={(login, password) => {
             setRegisterBusy(true);
             setRegisterError(null);
@@ -1445,6 +1465,46 @@ export function App() {
             ws.onerror = () => {
               setRegisterBusy(false);
               setRegisterError('Ошибка соединения');
+            };
+          }}
+          onLoginAccount={(login, password) => {
+            setLoginBusy(true);
+            setLoginError(null);
+            const ids = getOrCreateDeviceId();
+            deviceIdRef.current = ids.deviceId;
+            fingerprintRef.current = ids.fingerprint;
+            if (mpRef.current) {
+              mpRef.current.setDeviceIdentity(ids.deviceId, ids.fingerprint);
+              mpRef.current.loginAccount(login, password);
+              return;
+            }
+            const ws = new WebSocket(resolveServerUrl());
+            ws.onopen = () => {
+              ws.send(JSON.stringify({
+                type: 'loginAccount',
+                deviceId: ids.deviceId,
+                fingerprint: ids.fingerprint,
+                login,
+                password,
+              }));
+            };
+            ws.onmessage = (ev) => {
+              try {
+                const msg = JSON.parse(String(ev.data));
+                if (msg.type === 'loginAccountResult') {
+                  setLoginBusy(false);
+                  if (!msg.ok) setLoginError(msg.message);
+                  else if (msg.accountLogin) {
+                    setAccountLogin(msg.accountLogin);
+                    try { localStorage.setItem('agarvaAccountLogin', msg.accountLogin); } catch {}
+                  }
+                  ws.close();
+                }
+              } catch {}
+            };
+            ws.onerror = () => {
+              setLoginBusy(false);
+              setLoginError('Ошибка соединения');
             };
           }}
         />

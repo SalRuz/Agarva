@@ -301,6 +301,9 @@ export class PersistentStore {
     login: string,
     password: string
   ): { ok: true; account: AccountRecord } | { ok: false; error: string } {
+    if (!/^[a-zA-Z0-9]+$/.test(login.trim()) || !password || password.length > 8) {
+      return { ok: false, error: 'Неверный логин или пароль' };
+    }
     const key = login.trim().toLowerCase();
     const account = this.data.accounts[key];
     if (!account) return { ok: false, error: 'Неверный логин или пароль' };
@@ -308,6 +311,30 @@ export class PersistentStore {
       return { ok: false, error: 'Неверный логин или пароль' };
     }
     return { ok: true, account };
+  }
+
+  /** Verify an account and restore it only on the device that created it. */
+  loginAccountOnDevice(
+    deviceId: string,
+    login: string,
+    password: string
+  ): { ok: true; profile: PlayerProfile } | { ok: false; error: string } {
+    const result = this.loginAccount(login, password);
+    if (!result.ok) return result;
+    const id = deviceId.trim().slice(0, 80);
+    if (!id) return { ok: false, error: 'Нет device id' };
+    if (result.account.deviceId !== id) {
+      return { ok: false, error: 'Аккаунт привязан к другому устройству' };
+    }
+    const existing = this.data.players[id];
+    if (existing?.accountLogin && existing.accountLogin.toLowerCase() !== result.account.login.toLowerCase()) {
+      return { ok: false, error: 'На этом устройстве уже есть другой аккаунт' };
+    }
+    const profile = this.upsertPlayer(id, {
+      accountLogin: result.account.login,
+      lastNick: existing?.lastNick || result.account.login,
+    });
+    return { ok: true, profile };
   }
 
   linkTelegram(chatId: number | string, login: string) {
