@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { GameplayConfig } from '../shared/gameConfig';
@@ -61,6 +62,7 @@ export class PersistentStore {
   private data: PersistedData;
   private saveListeners: SaveListener[] = [];
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private writeQueue: Promise<void> = Promise.resolve();
   private lastBackupAt = 0;
   /** Latest serialized snapshot kept in memory for TG download without hitting disk. */
   private memoryJson: string;
@@ -112,6 +114,23 @@ export class PersistentStore {
     renameSync(tmpPath, storePath);
   }
 
+  private async writeDiskAsync(json: string) {
+    await mkdir(dirname(storePath), { recursive: true });
+    const tmpPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmpPath, json, 'utf8');
+    await rename(tmpPath, storePath);
+  }
+
+  private notifySaved(json: string, reason: 'debounce' | 'flush' | 'backup') {
+    for (const listener of this.saveListeners) {
+      try {
+        listener(json, { reason });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   /** Schedule a non-blocking save; coalesces rapid updates. */
   private save() {
     this.memoryJson = JSON.stringify(this.data, null, 2);
@@ -119,29 +138,18 @@ export class PersistentStore {
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
       const json = this.memoryJson;
-      try {
-        this.writeDisk(json);
-      } catch (error) {
-        console.error('[store] disk save failed:', error);
-      }
-      for (const listener of this.saveListeners) {
-        try {
-          listener(json, { reason: 'debounce' });
-        } catch {
-          /* ignore */
-        }
-      }
-      const now = Date.now();
-      if (now - this.lastBackupAt >= HALF_DAY_MS) {
-        this.lastBackupAt = now;
-        for (const listener of this.saveListeners) {
-          try {
-            listener(json, { reason: 'backup' });
-          } catch {
-            /* ignore */
+      // Preserve write order while keeping disk I/O off the gameplay event loop.
+      this.writeQueue = this.writeQueue
+        .then(() => this.writeDiskAsync(json))
+        .then(() => {
+          this.notifySaved(json, 'debounce');
+          const now = Date.now();
+          if (now - this.lastBackupAt >= HALF_DAY_MS) {
+            this.lastBackupAt = now;
+            this.notifySaved(json, 'backup');
           }
-        }
-      }
+        })
+        .catch((error) => console.error('[store] disk save failed:', error));
     }, SAVE_DEBOUNCE_MS);
   }
 
@@ -153,13 +161,14 @@ export class PersistentStore {
     }
     this.memoryJson = JSON.stringify(this.data, null, 2);
     this.writeDisk(this.memoryJson);
-    for (const listener of this.saveListeners) {
-      try {
-        listener(this.memoryJson, { reason: 'flush' });
-      } catch {
-        /* ignore */
-      }
-    }
+    // A previously queued asynchronous snapshot may still be in flight. Queue
+    // this same authoritative snapshot after it so an older save cannot become
+    // the final file after an admin import.
+    const json = this.memoryJson;
+    this.writeQueue = this.writeQueue
+      .then(() => this.writeDiskAsync(json))
+      .catch((error) => console.error('[store] disk save failed:', error));
+    this.notifySaved(this.memoryJson, 'flush');
     return this.memoryJson;
   }
 

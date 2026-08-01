@@ -55,8 +55,9 @@ const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
 /** Physics stays at 30 Hz; mobile snapshots are sent at 10 Hz. */
 const STATE_SEND_MODULO = 3;
 /** Absolute transport ceilings; admin settings cannot exceed these on the wire. */
-const NETWORK_FOOD_MAX = 75;
-const NETWORK_EJECT_MAX = 45;
+const NETWORK_FOOD_MAX = 48;
+const NETWORK_EJECT_MAX = 25;
+const STATE_BACKPRESSURE_BYTES = 96_000;
 
 interface ClientSession {
   ws: WebSocket;
@@ -244,7 +245,7 @@ function startServer(attempt = 0) {
   function send(ws: WebSocket, msg: ServerMessage) {
     if (ws.readyState === WebSocket.OPEN) {
       // Drop when client can't drain - prevents ping spikes from queue growth
-      if (ws.bufferedAmount > 512_000) return;
+      if (ws.bufferedAmount > 128_000) return;
       ws.send(JSON.stringify(msg));
     }
   }
@@ -280,51 +281,28 @@ function startServer(attempt = 0) {
     return net;
   }
 
-  function collectClosestInViewCapped<T extends { x: number; y: number }, U>(
+  function collectInViewCapped<T extends { x: number; y: number }, U>(
     items: T[],
     cx: number,
     cy: number,
     viewR2: number,
     max: number,
+    startAt: number,
     mapFn: (item: T) => U
   ): U[] {
-    const candidates: { item: T; distance2: number }[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
+    if (max <= 0 || items.length === 0) return [];
+    const result: U[] = [];
+    // Do not collect/sort every in-view item for every client snapshot. Start at
+    // a rotating offset so the capped selection stays fair while stopping as
+    // soon as the network budget is filled.
+    const offset = ((startAt % items.length) + items.length) % items.length;
+    for (let scanned = 0; scanned < items.length && result.length < max; scanned++) {
+      const it = items[(offset + scanned) % items.length];
       const dx = it.x - cx;
       const dy = it.y - cy;
-      const distance2 = dx * dx + dy * dy;
-      if (distance2 > viewR2) continue;
-      candidates.push({ item: it, distance2 });
+      if (dx * dx + dy * dy <= viewR2) result.push(mapFn(it));
     }
-    if (candidates.length > max) {
-      // Keep only the nearest max candidates in expected O(n) time. Sorting all
-      // in-FOV food every client tick was expensive in dense multiplayer scenes.
-      let left = 0;
-      let right = candidates.length - 1;
-      const target = max - 1;
-      while (left < right) {
-        const pivot = candidates[(left + right) >> 1].distance2;
-        let i = left;
-        let j = right;
-        while (i <= j) {
-          while (candidates[i].distance2 < pivot) i++;
-          while (candidates[j].distance2 > pivot) j--;
-          if (i <= j) {
-            [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
-            i++;
-            j--;
-          }
-        }
-        if (target <= j) right = j;
-        else if (target >= i) left = i;
-        else break;
-      }
-      candidates.length = max;
-    }
-    // Sort only the capped result so its order remains stable as the FOV moves.
-    candidates.sort((a, b) => a.distance2 - b.distance2);
-    return candidates.map(({ item }) => mapFn(item));
+    return result;
   }
 
   function buildStateFor(session: ClientSession, includeLeaderboard: boolean): StateMessage {
@@ -360,12 +338,13 @@ function startServer(attempt = 0) {
     const cellInView = (x: number, y: number, r: number) =>
       isEntityNearView(x, y, r, center.x, center.y, viewR);
 
-    const food = collectClosestInViewCapped(
+    const food = collectInViewCapped(
       state.food,
       center.x,
       center.y,
       viewR2,
       Math.min(cfg.foodNetMax, NETWORK_FOOD_MAX),
+      session.tickCount * NETWORK_FOOD_MAX,
       (f) => ({
         id: f.id,
         x: Math.round(f.x),
@@ -386,12 +365,13 @@ function startServer(attempt = 0) {
       });
     }
 
-    const ejected = collectClosestInViewCapped(
+    const ejected = collectInViewCapped(
       state.ejectedMass,
       center.x,
       center.y,
       viewR2,
       Math.min(cfg.ejectNetMax, NETWORK_EJECT_MAX),
+      session.tickCount * NETWORK_EJECT_MAX,
       (e) => ({
         id: e.id,
         x: Math.round(e.x),
@@ -447,9 +427,9 @@ function startServer(attempt = 0) {
   const wss = new WebSocketServer({
     host: '0.0.0.0',
     port: PORT,
-    // JSON snapshots are highly repetitive. Compress only substantial packets to
-    // preserve CPU for short control messages while reducing mobile transfer.
-    perMessageDeflate: { threshold: 1024 },
+    // Compression spikes zlib CPU under concurrent mobile clients. Small,
+    // capped JSON snapshots are cheaper and more latency-stable uncompressed.
+    perMessageDeflate: false,
   });
 
   let listening = false;
@@ -1233,6 +1213,7 @@ function startServer(attempt = 0) {
     let roomInfoAcc = 0;
     tickTimer = setInterval(() => {
       if (!listening) return;
+      const tickStartedAt = performance.now();
       // The two rooms have independent engines. Updating the 20-bot, 5400-food
       // classic world during a Solo Fight wastes a full simulation tick per frame.
       let hasClassicSession = false;
@@ -1243,9 +1224,13 @@ function startServer(attempt = 0) {
         }
       }
       if (hasClassicSession) classicEngine.update();
-      if (sfState.phase !== 'waiting') soloFightEngine.update();
-      if (teamStates.duoFight.phase !== 'waiting') duoFightEngine.update();
-      if (teamStates.trioFight.phase !== 'waiting') trioFightEngine.update();
+      if (sfState.phase !== 'waiting' && sfDuelists.length > 0) soloFightEngine.update();
+      if (teamStates.duoFight.phase !== 'waiting' && teamFighters.duoFight.length > 0) {
+        duoFightEngine.update();
+      }
+      if (teamStates.trioFight.phase !== 'waiting' && teamFighters.trioFight.length > 0) {
+        trioFightEngine.update();
+      }
       tickSoloFightPhases();
       tickTeamFight('duoFight', Date.now());
       tickTeamFight('trioFight', Date.now());
@@ -1304,16 +1289,16 @@ function startServer(attempt = 0) {
 
         if (session.lobbyOnly) continue;
         session.tickCount = (session.tickCount + 1) | 0;
-        if (ws.bufferedAmount > 256_000) continue;
+        if (ws.bufferedAmount > STATE_BACKPRESSURE_BYTES) continue;
         // Physics/input stay at 30 Hz; clients interpolate 10 Hz snapshots.
         if (session.tickCount % STATE_SEND_MODULO !== 0) continue;
         // Leaderboard is UI-only; refresh it once every three seconds.
-        const includeLb = session.tickCount % (STATE_SEND_MODULO * 30) === 0;
+        const includeLb = session.tickCount % (STATE_SEND_MODULO * 50) === 0;
         send(ws, buildStateFor(session, includeLb));
         if (session.room === 'soloFight') {
           const hud = makeSoloFightHud(sfState);
           const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.a.name}|${hud.a.score}|${hud.b.name}|${hud.b.score}`;
-          if (key !== session.lastSfHudKey || session.tickCount % 4 === 0) {
+          if (key !== session.lastSfHudKey || session.tickCount % 30 === 0) {
             session.lastSfHudKey = key;
             send(ws, hud);
           }
@@ -1326,7 +1311,7 @@ function startServer(attempt = 0) {
             getRoomInfo(session.room).lobby
           );
           const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.blue.alive}|${hud.red.alive}`;
-          if (key !== session.lastSfHudKey || session.tickCount % 4 === 0) {
+          if (key !== session.lastSfHudKey || session.tickCount % 30 === 0) {
             session.lastSfHudKey = key;
             send(ws, hud);
           }
@@ -1337,6 +1322,10 @@ function startServer(attempt = 0) {
       if (roomInfoAcc >= 2000) {
         roomInfoAcc = 0;
         broadcastRoomInfo();
+      }
+      const tickDuration = performance.now() - tickStartedAt;
+      if (tickDuration > 50) {
+        console.warn(`[agar-server] slow tick ${tickDuration.toFixed(1)}ms; clients=${clients.size}`);
       }
     }, getTickMs());
   }

@@ -181,7 +181,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   foodViewMax: 9000,
   // Capped snapshots: enough density to navigate, without sending hundreds of
   // repeated JSON food records on every remote state update.
-  foodNetMax: 75,
+  foodNetMax: 48,
   virusMass: 130,
   virusBonusMass: 100,
   virusMinEatMass: 130,
@@ -207,7 +207,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   ejectGracePeriod: 200,
   ejectFriction: 0.945,
   ejectMaxCount: 3000,
-  ejectNetMax: 200,
+  ejectNetMax: 25,
   massDecayPerSec: 0.002,
   massDecayMin: 50,
   botAiIntervalMs: 250,

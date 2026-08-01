@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { writeFile } from 'node:fs/promises';
+import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { RoomMode } from './soloFight';
@@ -43,7 +43,18 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
     return null;
   }
 
-  const bot = new TelegramBot(token, { polling: true });
+  // Start polling explicitly after listeners are registered: startup failures
+  // (especially Telegram 409 conflicts) must be visible and recoverable.
+  const bot = new TelegramBot(token, { polling: false });
+  let retryingPollingConflict = false;
+  let pollingStoppedForConflict = false;
+  const startPolling = (reason: 'startup' | 'retry') => {
+    pollingStoppedForConflict = false;
+    void bot.startPolling().then(
+      () => console.log(`[telegram] polling started (${reason})`),
+      (error: Error) => console.error(`[telegram] polling start failed (${reason}):`, error.message)
+    );
+  };
   const selectedRoom = new Map<number, RoomMode>();
   const authFlow = new Map<number, AuthStep>();
   /** Latest DB JSON kept only in bot process memory (updated from store saves). */
@@ -93,14 +104,17 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
       sendToTelegram(chatId, 'В памяти бота пока нет копии БД.');
       return;
     }
+    let tmp = '';
     try {
-      const tmp = join(tmpdir(), `agarva-db-${Date.now()}.json`);
+      tmp = join(tmpdir(), `agarva-db-${Date.now()}.json`);
       await writeFile(tmp, json, 'utf8');
       await bot.sendDocument(chatId, tmp, {
         caption: 'Глобальная БД Agarva (из памяти бота)',
       });
     } catch (error) {
       sendToTelegram(chatId, `Не удалось отправить БД: ${error instanceof Error ? error.message : 'error'}`);
+    } finally {
+      if (tmp) void unlink(tmp).catch(() => {});
     }
   };
 
@@ -114,7 +128,8 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
         const tmp = join(tmpdir(), `agarva-db-auto-${Date.now()}.json`);
         void writeFile(tmp, json, 'utf8')
           .then(() => bot.sendDocument(devId, tmp, { caption: 'Автобэкап БД Agarva (раз в ~12ч)' }))
-          .catch((error: Error) => console.error('[telegram] db backup error:', error.message));
+          .catch((error: Error) => console.error('[telegram] db backup error:', error.message))
+          .finally(() => void unlink(tmp).catch(() => {}));
       }
     });
   }
@@ -290,10 +305,25 @@ export function startTelegramBot(bridge: TelegramGameBridge) {
       console.error(
         '[telegram] polling conflict (409): another process is using this token. Stop the duplicate bot or set TELEGRAM_BOT_ENABLED=0 locally.'
       );
+      if (!pollingStoppedForConflict) {
+        pollingStoppedForConflict = true;
+        void bot.stopPolling().catch((stopError: Error) =>
+          console.error('[telegram] failed to stop conflicted polling:', stopError.message)
+        );
+      }
+      if (!retryingPollingConflict) {
+        retryingPollingConflict = true;
+        setTimeout(() => {
+          console.warn('[telegram] retrying polling once after 409 conflict');
+          startPolling('retry');
+        }, 5000).unref();
+      }
       return;
     }
     console.error('[telegram] polling error:', message);
   });
-  console.log(`[telegram] bot started${process.env.TELEGRAM_DEV_ID ? `; dev id configured` : ''}`);
+  bot.on('error', (error) => console.error('[telegram] bot error:', error.message));
+  startPolling('startup');
+  console.log(`[telegram] bot initialized${process.env.TELEGRAM_DEV_ID ? `; dev id configured` : ''}`);
   return bot;
 }
