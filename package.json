@@ -9,14 +9,12 @@
     "preview": "vite preview",
     "server": "tsx server/index.ts",
     "start": "tsx server/index.ts",
-    "bot": "tsx server/botOnly.ts",
     "start:prod": "NODE_ENV=production tsx server/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "clsx": "2.1.1",
     "dotenv": "^17.4.2",
-    "node-telegram-bot-api": "^1.2.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "tailwind-merge": "3.4.0",
@@ -25,7 +23,6 @@
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "^22.0.0",
-    "@types/node-telegram-bot-api": "^0.64.15",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@types/ws": "^8.18.1",

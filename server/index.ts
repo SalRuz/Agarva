@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { execSync } from 'node:child_process';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import 'dotenv/config';
 import { GameEngine } from '../shared/GameEngine';
 import {
@@ -49,7 +50,6 @@ import {
   TEAM_FIGHT_START_MASS,
 } from './teamFight';
 import { PersistentStore, type FightMode } from './persistentStore';
-import { startTelegramBot } from './telegramBot';
 
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
 /** Physics stays at 30 Hz; mobile snapshots are sent at 10 Hz. */
@@ -57,7 +57,8 @@ const STATE_SEND_MODULO = 3;
 /** Absolute transport ceilings; admin settings cannot exceed these on the wire. */
 const NETWORK_FOOD_MAX = 48;
 const NETWORK_EJECT_MAX = 25;
-const STATE_BACKPRESSURE_BYTES = 96_000;
+const STATE_BACKPRESSURE_BYTES = 32_000;
+const BOT_CHAT_BUFFER_SIZE = 200;
 
 interface ClientSession {
   ws: WebSocket;
@@ -92,6 +93,14 @@ interface ClientSession {
   lastSfHudKey: string;
   /** Last skin per entity sent to this client; removed when it leaves this FOV. */
   sentSkins: Map<string, string>;
+}
+
+interface BotChatLine {
+  id: number;
+  room: RoomMode;
+  name: string;
+  text: string;
+  t: number;
 }
 
 function parseMode(mode?: string): RoomMode {
@@ -218,6 +227,13 @@ function startServer(attempt = 0) {
   > = { duoFight: [], trioFight: [] };
 
   const clients = new Map<WebSocket, ClientSession>();
+  const botChatLines: Record<RoomMode, BotChatLine[]> = {
+    classic: [],
+    soloFight: [],
+    duoFight: [],
+    trioFight: [],
+  };
+  let nextBotChatId = 1;
 
   function removePendingFightJoin(session: ClientSession) {
     for (let i = pendingSoloFightJoins.length - 1; i >= 0; i--) {
@@ -257,6 +273,18 @@ function startServer(attempt = 0) {
     }
   }
 
+  function queueGameChat(room: RoomMode, name: string, text: string, t: number) {
+    const queue = botChatLines[room];
+    queue.push({ id: nextBotChatId++, room, name, text, t });
+    if (queue.length > BOT_CHAT_BUFFER_SIZE) queue.splice(0, queue.length - BOT_CHAT_BUFFER_SIZE);
+  }
+
+  function broadcastGameChat(room: RoomMode, name: string, text: string, color: string) {
+    const t = Date.now();
+    broadcastToRoom(room, { type: 'chat', name, text, t, color });
+    queueGameChat(room, name, text, t);
+  }
+
   function toNetPlayer(
     p: Player,
     cellFilter?: (c: Player['cells'][0]) => boolean,
@@ -287,22 +315,51 @@ function startServer(attempt = 0) {
     cy: number,
     viewR2: number,
     max: number,
-    startAt: number,
     mapFn: (item: T) => U
   ): U[] {
     if (max <= 0 || items.length === 0) return [];
-    const result: U[] = [];
-    // Do not collect/sort every in-view item for every client snapshot. Start at
-    // a rotating offset so the capped selection stays fair while stopping as
-    // soon as the network budget is filled.
-    const offset = ((startAt % items.length) + items.length) % items.length;
-    for (let scanned = 0; scanned < items.length && result.length < max; scanned++) {
-      const it = items[(offset + scanned) % items.length];
-      const dx = it.x - cx;
-      const dy = it.y - cy;
-      if (dx * dx + dy * dy <= viewR2) result.push(mapFn(it));
+    // Keep exactly the nearest objects to the camera. The previous rotating
+    // scan changed the capped set every snapshot, which made food and W blink.
+    // A bounded max-heap makes this O(items × log(max)) without sorting all food.
+    const heap: { item: T; d2: number }[] = [];
+    const swap = (a: number, b: number) => ([heap[a], heap[b]] = [heap[b], heap[a]]);
+    const siftUp = (index: number) => {
+      for (let child = index; child > 0;) {
+        const parent = (child - 1) >> 1;
+        if (heap[parent].d2 >= heap[child].d2) break;
+        swap(parent, child);
+        child = parent;
+      }
+    };
+    const siftDown = () => {
+      for (let parent = 0;;) {
+        const left = parent * 2 + 1;
+        const right = left + 1;
+        let largest = parent;
+        if (left < heap.length && heap[left].d2 > heap[largest].d2) largest = left;
+        if (right < heap.length && heap[right].d2 > heap[largest].d2) largest = right;
+        if (largest === parent) return;
+        swap(parent, largest);
+        parent = largest;
+      }
+    };
+    for (const item of items) {
+      const dx = item.x - cx;
+      const dy = item.y - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > viewR2) continue;
+      if (heap.length < max) {
+        heap.push({ item, d2 });
+        siftUp(heap.length - 1);
+      } else if (d2 < heap[0].d2) {
+        heap[0] = { item, d2 };
+        siftDown();
+      }
     }
-    return result;
+    // Identical ordering on every snapshot avoids unnecessary client churn.
+    return heap
+      .sort((a, b) => a.d2 - b.d2)
+      .map(({ item }) => mapFn(item));
   }
 
   function buildStateFor(session: ClientSession, includeLeaderboard: boolean): StateMessage {
@@ -344,7 +401,6 @@ function startServer(attempt = 0) {
       center.y,
       viewR2,
       Math.min(cfg.foodNetMax, NETWORK_FOOD_MAX),
-      session.tickCount * NETWORK_FOOD_MAX,
       (f) => ({
         id: f.id,
         x: Math.round(f.x),
@@ -371,7 +427,6 @@ function startServer(attempt = 0) {
       center.y,
       viewR2,
       Math.min(cfg.ejectNetMax, NETWORK_EJECT_MAX),
-      session.tickCount * NETWORK_EJECT_MAX,
       (e) => ({
         id: e.id,
         x: Math.round(e.x),
@@ -424,12 +479,17 @@ function startServer(attempt = 0) {
     tryFreePort(PORT);
   }
 
+  const httpServer = createServer((req, res) => {
+    void handleBotApi(req, res);
+  });
   const wss = new WebSocketServer({
-    host: '0.0.0.0',
-    port: PORT,
+    noServer: true,
     // Compression spikes zlib CPU under concurrent mobile clients. Small,
     // capped JSON snapshots are cheaper and more latency-stable uncompressed.
     perMessageDeflate: false,
+  });
+  httpServer.on('upgrade', (req, socket, head) => {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   });
 
   let listening = false;
@@ -519,6 +579,116 @@ function startServer(attempt = 0) {
       };
     }
     return { type: 'roomInfo', players, lobby, mode };
+  }
+
+  function writeBotApi(res: ServerResponse, status: number, body: unknown) {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(JSON.stringify(body));
+  }
+
+  function isBotApiAuthorized(req: IncomingMessage) {
+    const expected = process.env.GAME_API_SECRET?.trim();
+    const received = req.headers['x-game-api-secret'];
+    return !!expected && typeof received === 'string' && received === expected;
+  }
+
+  async function readBotApiBody(req: IncomingMessage): Promise<unknown> {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of req) {
+      const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += part.length;
+      if (bytes > 5_000_000) throw new Error('Body is too large');
+      chunks.push(part);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  }
+
+  async function handleBotApi(req: IncomingMessage, res: ServerResponse) {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (!url.pathname.startsWith('/api/bot/')) {
+      writeBotApi(res, 404, { error: 'Not found' });
+      return;
+    }
+    if (!isBotApiAuthorized(req)) {
+      writeBotApi(res, 401, { error: 'Unauthorized' });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/bot/online') {
+      const counts = (['classic', 'soloFight', 'duoFight', 'trioFight'] as RoomMode[]).reduce(
+        (result, mode) => {
+          const info = getRoomInfo(mode);
+          result[mode] = { players: info.players, spectators: info.lobby };
+          return result;
+        },
+        {} as Record<RoomMode, { players: number; spectators: number }>
+      );
+      writeBotApi(res, 200, counts);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/bot/tops') {
+      const mode = url.searchParams.get('mode');
+      if (mode !== 'soloFight' && mode !== 'duoFight' && mode !== 'trioFight') {
+        writeBotApi(res, 400, { error: 'Invalid fight mode' });
+        return;
+      }
+      const top = [...persistentStore.getScores(mode).entries()]
+        .map(([name, score]) => ({ name, score }))
+        .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+      writeBotApi(res, 200, top);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/bot/chat-out') {
+      const room = parseMode(url.searchParams.get('room') || undefined);
+      const since = Math.max(0, Number(url.searchParams.get('since')) || 0);
+      const lines = botChatLines[room].filter((line) => line.id > since);
+      writeBotApi(res, 200, { lines, lastId: lines.at(-1)?.id ?? since });
+      return;
+    }
+    try {
+      const body = await readBotApiBody(req);
+      if (req.method === 'POST' && url.pathname === '/api/bot/chat') {
+        const input = body as { room?: string; name?: string; text?: string };
+        const room = parseMode(input.room);
+        const name = String(input.name || 'Telegram').trim().slice(0, 30) || 'Telegram';
+        const text = sanitizeChat(String(input.text || ''));
+        if (!text) {
+          writeBotApi(res, 400, { error: 'Empty chat message' });
+          return;
+        }
+        broadcastToRoom(room, { type: 'chat', name, text, t: Date.now(), color: '#27a9ff', fromTg: true });
+        writeBotApi(res, 200, { ok: true });
+        return;
+      }
+      if (url.pathname === '/api/bot/db') {
+        if (req.method === 'GET') {
+          writeBotApi(res, 200, { json: persistentStore.exportJson() });
+          return;
+        }
+        if (req.method === 'POST') {
+          const json = typeof (body as { json?: unknown }).json === 'string' ? (body as { json: string }).json : '';
+          const result = persistentStore.importJson(json);
+          if (!result.ok) {
+            writeBotApi(res, 400, result);
+            return;
+          }
+          sfState.scores = persistentStore.getScores('soloFight');
+          teamStates.duoFight.scores = persistentStore.getScores('duoFight');
+          teamStates.trioFight.scores = persistentStore.getScores('trioFight');
+          const config = persistentStore.getConfig();
+          if (config) applyClassicConfigAndSyncSf(config);
+          broadcastSoloFightTop();
+          broadcastTeamMeta('duoFight');
+          broadcastTeamMeta('trioFight');
+          writeBotApi(res, 200, { ok: true });
+          return;
+        }
+      }
+    } catch (error) {
+      writeBotApi(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
+      return;
+    }
+    writeBotApi(res, 405, { error: 'Method not allowed' });
   }
 
   function broadcastRoomInfo() {
@@ -1033,13 +1203,7 @@ function startServer(attempt = 0) {
   function announceJoin(room: RoomMode, session: ClientSession, name: string) {
     if (session.joinAnnouncedRoom === room) return;
     session.joinAnnouncedRoom = room;
-    broadcastToRoom(room, {
-      type: 'chat',
-      name,
-      text: 'присоединился к игре',
-      t: Date.now(),
-      color: '#94a3b8',
-    });
+    broadcastGameChat(room, name, 'присоединился к игре', '#94a3b8');
   }
 
   /** Same nick cannot occupy 2+ fighter slots (joined fighters + pending only). */
@@ -1330,7 +1494,7 @@ function startServer(attempt = 0) {
     }, getTickMs());
   }
 
-  wss.on('listening', () => {
+  httpServer.on('listening', () => {
     listening = true;
     const c = classicEngine.getState();
     const s = soloFightEngine.getState();
@@ -1341,9 +1505,9 @@ function startServer(attempt = 0) {
     console.log(`[agar-server] classic ${c.worldWidth}x${c.worldHeight}, soloFight ${s.worldWidth}x${s.worldHeight}`);
   });
 
-  wss.on('error', (err: NodeJS.ErrnoException) => {
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
-      wss.close();
+      httpServer.close();
       if (attempt === 0) {
         const freed = tryFreePort(PORT);
         if (freed) {
@@ -1725,8 +1889,7 @@ function startServer(attempt = 0) {
           }
           const name = live?.name || session.lastName || 'Player';
           const color = live?.color || session.lastColor || '#4ECDC4';
-          broadcastToRoom(session.room, { type: 'chat', name, text, t: now, color });
-          relayGameChat(session.room, name, text);
+          broadcastGameChat(session.room, name, text, color);
           break;
         }
         case 'input': {
@@ -1935,59 +2098,13 @@ function startServer(attempt = 0) {
     ws.on('error', cleanup);
   });
 
-  let relayGameChat: (room: RoomMode, name: string, text: string) => void = () => {};
-
-  startTelegramBot({
-    store: persistentStore,
-    getOnline: () => ({
-      classic: (() => {
-        const info = getRoomInfo('classic');
-        return { players: info.players, spectators: info.lobby };
-      })(),
-      soloFight: (() => {
-        const info = getRoomInfo('soloFight');
-        return { players: info.players, spectators: info.lobby };
-      })(),
-      duoFight: (() => {
-        const info = getRoomInfo('duoFight');
-        return { players: info.players, spectators: info.lobby };
-      })(),
-      trioFight: (() => {
-        const info = getRoomInfo('trioFight');
-        return { players: info.players, spectators: info.lobby };
-      })(),
-    }),
-    sendChat: (room, name, text) => {
-      const clean = sanitizeChat(text);
-      if (!clean) return;
-      broadcastToRoom(room, {
-        type: 'chat',
-        name,
-        text: clean,
-        t: Date.now(),
-        color: '#27a9ff',
-        fromTg: true,
-      });
-    },
-    setGameChatRelay: (relay) => {
-      relayGameChat = relay;
-    },
-    getTop: (mode) => {
-      const scores =
-        mode === 'soloFight'
-          ? sfState.scores
-          : teamStates[mode].scores;
-      return [...scores.entries()]
-        .map(([name, score]) => ({ name, score }))
-        .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-    },
-  });
-
+  httpServer.listen(PORT, '0.0.0.0');
   restartTickLoop();
 
   const shutdown = () => {
     if (tickTimer) clearInterval(tickTimer);
     wss.close();
+    httpServer.close();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
