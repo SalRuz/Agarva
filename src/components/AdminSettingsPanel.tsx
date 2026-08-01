@@ -29,7 +29,7 @@ const SECTIONS: SectionDef[] = [
       },
       { key: 'serverTickHz', label: 'Tick rate сервера', help: 'Частота обновления сервера в секунду.', step: 1 },
       { key: 'foodNetMax', label: 'Лимит еды в снапшоте', help: 'Сколько кусочков еды максимум отправлять клиенту.', step: 1 },
-      { key: 'ejectNetMax', label: 'Лимит W в снапшоте', help: 'Сколько W максимум отправлять клиенту.', step: 1 },
+      { key: 'ejectNetMax', label: 'Макс. W в обзоре', help: 'Сколько W максимум отображать и отправлять клиенту в его обзоре (1–200).', step: 1 },
     ],
   },
   {
@@ -227,6 +227,8 @@ interface AdminSettingsPanelProps {
   onSave: () => void;
   onImport: (text: string) => void;
   onExport: () => void;
+  onDownloadDb?: () => void;
+  onUploadDb?: (text: string) => void;
 }
 
 export function AdminSettingsPanel({
@@ -241,8 +243,11 @@ export function AdminSettingsPanel({
   onSave,
   onImport,
   onExport,
+  onDownloadDb,
+  onUploadDb,
 }: AdminSettingsPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dbFileInputRef = useRef<HTMLInputElement>(null);
   const totalFields = useMemo(() => SECTIONS.reduce((sum, section) => sum + section.fields.length, 0), []);
 
   if (!open) return null;
@@ -286,6 +291,42 @@ export function AdminSettingsPanel({
               {saveNotice}
             </div>
           )}
+
+          <section className="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4">
+            <h3 className="text-xl font-semibold text-white mb-2">Глобальная база данных</h3>
+            <p className="text-xs text-slate-400 mb-3">
+              Топы файт-режимов, ники и настройки игроков (по устройству), админ-конфиг. Файл: data/agarva.db.json
+            </p>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={() => onDownloadDb?.()}
+                className="px-4 py-2 rounded-xl bg-amber-600 text-white hover:bg-amber-700 transition"
+              >
+                Скачать БД
+              </button>
+              <button
+                type="button"
+                onClick={() => dbFileInputRef.current?.click()}
+                className="px-4 py-2 rounded-xl bg-white/10 text-white hover:bg-white/20 transition"
+              >
+                Загрузить БД
+              </button>
+              <input
+                ref={dbFileInputRef}
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const text = await file.text();
+                  onUploadDb?.(text);
+                  e.currentTarget.value = '';
+                }}
+              />
+            </div>
+          </section>
 
           {SECTIONS.map((section) => (
             <section key={section.title} className="rounded-2xl border border-white/10 bg-white/5 p-4">

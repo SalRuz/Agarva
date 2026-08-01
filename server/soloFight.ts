@@ -35,7 +35,10 @@ export interface SoloFightState {
   fightEndsAt: number;
   /** session socket ids or player session refs tracked externally */
   fighterPlayerIds: string[];
-  scores: Map<string, number>; // by player name — persistent across matches
+  /** Career wins, persisted and used by menu/Telegram tops. */
+  scores: Map<string, number>;
+  /** Consecutive match wins, used only by the in-match HUD. */
+  streaks: Map<string, number>;
   names: string[];
 }
 
@@ -76,8 +79,8 @@ export function makeSoloFightHud(state: SoloFightState): SoloFightHudMessage {
     phase: state.phase,
     countdown,
     fightSecondsLeft,
-    a: { name: aName, score: state.scores.get(aName) ?? 0 },
-    b: { name: bName, score: state.scores.get(bName) ?? 0 },
+    a: { name: aName, score: state.streaks.get(aName) ?? 0 },
+    b: { name: bName, score: state.streaks.get(bName) ?? 0 },
   };
 }
 
@@ -107,6 +110,7 @@ export function createEmptySoloFightState(): SoloFightState {
     fightEndsAt: 0,
     fighterPlayerIds: [],
     scores: new Map(),
+    streaks: new Map(),
     names: [],
   };
 }
@@ -118,8 +122,6 @@ export function cloneSoloDefaults(): GameplayConfig {
 export function isSoloFightJoinBlocked(phase: SoloFightPhase): boolean {
   return (
     phase === 'fighting' ||
-    phase === 'countdown' ||
-    phase === 'ended' ||
-    phase === 'resetting'
+    phase === 'countdown'
   );
 }

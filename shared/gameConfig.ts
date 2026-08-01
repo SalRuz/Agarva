@@ -157,7 +157,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   splitLaunchSharpnessSmall: 1,
   splitLaunchSharpnessLarge: 2.5,
   centerCursorSplitChainEnabled: 1,
-  splitInheritVelocityEnabled: 1,
+  splitInheritVelocityEnabled: 0,
   nameScale: 0.28,
   nameStrokeWidth: 0.02,
   splitFriction: 0.93,
@@ -207,7 +207,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   ejectGracePeriod: 200,
   ejectFriction: 0.945,
   ejectMaxCount: 3000,
-  ejectNetMax: 60,
+  ejectNetMax: 200,
   massDecayPerSec: 0.002,
   massDecayMin: 50,
   botAiIntervalMs: 250,
@@ -318,7 +318,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.ejectGracePeriod = Math.max(0, Math.round(out.ejectGracePeriod));
   out.ejectFriction = clampRange(out.ejectFriction, 0, 0.9999);
   out.ejectMaxCount = Math.max(1, Math.round(out.ejectMaxCount));
-  out.ejectNetMax = Math.max(1, Math.round(out.ejectNetMax));
+  out.ejectNetMax = clampRange(Math.round(out.ejectNetMax), 1, 200);
   out.massDecayPerSec = Math.max(0, out.massDecayPerSec);
   out.massDecayMin = Math.max(0, out.massDecayMin);
   out.botAiIntervalMs = Math.max(10, Math.round(out.botAiIntervalMs));

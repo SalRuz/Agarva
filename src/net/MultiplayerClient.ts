@@ -38,7 +38,18 @@ export interface MultiplayerCallbacks {
     b: { name: string; score: number };
   }) => void;
   onSoloFightTop?: (entries: { name: string; score: number }[]) => void;
-  onTeamFightHud?: (hud: { mode: 'duoFight' | 'trioFight'; phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting'; countdown: number; fightSecondsLeft?: number; blue: { alive: number; total: number; members: string[] }; red: { alive: number; total: number; members: string[] } }) => void;
+  onTeamFightHud?: (hud: { mode: 'duoFight' | 'trioFight'; phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting'; countdown: number; fightSecondsLeft?: number; blue: { alive: number; total: number; members: string[]; streaks: Record<string, number> }; red: { alive: number; total: number; members: string[]; streaks: Record<string, number> } }) => void;
+  onTeamFightTop?: (mode: 'soloFight' | 'duoFight' | 'trioFight', entries: { name: string; score: number }[]) => void;
+  onPlayerProfile?: (profile: {
+    deviceId: string;
+    lastNick?: string;
+    skinId?: string;
+    prefs?: Record<string, unknown>;
+    accountLogin?: string;
+  }) => void;
+  onRegisterAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
+  onAdminDbExport?: (json: string) => void;
+  onAdminDbResult?: (ok: boolean, message: string) => void;
 }
 
 interface Snap {
@@ -249,6 +260,8 @@ export class MultiplayerClient {
   private static readonly INPUT_MIN_DELTA = 2;
   private spectateOnly = false;
   private ownedIds: string[] = [];
+  private deviceId = '';
+  private fingerprint = '';
   private roomMode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight' = 'classic';
   private roomTeam: 'blue' | 'red' | undefined;
   /** Retain skins when server omits unchanged skin fields */
@@ -260,6 +273,11 @@ export class MultiplayerClient {
     this.callbacks = callbacks;
     this.password = password;
     this.skin = skin;
+  }
+
+  setDeviceIdentity(deviceId: string, fingerprint: string) {
+    this.deviceId = deviceId;
+    this.fingerprint = fingerprint;
   }
 
   setRoomMode(mode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight') {
@@ -294,6 +312,8 @@ export class MultiplayerClient {
       skin?: string;
       mode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
       team?: 'blue' | 'red';
+      deviceId?: string;
+      fingerprint?: string;
     } = {
       type: 'join',
       name,
@@ -302,6 +322,8 @@ export class MultiplayerClient {
     if (this.roomTeam) msg.team = this.roomTeam;
     if (isAdminName(name) && this.password) msg.password = this.password;
     if (this.skin) msg.skin = this.skin;
+    if (this.deviceId) msg.deviceId = this.deviceId;
+    if (this.fingerprint) msg.fingerprint = this.fingerprint;
     return msg;
   }
 
@@ -481,6 +503,29 @@ export class MultiplayerClient {
       case 'soloFightTop':
         this.callbacks.onSoloFightTop?.(msg.entries);
         break;
+      case 'teamFightTop':
+        this.callbacks.onTeamFightTop?.(msg.mode, msg.entries);
+        break;
+      case 'playerProfile':
+        this.callbacks.onPlayerProfile?.(msg);
+        if (msg.deviceId) {
+          this.deviceId = msg.deviceId;
+          try {
+            localStorage.setItem('agarvaDeviceId', msg.deviceId);
+          } catch {
+            /* ignore */
+          }
+        }
+        break;
+      case 'registerAccountResult':
+        this.callbacks.onRegisterAccountResult?.(msg.ok, msg.message, msg.accountLogin);
+        break;
+      case 'adminDbExport':
+        this.callbacks.onAdminDbExport?.(msg.json);
+        break;
+      case 'adminDbResult':
+        this.callbacks.onAdminDbResult?.(msg.ok, msg.message);
+        break;
       case 'teamFightHud':
         this.callbacks.onTeamFightHud?.(msg);
         break;
@@ -494,7 +539,12 @@ export class MultiplayerClient {
           }
         }
         if (msg.leaderboard) this.lastLeaderboard = msg.leaderboard;
-        this.snapPrev = this.snapCurr;
+        // A multibox switch changes `you` to a different owned player. Do not
+        // interpolate the old cell into the new one: GameCanvas must receive the
+        // new position and radius immediately so both camera axes and zoom snap.
+        const activePlayerChanged =
+          this.snapCurr?.you?.id !== undefined && this.snapCurr.you.id !== you?.id;
+        this.snapPrev = activePlayerChanged ? null : this.snapCurr;
         this.snapCurr = {
           localT: performance.now(),
           state,
@@ -627,6 +677,34 @@ export class MultiplayerClient {
 
   adminSpawnBot(x: number, y: number, mass = 500) {
     this.send({ type: 'adminSpawnBot', x, y, mass });
+  }
+
+  syncProfile(payload: {
+    deviceId: string;
+    fingerprint?: string;
+    lastNick?: string;
+    skinId?: string | null;
+    prefs?: Record<string, unknown>;
+  }) {
+    this.send({ type: 'syncProfile', ...payload });
+  }
+
+  adminDownloadDb() {
+    this.send({ type: 'adminDownloadDb' });
+  }
+
+  adminUploadDb(json: string) {
+    this.send({ type: 'adminUploadDb', json });
+  }
+
+  registerAccount(login: string, password: string) {
+    this.send({
+      type: 'registerAccount',
+      deviceId: this.deviceId,
+      fingerprint: this.fingerprint,
+      login,
+      password,
+    });
   }
 
   resetStarter() {

@@ -107,6 +107,8 @@ export function GameCanvas({
     targetScale: 1,
     userZoom: 1,
   });
+  /** The active owned player is allowed to change only on a multibox switch. */
+  const cameraPlayerIdRef = useRef<string | null>(null);
   const mouseWorldRef = useRef({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 });
   /** Last mouse position in canvas pixels — recomputed to world every frame */
   const mouseScreenRef = useRef({ x: 0, y: 0, valid: false });
@@ -312,7 +314,12 @@ export function GameCanvas({
     let fpsFrames = 0;
     let fpsLastAt = performance.now();
 
-    const computeAutoZoom = (player: Player, width: number, height: number): number => {
+    const computeAutoZoom = (
+      player: Player,
+      width: number,
+      height: number,
+      useVisualRadius = true
+    ): number => {
       let sumR = 0;
       let minX = Infinity;
       let maxX = -Infinity;
@@ -320,7 +327,7 @@ export function GameCanvas({
       let maxY = -Infinity;
 
       for (const cell of player.cells) {
-        const r = cell.visualRadius > 0 ? cell.visualRadius : cell.radius;
+        const r = useVisualRadius && cell.visualRadius > 0 ? cell.visualRadius : cell.radius;
         sumR += r;
         minX = Math.min(minX, cell.x - r);
         maxX = Math.max(maxX, cell.x + r);
@@ -383,6 +390,20 @@ export function GameCanvas({
         targetY = center.y;
         const auto = computeAutoZoom(currentPlayer, width, height);
         cameraRef.current.targetScale = auto * cameraRef.current.userZoom;
+        // Switching multibox ownership is a hard camera cut. Position updates for
+        // the same player remain smooth below. Use physical radii here, not their
+        // visual growth/shrink interpolation, so a small↔large switch cannot
+        // inherit a zoom animation from the previously rendered cell.
+        if (cameraPlayerIdRef.current !== currentPlayer.id) {
+          cameraPlayerIdRef.current = currentPlayer.id;
+          cameraRef.current.targetScale =
+            computeAutoZoom(currentPlayer, width, height, false) * cameraRef.current.userZoom;
+          cameraRef.current.x = targetX;
+          cameraRef.current.y = targetY;
+          cameraRef.current.scale = cameraRef.current.targetScale;
+        }
+      } else {
+        cameraPlayerIdRef.current = null;
       }
 
       // Smooth camera — snappier while spectating so mouse look feels immediate

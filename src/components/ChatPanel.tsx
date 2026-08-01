@@ -7,6 +7,7 @@ export interface ChatLine {
   text: string;
   t: number;
   color?: string;
+  fromTg?: boolean;
 }
 
 interface ChatPanelProps {
@@ -119,6 +120,7 @@ export function ChatPanel({
               >
                 {m.name}
               </button>
+              {m.fromTg && <span className="ml-1 font-bold text-sky-400">(TG)</span>}
               <span className="text-gray-500">: </span>
               <span>{m.text}</span>
             </div>

@@ -35,11 +35,11 @@ export function SoloFightHud({ phase, countdown, fightSecondsLeft, a, b }: SoloF
         <div className="space-y-1 text-sm">
           <div className="flex justify-between gap-4 text-white">
             <span className="truncate max-w-[120px]">{a.name || '—'}</span>
-            <span className="font-mono text-emerald-300">{a.score}</span>
+            <span className="font-mono text-emerald-300">🔥 {a.score}</span>
           </div>
           <div className="flex justify-between gap-4 text-white">
             <span className="truncate max-w-[120px]">{b.name || '—'}</span>
-            <span className="font-mono text-emerald-300">{b.score}</span>
+            <span className="font-mono text-emerald-300">🔥 {b.score}</span>
           </div>
         </div>
       </div>

@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { execSync } from 'node:child_process';
+import 'dotenv/config';
 import { GameEngine } from '../shared/GameEngine';
 import {
   defaultGameplayConfig,
@@ -47,10 +48,14 @@ import {
   TEAM_FIGHT_RESET_MS,
   TEAM_FIGHT_START_MASS,
 } from './teamFight';
+import { PersistentStore, type FightMode } from './persistentStore';
+import { startTelegramBot } from './telegramBot';
 
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
-/** Physics remains at 30 Hz; state snapshots use 20 Hz (2 out of 3 ticks). */
-const STATE_SEND_MODULO = 3;
+/** Physics remains at 30 Hz; state snapshots use 15 Hz (every other tick). */
+const STATE_SEND_MODULO = 2;
+/** Hard transport ceiling for food; ejected-mass cap is configured by the admin. */
+const NETWORK_FOOD_MAX = 100;
 
 interface ClientSession {
   ws: WebSocket;
@@ -76,8 +81,10 @@ interface ClientSession {
   lastName: string;
   lastColor: string;
   lastSkin: string;
-  /** Last skin id sent per player id (omit unchanged skins from packets) */
-  sentSkins: Map<string, string>;
+  /** Stable device profile id */
+  deviceId: string;
+  /** Room we already announced join for (no re-announce on respawn). */
+  joinAnnouncedRoom: RoomMode | null;
   /** Tick counter for throttling heavy extras */
   tickCount: number;
   lastSfHudKey: string;
@@ -164,7 +171,10 @@ function sanitizeChat(text: string): string {
 }
 
 function startServer(attempt = 0) {
-  let classicConfig: GameplayConfig = sanitizeGameplayConfig(defaultGameplayConfig);
+  const persistentStore = new PersistentStore();
+  let classicConfig: GameplayConfig = sanitizeGameplayConfig(
+    persistentStore.getConfig() ?? defaultGameplayConfig
+  );
   const classicEngine = new GameEngine({
     botCount: classicConfig.botCountMp,
     foodCount: classicConfig.foodCountMp,
@@ -179,8 +189,11 @@ function startServer(attempt = 0) {
   let soloFightConfig: GameplayConfig = sfCreated.config;
   const soloFightEngine = sfCreated.engine;
   const sfState: SoloFightState = createEmptySoloFightState();
+  sfState.scores = persistentStore.getScores('soloFight');
   /** Registered duelists (kept through death until leave / both gone) */
   let sfDuelists: ClientSession[] = [];
+  /** Joins received while the finished arena is being cleared. */
+  const pendingSoloFightJoins: { session: ClientSession; name: string; skin: string }[] = [];
   /** Guard against re-entrant match end (death + timeout same tick) */
   let sfMatchEnding = false;
   const duoCreated = createTeamFightEngine(syncTeamFightFromClassic(classicConfig));
@@ -190,12 +203,26 @@ function startServer(attempt = 0) {
   const duoFightEngine = duoCreated.engine;
   const trioFightEngine = trioCreated.engine;
   const teamStates: Record<TeamFightMode, TeamFightState> = {
-    duoFight: createEmptyTeamFightState(),
-    trioFight: createEmptyTeamFightState(),
+    duoFight: { ...createEmptyTeamFightState(), scores: persistentStore.getScores('duoFight') },
+    trioFight: { ...createEmptyTeamFightState(), scores: persistentStore.getScores('trioFight') },
   };
   const teamFighters: Record<TeamFightMode, ClientSession[]> = { duoFight: [], trioFight: [] };
+  /** Team selections received while the finished arena is being cleared. */
+  const pendingTeamFightJoins: Record<
+    TeamFightMode,
+    { session: ClientSession; name: string; skin: string; team: FightTeam }[]
+  > = { duoFight: [], trioFight: [] };
 
   const clients = new Map<WebSocket, ClientSession>();
+
+  function removePendingFightJoin(session: ClientSession) {
+    for (let i = pendingSoloFightJoins.length - 1; i >= 0; i--) {
+      if (pendingSoloFightJoins[i].session === session) pendingSoloFightJoins.splice(i, 1);
+    }
+    for (const mode of ['duoFight', 'trioFight'] as TeamFightMode[]) {
+      pendingTeamFightJoins[mode] = pendingTeamFightJoins[mode].filter((entry) => entry.session !== session);
+    }
+  }
 
   function engineFor(room: RoomMode): GameEngine {
     if (room === 'soloFight') return soloFightEngine;
@@ -228,7 +255,6 @@ function startServer(attempt = 0) {
 
   function toNetPlayer(
     p: Player,
-    session: ClientSession,
     cellFilter?: (c: Player['cells'][0]) => boolean
   ): NetPlayer {
     const cells = cellFilter ? p.cells.filter(cellFilter) : p.cells;
@@ -239,22 +265,16 @@ function startServer(attempt = 0) {
       score: p.score,
       cells: cells.map((c) => ({
         id: c.id,
-        x: Math.round(c.x * 10) / 10,
-        y: Math.round(c.y * 10) / 10,
-        r: Math.round(c.radius * 10) / 10,
+        x: Math.round(c.x),
+        y: Math.round(c.y),
+        r: Math.round(c.radius * 2) / 2,
         c: c.color,
       })),
       fr: p.frozen ? 1 : 0,
     };
-    const skin = p.skin || '';
-    const prev = session.sentSkins.get(p.id);
-    if (skin && skin !== prev) {
-      net.skin = skin;
-      session.sentSkins.set(p.id, skin);
-    } else if (!skin && prev) {
-      net.skin = '';
-      session.sentSkins.delete(p.id);
-    }
+    // Include this every snapshot: clients can enter FOV after missing the
+    // original packet, so omitting an unchanged skin is not reliable.
+    net.skin = p.skin || '';
     return net;
   }
 
@@ -343,7 +363,7 @@ function startServer(attempt = 0) {
       center.x,
       center.y,
       viewR2,
-      cfg.foodNetMax,
+      Math.min(cfg.foodNetMax, NETWORK_FOOD_MAX),
       (f) => ({
         id: f.id,
         x: Math.round(f.x),
@@ -357,8 +377,8 @@ function startServer(attempt = 0) {
       if (!cellInView(v.x, v.y, v.radius)) continue;
       viruses.push({
         id: v.id,
-        x: Math.round(v.x * 10) / 10,
-        y: Math.round(v.y * 10) / 10,
+        x: Math.round(v.x),
+        y: Math.round(v.y),
         r: Math.round(v.radius),
         ch: v.charge,
       });
@@ -372,9 +392,9 @@ function startServer(attempt = 0) {
       cfg.ejectNetMax,
       (e) => ({
         id: e.id,
-        x: Math.round(e.x * 10) / 10,
-        y: Math.round(e.y * 10) / 10,
-        r: Math.round(e.radius * 10) / 10,
+        x: Math.round(e.x),
+        y: Math.round(e.y),
+        r: Math.round(e.radius * 2) / 2,
         c: e.color,
       })
     );
@@ -384,15 +404,15 @@ function startServer(attempt = 0) {
       .filter((p) => p.cells.length > 0 && p.id !== youId)
       .map((p) =>
         ownedSet.has(p.id)
-          ? toNetPlayer(p, session)
-          : toNetPlayer(p, session, (c) => cellInView(c.x, c.y, c.radius))
+          ? toNetPlayer(p)
+          : toNetPlayer(p, (c) => cellInView(c.x, c.y, c.radius))
       )
       .filter((p) => p.cells.length > 0);
 
     const msg: StateMessage = {
       type: 'state',
       t: Date.now(),
-      you: playing ? toNetPlayer(youPlayer!, session) : null,
+      you: playing ? toNetPlayer(youPlayer!) : null,
       players,
       food,
       viruses,
@@ -410,7 +430,13 @@ function startServer(attempt = 0) {
     tryFreePort(PORT);
   }
 
-  const wss = new WebSocketServer({ host: '0.0.0.0', port: PORT });
+  const wss = new WebSocketServer({
+    host: '0.0.0.0',
+    port: PORT,
+    // JSON snapshots are highly repetitive. Compress only substantial packets to
+    // preserve CPU for short control messages while reducing mobile transfer.
+    perMessageDeflate: { threshold: 1024 },
+  });
 
   let listening = false;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -477,7 +503,7 @@ function startServer(attempt = 0) {
         continue;
       }
       if (isTeamFight(mode)) {
-        if (teamFighters[mode].includes(session) && (session.joined || teamStates[mode].phase === 'ended')) players += 1;
+        if (teamFighters[mode].includes(session) && session.joined) players += 1;
         else if (session.spectating) lobby += 1;
         continue;
       }
@@ -550,8 +576,12 @@ function startServer(attempt = 0) {
     }
     sfMatchEnding = true;
 
-    if (winnerName) {
-      sfState.scores.set(winnerName, (sfState.scores.get(winnerName) ?? 0) + 1);
+    for (const session of sfDuelists) {
+      const won = winnerName !== null && session.lastName === winnerName;
+      sfState.streaks.set(session.lastName, won ? (sfState.streaks.get(session.lastName) ?? 0) + 1 : 0);
+      if (won) {
+        sfState.scores.set(session.lastName, persistentStore.recordWin('soloFight', session.lastName));
+      }
     }
 
     freezeSfFighters(true);
@@ -590,6 +620,14 @@ function startServer(attempt = 0) {
     sfState.betweenEndsAt = 0;
     sfState.resetEndsAt = 0;
     sfState.fightEndsAt = 0;
+    applyPendingSoloFightJoins();
+  }
+
+  function applyPendingSoloFightJoins() {
+    const pending = pendingSoloFightJoins.splice(0);
+    for (const { session, name, skin } of pending) {
+      if (session.ws.readyState === WebSocket.OPEN) joinSoloFight(session, name, skin);
+    }
   }
 
   function handleSoloFightDeath(deadSession: ClientSession) {
@@ -612,7 +650,7 @@ function startServer(attempt = 0) {
     if (!sfDuelists.includes(session)) return;
     const wasFighting = sfState.phase === 'fighting';
     const wasCountdown = sfState.phase === 'countdown';
-    const wasEnded = sfState.phase === 'ended';
+    const wasEnded = sfState.phase === 'ended' || sfState.phase === 'resetting';
     const remaining = sfDuelists.filter((s) => s !== session);
 
     if (wasFighting && remaining.length === 1 && remaining[0].joined) {
@@ -623,14 +661,19 @@ function startServer(attempt = 0) {
     sfDuelists = remaining;
 
     if (sfDuelists.length === 0) {
-      sfState.phase = 'waiting';
+      // If rematch joins were queued while the post-win timer ran, apply them now.
+      // Previously phase jumped to waiting and pending joins were dropped forever.
+      soloFightEngine.clearArenaLoot();
+      sfState.names = [];
+      sfState.fighterPlayerIds = [];
       sfState.countdownEndsAt = 0;
       sfState.betweenEndsAt = 0;
       sfState.resetEndsAt = 0;
       sfState.fightEndsAt = 0;
-      sfState.names = [];
-      sfState.fighterPlayerIds = [];
-      soloFightEngine.clearArenaLoot();
+      sfState.phase = 'waiting';
+      applyPendingSoloFightJoins();
+      broadcastSfHud();
+      broadcastRoomInfo();
       return;
     }
 
@@ -726,7 +769,12 @@ function startServer(attempt = 0) {
 
   function broadcastTeamMeta(mode: TeamFightMode) {
     const state = teamStates[mode];
-    const hud = makeTeamFightHud(mode, state, (team) => teamMembers(mode, team));
+    const hud = makeTeamFightHud(
+      mode,
+      state,
+      (team) => teamMembers(mode, team),
+      getRoomInfo(mode).lobby
+    );
     broadcastToRoom(mode, hud);
     broadcastToRoom(mode, makeTeamFightTop(mode, state));
   }
@@ -747,17 +795,25 @@ function startServer(attempt = 0) {
     }
     teamFighters[mode] = [];
     engine.clearArenaLoot();
-    teamStates[mode] = createEmptyTeamFightState();
+    teamStates[mode] = {
+      ...createEmptyTeamFightState(),
+      scores: persistentStore.getScores(mode),
+      streaks: teamStates[mode].streaks,
+    };
+    applyPendingTeamFightJoins(mode);
   }
 
   function endTeamFight(mode: TeamFightMode, winner: FightTeam | null) {
     const state = teamStates[mode];
     if (state.phase !== 'fighting') return;
-    if (winner) {
-      for (const session of teamFighters[mode]) {
-        if (session.team === winner) {
-          state.scores.set(session.lastName, (state.scores.get(session.lastName) ?? 0) + 1);
-        }
+    for (const session of teamFighters[mode]) {
+      const won = winner !== null && session.team === winner;
+      state.streaks.set(session.lastName, won ? (state.streaks.get(session.lastName) ?? 0) + 1 : 0);
+      if (won) {
+        state.scores.set(
+          session.lastName,
+          persistentStore.recordWin(mode as FightMode, session.lastName)
+        );
       }
     }
     freezeTeamFighters(mode, true);
@@ -771,6 +827,13 @@ function startServer(attempt = 0) {
     }
     broadcastTeamMeta(mode);
     broadcastRoomInfo();
+  }
+
+  function applyPendingTeamFightJoins(mode: TeamFightMode) {
+    const pending = pendingTeamFightJoins[mode].splice(0);
+    for (const { session, name, skin, team } of pending) {
+      if (session.ws.readyState === WebSocket.OPEN) joinTeamFight(session, mode, name, skin, team);
+    }
   }
 
   function checkTeamFightWinner(mode: TeamFightMode) {
@@ -815,8 +878,8 @@ function startServer(attempt = 0) {
   }
 
   function joinTeamFight(session: ClientSession, mode: TeamFightMode, name: string, skin: string, team?: FightTeam) {
-    const state = teamStates[mode];
-    const fighters = teamFighters[mode].filter((s) => s.ws.readyState === WebSocket.OPEN);
+    let state = teamStates[mode];
+    let fighters = teamFighters[mode].filter((s) => s.ws.readyState === WebSocket.OPEN);
     teamFighters[mode] = fighters;
     const size = teamSizeFor(mode);
     if (!team || (team !== 'blue' && team !== 'red')) {
@@ -825,6 +888,37 @@ function startServer(attempt = 0) {
       send(session.ws, { type: 'error', message: 'Выберите команду' });
       send(session.ws, { type: 'roomInfo', players: fighters.length, lobby: 0, mode });
       broadcastTeamMeta(mode);
+      return;
+    }
+    if (state.phase === 'ended' || state.phase === 'resetting') {
+      pendingTeamFightJoins[mode] = pendingTeamFightJoins[mode].filter((entry) => entry.session !== session);
+      const engine = engineFor(mode);
+      for (const s of teamFighters[mode]) {
+        clearSessionPlayers(s, engine);
+        s.joined = false;
+        s.team = undefined;
+      }
+      teamFighters[mode] = [];
+      engine.clearArenaLoot();
+      teamStates[mode] = {
+        ...createEmptyTeamFightState(),
+        scores: persistentStore.getScores(mode),
+        streaks: teamStates[mode].streaks,
+      };
+      state = teamStates[mode];
+      fighters = [];
+    }
+    if (isFightNickTaken(mode, name, session)) {
+      send(session.ws, {
+        type: 'error',
+        message: 'Этот ник уже в этом файте — смените ник и нажмите «Войти» снова',
+      });
+      session.room = mode;
+      session.lobbyOnly = true;
+      session.spectating = false;
+      session.joined = false;
+      session.team = undefined;
+      clearSessionPlayers(session, engineFor(mode));
       return;
     }
     const onTeam = fighters.filter((s) => s.team === team);
@@ -869,6 +963,7 @@ function startServer(attempt = 0) {
     refreshAdmin(session);
     sendWelcome(session, player.id, engineFor(mode), session.isAdmin);
     send(session.ws, { type: 'settings', settings: configFor(mode), mode });
+    announceJoin(mode, session, name);
     broadcastTeamMeta(mode);
     broadcastRoomInfo();
   }
@@ -876,6 +971,7 @@ function startServer(attempt = 0) {
   function leaveTeamFight(session: ClientSession, mode: TeamFightMode) {
     if (!teamFighters[mode].includes(session)) return;
     const state = teamStates[mode];
+    const wasEnded = state.phase === 'ended' || state.phase === 'resetting';
     teamFighters[mode] = teamFighters[mode].filter((s) => s !== session);
     clearSessionPlayers(session, engineFor(mode));
     session.team = undefined;
@@ -887,8 +983,16 @@ function startServer(attempt = 0) {
       engineFor(mode).clearArenaLoot();
     }
     if (teamFighters[mode].length === 0) {
-      teamStates[mode] = createEmptyTeamFightState();
+      teamStates[mode] = {
+        ...createEmptyTeamFightState(),
+        scores: persistentStore.getScores(mode),
+        streaks: wasEnded ? state.streaks : new Map(),
+      };
       engineFor(mode).clearArenaLoot();
+      applyPendingTeamFightJoins(mode);
+      broadcastTeamMeta(mode);
+      broadcastRoomInfo();
+      return;
     }
     broadcastTeamMeta(mode);
   }
@@ -926,9 +1030,103 @@ function startServer(attempt = 0) {
     broadcastRoomInfo();
   }
 
+  function normalizeNick(name: string) {
+    return name.trim().toLowerCase();
+  }
+
+  function announceJoin(room: RoomMode, session: ClientSession, name: string) {
+    if (session.joinAnnouncedRoom === room) return;
+    session.joinAnnouncedRoom = room;
+    broadcastToRoom(room, {
+      type: 'chat',
+      name,
+      text: 'присоединился к игре',
+      t: Date.now(),
+      color: '#94a3b8',
+    });
+  }
+
+  /** Same nick cannot occupy 2+ fighter slots (joined fighters + pending only). */
+  function isFightNickTaken(
+    mode: 'soloFight' | TeamFightMode,
+    name: string,
+    except: ClientSession
+  ): boolean {
+    const nick = normalizeNick(name);
+    if (!nick) return false;
+    if (mode === 'soloFight') {
+      for (const s of sfDuelists) {
+        if (s === except || s.ws.readyState !== WebSocket.OPEN || !s.joined) continue;
+        if (normalizeNick(s.lastName) === nick) return true;
+      }
+      for (const entry of pendingSoloFightJoins) {
+        if (entry.session === except) continue;
+        if (entry.session.ws.readyState !== WebSocket.OPEN) continue;
+        if (normalizeNick(entry.name) === nick) return true;
+      }
+      return false;
+    }
+    for (const s of teamFighters[mode]) {
+      if (s === except || s.ws.readyState !== WebSocket.OPEN || !s.joined) continue;
+      if (normalizeNick(s.lastName) === nick) return true;
+    }
+    for (const entry of pendingTeamFightJoins[mode]) {
+      if (entry.session === except) continue;
+      if (entry.session.ws.readyState !== WebSocket.OPEN) continue;
+      if (normalizeNick(entry.name) === nick) return true;
+    }
+    return false;
+  }
+
+  function forceResetSoloFightArena() {
+    for (const s of [...sfDuelists]) {
+      clearSessionPlayers(s, soloFightEngine);
+      s.joined = false;
+      s.activeIndex = 0;
+      if (s.ws.readyState === WebSocket.OPEN) {
+        send(s.ws, { type: 'died' });
+        send(s.ws, makeSoloFightHud(sfState));
+      }
+    }
+    sfDuelists = [];
+    soloFightEngine.clearArenaLoot();
+    sfState.names = [];
+    sfState.fighterPlayerIds = [];
+    sfState.phase = 'waiting';
+    sfState.countdownEndsAt = 0;
+    sfState.betweenEndsAt = 0;
+    sfState.resetEndsAt = 0;
+    sfState.fightEndsAt = 0;
+  }
+
   function joinSoloFight(session: ClientSession, name: string, skin: string) {
     const openDuelists = sfDuelists.filter((s) => s.ws.readyState === WebSocket.OPEN);
     sfDuelists = openDuelists;
+
+    // Rematch during post-win timer: clear arena immediately and join as waiting.
+    if (sfState.phase === 'ended' || sfState.phase === 'resetting') {
+      pendingSoloFightJoins.splice(
+        0,
+        pendingSoloFightJoins.length,
+        ...pendingSoloFightJoins.filter((entry) => entry.session !== session)
+      );
+      forceResetSoloFightArena();
+      broadcastSfHud();
+      // fall through into normal waiting join
+    }
+
+    if (isFightNickTaken('soloFight', name, session)) {
+      send(session.ws, {
+        type: 'error',
+        message: 'Этот ник уже в соло файте — смените ник и нажмите «Войти» снова',
+      });
+      session.room = 'soloFight';
+      session.lobbyOnly = true;
+      session.spectating = false;
+      session.joined = false;
+      clearSessionPlayers(session, soloFightEngine);
+      return;
+    }
 
     // Only allow joining as a fighter while waiting with a free slot
     if (isSoloFightJoinBlocked(sfState.phase) || sfDuelists.length >= 2) {
@@ -973,6 +1171,7 @@ function startServer(attempt = 0) {
       send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
       send(session.ws, makeSoloFightHud(sfState));
       send(session.ws, makeSoloFightTop(sfState));
+      announceJoin('soloFight', session, name);
       broadcastRoomInfo();
       return;
     }
@@ -1009,6 +1208,7 @@ function startServer(attempt = 0) {
       send(d.ws, makeSoloFightHud(sfState));
       send(d.ws, makeSoloFightTop(sfState));
     }
+    announceJoin('soloFight', session, name);
     broadcastRoomInfo();
   }
 
@@ -1089,11 +1289,11 @@ function startServer(attempt = 0) {
         if (session.lobbyOnly) continue;
         session.tickCount = (session.tickCount + 1) | 0;
         if (ws.bufferedAmount > 256_000) continue;
-        // Send two snapshots every three simulation ticks: inputs/physics stay
-        // responsive at 30 Hz, while remote JSON traffic and stringify work drop
-        // by a third. Client interpolation already covers the skipped tick.
-        if (session.tickCount % STATE_SEND_MODULO === 0) continue;
-        const includeLb = session.tickCount % (STATE_SEND_MODULO * 5) === 1;
+        // Physics/input stay at 30 Hz; clients interpolate the 15 Hz snapshots.
+        // This halves the dominant JSON stream without degrading control feel.
+        if (session.tickCount % STATE_SEND_MODULO !== 0) continue;
+        // Leaderboard is UI-only, so refresh it at 1.5 Hz instead of every state.
+        const includeLb = session.tickCount % (STATE_SEND_MODULO * 10) === 0;
         send(ws, buildStateFor(session, includeLb));
         if (session.room === 'soloFight') {
           const hud = makeSoloFightHud(sfState);
@@ -1104,7 +1304,12 @@ function startServer(attempt = 0) {
           }
         }
         if (isTeamFight(session.room)) {
-          const hud = makeTeamFightHud(session.room, teamStates[session.room], (team) => teamMembers(session.room as TeamFightMode, team));
+          const hud = makeTeamFightHud(
+            session.room,
+            teamStates[session.room],
+            (team) => teamMembers(session.room as TeamFightMode, team),
+            getRoomInfo(session.room).lobby
+          );
           const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.blue.alive}|${hud.red.alive}`;
           if (key !== session.lastSfHudKey || session.tickCount % 4 === 0) {
             session.lastSfHudKey = key;
@@ -1167,7 +1372,8 @@ function startServer(attempt = 0) {
       lastName: 'Player',
       lastColor: '#4ECDC4',
       lastSkin: '',
-      sentSkins: new Map(),
+      deviceId: '',
+      joinAnnouncedRoom: null,
       tickCount: 0,
       lastSfHudKey: '',
     };
@@ -1204,6 +1410,7 @@ function startServer(attempt = 0) {
         }
         case 'lobby': {
           const mode = parseMode(msg.mode);
+          removePendingFightJoin(session);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
             clearSessionPlayers(session, soloFightEngine);
@@ -1212,6 +1419,7 @@ function startServer(attempt = 0) {
           } else {
             clearSessionPlayers(session, engine());
           }
+          if (session.room !== mode) session.joinAnnouncedRoom = null;
           session.room = mode;
           session.lobbyOnly = true;
           session.spectating = false;
@@ -1223,12 +1431,13 @@ function startServer(attempt = 0) {
           }
           if (isTeamFight(mode)) {
             send(ws, makeTeamFightTop(mode, teamStates[mode]));
-            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team)));
+            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team), getRoomInfo(mode).lobby));
           }
           break;
         }
         case 'spectate': {
           const mode = parseMode(msg.mode);
+          removePendingFightJoin(session);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
             clearSessionPlayers(session, soloFightEngine);
@@ -1257,7 +1466,7 @@ function startServer(attempt = 0) {
             send(ws, makeSoloFightTop(sfState));
           }
           if (isTeamFight(mode)) {
-            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team)));
+            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team), getRoomInfo(mode).lobby));
             send(ws, makeTeamFightTop(mode, teamStates[mode]));
           }
           broadcastRoomInfo();
@@ -1265,6 +1474,7 @@ function startServer(attempt = 0) {
         }
         case 'join': {
           const mode = parseMode(msg.mode);
+          removePendingFightJoin(session);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
             clearSessionPlayers(session, soloFightEngine);
@@ -1272,6 +1482,9 @@ function startServer(attempt = 0) {
             leaveTeamFight(session, session.room);
           } else if (session.joined && session.playerIds.length > 0) {
             clearSessionPlayers(session, engine());
+          }
+          if (session.joinAnnouncedRoom && session.joinAnnouncedRoom !== mode) {
+            session.joinAnnouncedRoom = null;
           }
 
           const name = (msg.name || session.lastName || 'Player').trim().slice(0, 15) || 'Player';
@@ -1287,6 +1500,28 @@ function startServer(attempt = 0) {
           session.lastName = name;
           const skin = String(msg.skin || '').trim();
           session.lastSkin = skin;
+
+          const resolvedDevice =
+            persistentStore.resolveDeviceId(
+              typeof msg.deviceId === 'string' ? msg.deviceId : undefined,
+              typeof msg.fingerprint === 'string' ? msg.fingerprint : undefined
+            ) || (typeof msg.deviceId === 'string' ? msg.deviceId.trim().slice(0, 80) : '');
+          if (resolvedDevice) {
+            session.deviceId = resolvedDevice;
+            const profile = persistentStore.upsertPlayer(resolvedDevice, {
+              lastNick: name,
+              skinId: skin || undefined,
+              fingerprint: typeof msg.fingerprint === 'string' ? msg.fingerprint : undefined,
+            });
+            send(ws, {
+              type: 'playerProfile',
+              deviceId: resolvedDevice,
+              lastNick: profile.lastNick,
+              skinId: profile.skinId,
+              prefs: profile.prefs,
+              accountLogin: profile.accountLogin,
+            });
+          }
 
           if (mode === 'soloFight') {
             joinSoloFight(session, name, skin);
@@ -1311,6 +1546,7 @@ function startServer(attempt = 0) {
             console.log(`[agar-server] admin online: ${session.lastName}`);
           }
           send(ws, { type: 'settings', settings: classicConfig, mode: 'classic' });
+          announceJoin('classic', session, name);
           broadcastRoomInfo();
           break;
         }
@@ -1333,6 +1569,7 @@ function startServer(attempt = 0) {
           const prevSfTick = soloFightConfig.serverTickHz;
           // Always update classic; soloFightWorldSize (if present) drives SF sync
           applyClassicConfigAndSyncSf(msg.settings);
+          persistentStore.setConfig(classicConfig);
           broadcastToRoom('classic', {
             type: 'settings',
             settings: classicConfig,
@@ -1484,6 +1721,7 @@ function startServer(attempt = 0) {
           const name = live?.name || session.lastName || 'Player';
           const color = live?.color || session.lastColor || '#4ECDC4';
           broadcastToRoom(session.room, { type: 'chat', name, text, t: now, color });
+          relayGameChat(session.room, name, text);
           break;
         }
         case 'input': {
@@ -1544,12 +1782,101 @@ function startServer(attempt = 0) {
           send(ws, { type: 'pong', t: msg.t });
           break;
         }
+        case 'syncProfile': {
+          const deviceId =
+            persistentStore.resolveDeviceId(msg.deviceId, msg.fingerprint) ||
+            String(msg.deviceId || '').trim().slice(0, 80);
+          if (!deviceId) break;
+          session.deviceId = deviceId;
+          const profile = persistentStore.upsertPlayer(deviceId, {
+            lastNick: msg.lastNick,
+            skinId: msg.skinId === null ? '' : msg.skinId,
+            prefs: msg.prefs,
+            fingerprint: msg.fingerprint,
+          });
+          send(ws, {
+            type: 'playerProfile',
+            deviceId,
+            lastNick: profile.lastNick,
+            skinId: profile.skinId,
+            prefs: profile.prefs,
+            accountLogin: profile.accountLogin,
+          });
+          break;
+        }
+        case 'registerAccount': {
+          const deviceId =
+            persistentStore.resolveDeviceId(msg.deviceId, msg.fingerprint) ||
+            String(msg.deviceId || '').trim().slice(0, 80);
+          if (!deviceId) {
+            send(ws, { type: 'registerAccountResult', ok: false, message: 'Нет device id' });
+            break;
+          }
+          session.deviceId = deviceId;
+          if (msg.fingerprint) {
+            persistentStore.upsertPlayer(deviceId, { fingerprint: msg.fingerprint, lastNick: session.lastName });
+          }
+          const result = persistentStore.registerAccount(deviceId, String(msg.login || ''), String(msg.password || ''));
+          if (!result.ok) {
+            send(ws, { type: 'registerAccountResult', ok: false, message: result.error });
+            break;
+          }
+          send(ws, {
+            type: 'registerAccountResult',
+            ok: true,
+            message: 'Аккаунт создан',
+            accountLogin: result.profile.accountLogin,
+          });
+          send(ws, {
+            type: 'playerProfile',
+            deviceId,
+            lastNick: result.profile.lastNick,
+            skinId: result.profile.skinId,
+            prefs: result.profile.prefs,
+            accountLogin: result.profile.accountLogin,
+          });
+          break;
+        }
+        case 'adminDownloadDb': {
+          if (!session.isAdmin) {
+            send(ws, { type: 'error', message: 'Admin only' });
+            break;
+          }
+          send(ws, { type: 'adminDbExport', json: persistentStore.exportJson() });
+          break;
+        }
+        case 'adminUploadDb': {
+          if (!session.isAdmin) {
+            send(ws, { type: 'error', message: 'Admin only' });
+            break;
+          }
+          const result = persistentStore.importJson(String(msg.json || ''));
+          if (!result.ok) {
+            send(ws, { type: 'adminDbResult', ok: false, message: result.error });
+            break;
+          }
+          sfState.scores = persistentStore.getScores('soloFight');
+          teamStates.duoFight.scores = persistentStore.getScores('duoFight');
+          teamStates.trioFight.scores = persistentStore.getScores('trioFight');
+          const cfg = persistentStore.getConfig();
+          if (cfg) {
+            classicConfig = sanitizeGameplayConfig(cfg);
+            // keep engines in sync via existing settings path if present
+          }
+          broadcastSoloFightTop();
+          broadcastTeamMeta('duoFight');
+          broadcastTeamMeta('trioFight');
+          broadcastRoomInfo();
+          send(ws, { type: 'adminDbResult', ok: true, message: 'База данных загружена' });
+          break;
+        }
         default:
           send(ws, { type: 'error', message: 'Unknown message type' });
       }
     });
 
     const cleanup = () => {
+      removePendingFightJoin(session);
       if (session.room === 'soloFight' && sfDuelists.includes(session)) {
         handleSoloFightLeave(session);
         clearSessionPlayers(session, soloFightEngine);
@@ -1564,6 +1891,54 @@ function startServer(attempt = 0) {
 
     ws.on('close', cleanup);
     ws.on('error', cleanup);
+  });
+
+  let relayGameChat: (room: RoomMode, name: string, text: string) => void = () => {};
+
+  startTelegramBot({
+    store: persistentStore,
+    getOnline: () => ({
+      classic: (() => {
+        const info = getRoomInfo('classic');
+        return { players: info.players, spectators: info.lobby };
+      })(),
+      soloFight: (() => {
+        const info = getRoomInfo('soloFight');
+        return { players: info.players, spectators: info.lobby };
+      })(),
+      duoFight: (() => {
+        const info = getRoomInfo('duoFight');
+        return { players: info.players, spectators: info.lobby };
+      })(),
+      trioFight: (() => {
+        const info = getRoomInfo('trioFight');
+        return { players: info.players, spectators: info.lobby };
+      })(),
+    }),
+    sendChat: (room, name, text) => {
+      const clean = sanitizeChat(text);
+      if (!clean) return;
+      broadcastToRoom(room, {
+        type: 'chat',
+        name,
+        text: clean,
+        t: Date.now(),
+        color: '#27a9ff',
+        fromTg: true,
+      });
+    },
+    setGameChatRelay: (relay) => {
+      relayGameChat = relay;
+    },
+    getTop: (mode) => {
+      const scores =
+        mode === 'soloFight'
+          ? sfState.scores
+          : teamStates[mode].scores;
+      return [...scores.entries()]
+        .map(([name, score]) => ({ name, score }))
+        .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+    },
   });
 
   restartTickLoop();

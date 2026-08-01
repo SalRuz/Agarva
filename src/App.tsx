@@ -23,7 +23,7 @@ import {
 } from '../shared/gameConfig';
 import { isAdminName } from '../shared/physics';
 import { getSectorLabelAt } from '../shared/sectors';
-import { requestRemoteAdminSettings } from './net/adminSettings';
+import { requestRemoteAdminSettings, requestRemoteAdminDbDownload, requestRemoteAdminDbUpload } from './net/adminSettings';
 import {
   loadSelectedSkinId,
   resolveSkinUrl,
@@ -34,8 +34,10 @@ import {
   hudSizeScale,
   loadPlayerPrefs,
   savePlayerPrefs,
+  sanitizePlayerPrefs,
   type PlayerPrefs,
 } from './settings/playerPrefs';
+import { getOrCreateDeviceId } from './device/deviceId';
 
 type GameMode = 'menu' | 'playing' | 'dead' | 'spectating';
 type SessionKind = 'solo' | 'multiplayer';
@@ -75,8 +77,9 @@ export function App() {
     phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
     countdown: number;
     fightSecondsLeft?: number;
-    blue: { alive: number; total: number; members: string[] };
-    red: { alive: number; total: number; members: string[] };
+    blue: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
+    red: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
+    spectators?: number;
   } | null>(null);
   const [showAdminSettings, setShowAdminSettings] = useState(false);
   const [showPlayerSettings, setShowPlayerSettings] = useState(false);
@@ -85,9 +88,24 @@ export function App() {
   const [adminSettingsSaving, setAdminSettingsSaving] = useState(false);
   const [adminSaveNotice, setAdminSaveNotice] = useState<string | null>(null);
   const [showSkinPicker, setShowSkinPicker] = useState(false);
+  const [accountLogin, setAccountLogin] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('agarvaAccountLogin');
+    } catch {
+      return null;
+    }
+  });
+  const [registerError, setRegisterError] = useState<string | null>(null);
+  const [registerBusy, setRegisterBusy] = useState(false);
   const [selectedSkinId, setSelectedSkinId] = useState<string | null>(() => loadSelectedSkinId());
   const selectedSkinUrl = resolveSkinUrl(selectedSkinId);
-  const [menuName, setMenuName] = useState('');
+  const [menuName, setMenuName] = useState(() => {
+    try {
+      return localStorage.getItem('agarvaMenuNick') || '';
+    } catch {
+      return '';
+    }
+  });
   const [menuPassword, setMenuPassword] = useState('');
   const [frozen, setFrozen] = useState(false);
 
@@ -110,6 +128,8 @@ export function App() {
   const spectateReturnPlayerIdRef = useRef<string | null>(null);
   const ownedIdsRef = useRef<string[]>([]);
   const selectedSkinIdRef = useRef<string | null>(selectedSkinId);
+  const deviceIdRef = useRef('');
+  const fingerprintRef = useRef('');
   const [chatMention, setChatMention] = useState<string | null>(null);
   const mpRenderRef = useRef<
     (() => { state: GameState; you: Player | undefined } | null) | null
@@ -155,6 +175,71 @@ export function App() {
   useEffect(() => {
     selectedSkinIdRef.current = selectedSkinId;
   }, [selectedSkinId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('agarvaMenuNick', menuName);
+    } catch {
+      /* ignore */
+    }
+    playerNameRef.current = menuName;
+  }, [menuName]);
+
+  useEffect(() => {
+    const { deviceId, fingerprint } = getOrCreateDeviceId();
+    deviceIdRef.current = deviceId;
+    fingerprintRef.current = fingerprint;
+    let closed = false;
+    let ws = null;
+    try {
+      ws = new WebSocket(resolveServerUrl());
+    } catch {
+      return;
+    }
+    ws.onopen = () => {
+      if (closed) return;
+      ws.send(JSON.stringify({
+        type: 'syncProfile',
+        deviceId,
+        fingerprint,
+        lastNick: localStorage.getItem('agarvaMenuNick') || undefined,
+        skinId: selectedSkinIdRef.current,
+      }));
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(String(ev.data));
+        if (msg.type !== 'playerProfile') return;
+        if (msg.deviceId) {
+          deviceIdRef.current = msg.deviceId;
+          try { localStorage.setItem('agarvaDeviceId', msg.deviceId); } catch {}
+        }
+        if (msg.lastNick) {
+          setMenuName(msg.lastNick);
+          playerNameRef.current = msg.lastNick;
+        }
+        if (msg.skinId) {
+          setSelectedSkinId(msg.skinId);
+          saveSelectedSkinId(msg.skinId);
+          selectedSkinIdRef.current = msg.skinId;
+        }
+        if (msg.accountLogin) {
+          setAccountLogin(msg.accountLogin);
+          try { localStorage.setItem('agarvaAccountLogin', msg.accountLogin); } catch {}
+        }
+        if (msg.prefs) {
+          const prefs = sanitizePlayerPrefs(msg.prefs);
+          setPlayerPrefs(prefs);
+          savePlayerPrefs(prefs);
+        }
+      } catch {}
+      try { ws.close(); } catch {}
+    };
+    return () => {
+      closed = true;
+      try { if (ws) ws.close(); } catch {}
+    };
+  }, []);
 
   const startMenuEngine = useCallback(() => {
     const engine = new GameEngine({
@@ -261,7 +346,8 @@ export function App() {
       if (sessionKindRef.current === 'multiplayer') {
         mpRef.current?.ping();
       }
-    }, 1000);
+    // Ping is informational only; avoid a request/response every second on mobile.
+    }, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -276,7 +362,13 @@ export function App() {
         setChatFocused(false);
         return;
       }
-      if (showAdminSettings || showSkinPicker || showPlayerSettings) return;
+      if (showAdminSettings || showSkinPicker || showPlayerSettings) {
+        if (e.code === 'Escape' && showSkinPicker) {
+          e.preventDefault();
+          setShowSkinPicker(false);
+        }
+        return;
+      }
       if (modeRef.current === 'playing') {
         e.preventDefault();
         setShowEscapeMenu((prev) => {
@@ -389,7 +481,7 @@ export function App() {
       onChat: (msg: ChatLine) => {
         setChatMessages((prev) => [
           ...prev.slice(-79),
-          { name: msg.name, text: msg.text, t: msg.t, color: msg.color },
+          { name: msg.name, text: msg.text, t: msg.t, color: msg.color, fromTg: msg.fromTg },
         ]);
       },
       onSettings: (settings: GameplayConfig) => {
@@ -416,9 +508,81 @@ export function App() {
         phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
         countdown: number;
         fightSecondsLeft?: number;
-        blue: { alive: number; total: number; members: string[] };
-        red: { alive: number; total: number; members: string[] };
+        blue: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
+        red: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
+        spectators?: number;
       }) => setTeamFightHud(hud),
+      onSoloFightTop: () => {
+        /* tops also arrive via lobby WS; keep callback for live sessions */
+      },
+      onPlayerProfile: (profile: {
+        deviceId: string;
+        lastNick?: string;
+        skinId?: string;
+        prefs?: Record<string, unknown>;
+        accountLogin?: string;
+      }) => {
+        if (profile.deviceId) {
+          deviceIdRef.current = profile.deviceId;
+          try {
+            localStorage.setItem('agarvaDeviceId', profile.deviceId);
+          } catch {
+            /* ignore */
+          }
+        }
+        if (profile.lastNick) {
+          setMenuName(profile.lastNick);
+          playerNameRef.current = profile.lastNick;
+        }
+        if (profile.skinId) {
+          setSelectedSkinId(profile.skinId);
+          saveSelectedSkinId(profile.skinId);
+          selectedSkinIdRef.current = profile.skinId;
+        }
+        if (profile.accountLogin) {
+          setAccountLogin(profile.accountLogin);
+          try {
+            localStorage.setItem('agarvaAccountLogin', profile.accountLogin);
+          } catch {
+            /* ignore */
+          }
+        }
+        if (profile.prefs) {
+          const prefs = sanitizePlayerPrefs(profile.prefs as Partial<PlayerPrefs>);
+          setPlayerPrefs(prefs);
+          savePlayerPrefs(prefs);
+        }
+      },
+      onRegisterAccountResult: (ok: boolean, message: string, login?: string) => {
+        setRegisterBusy(false);
+        if (!ok) {
+          setRegisterError(message);
+          return;
+        }
+        setRegisterError(null);
+        if (login) {
+          setAccountLogin(login);
+          try {
+            localStorage.setItem('agarvaAccountLogin', login);
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+      onAdminDbExport: (json: string) => {
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `agarva-db-${Date.now()}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+        setAdminSaveNotice('База данных скачана');
+      },
+      onAdminDbResult: (ok: boolean, message: string) => {
+        if (ok) setAdminSaveNotice(message);
+        else setAdminSettingsError(message);
+      },
       onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[], ownedIds?: string[]) => {
         gameStateRef.current = state;
         if (ownedIds && ownedIds.length > 0) {
@@ -468,6 +632,10 @@ export function App() {
       onError: (message: string) => {
         setConnectionError(message);
         setIsConnecting(false);
+        // Nick conflict / join reject: stay on menu so the player can change nick and retry
+        if (modeRef.current !== 'menu') {
+          setMode('menu');
+        }
       },
       onStatus: (status: string) => {
         if (status === 'error' || status === 'disconnected') {
@@ -511,6 +679,7 @@ export function App() {
         password,
         selectedSkinIdRef.current || undefined
       );
+      client.setDeviceIdentity(deviceIdRef.current, fingerprintRef.current);
       client.setRoomMode(mode);
       client.setRoomTeam(team);
       mpRef.current = client;
@@ -553,6 +722,7 @@ export function App() {
         playerNameRef.current || menuName || 'Spectator',
         attachMpCallbacks({ spectate: true })
       );
+      client.setDeviceIdentity(deviceIdRef.current, fingerprintRef.current);
       client.setRoomMode(mode);
       mpRef.current = client;
       mpRenderRef.current = () => client.getRenderState();
@@ -978,11 +1148,18 @@ export function App() {
     if (sessionKindRef.current === 'multiplayer' && mpRef.current) {
       mpRef.current.setSkin(id);
       mpRef.current.rename(playerNameRef.current, adminPasswordRef.current, id);
+      mpRef.current.syncProfile({
+        deviceId: deviceIdRef.current,
+        fingerprint: fingerprintRef.current,
+        lastNick: playerNameRef.current,
+        skinId: id,
+        prefs: playerPrefs as unknown as Record<string, unknown>,
+      });
     }
     for (const oid of ownedIdsRef.current) {
       engineRef.current?.updatePlayerSkin(oid, id || undefined);
     }
-  }, []);
+  }, [playerPrefs]);
 
   const handleMentionNick = useCallback((name: string) => {
     if (sessionKindRef.current !== 'multiplayer') return;
@@ -1072,12 +1249,65 @@ export function App() {
   const handlePlayerPrefsChange = useCallback((next: PlayerPrefs) => {
     setPlayerPrefs(next);
     savePlayerPrefs(next);
-  }, []);
+    if (sessionKindRef.current === 'multiplayer' && mpRef.current && deviceIdRef.current) {
+      mpRef.current.syncProfile({
+        deviceId: deviceIdRef.current,
+        fingerprint: fingerprintRef.current,
+        lastNick: playerNameRef.current || menuName,
+        skinId: selectedSkinIdRef.current,
+        prefs: next as unknown as Record<string, unknown>,
+      });
+    }
+  }, [menuName]);
+
+  const handleDownloadDb = useCallback(async () => {
+    setAdminSettingsError(null);
+    try {
+      if (mpRef.current && isAdminRef.current) {
+        mpRef.current.adminDownloadDb();
+        return;
+      }
+      const json = await requestRemoteAdminDbDownload(
+        resolveServerUrl(),
+        adminSettingsNameRef.current || menuName,
+        adminPasswordRef.current || menuPassword
+      );
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `agarva-db-${Date.now()}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setAdminSaveNotice('База данных скачана');
+    } catch (error) {
+      setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось скачать БД');
+    }
+  }, [menuName, menuPassword]);
+
+  const handleUploadDb = useCallback(async (text: string) => {
+    setAdminSettingsError(null);
+    try {
+      if (mpRef.current && isAdminRef.current) {
+        mpRef.current.adminUploadDb(text);
+        return;
+      }
+      const message = await requestRemoteAdminDbUpload(
+        resolveServerUrl(),
+        adminSettingsNameRef.current || menuName,
+        text,
+        adminPasswordRef.current || menuPassword
+      );
+      setAdminSaveNotice(message);
+    } catch (error) {
+      setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось загрузить БД');
+    }
+  }, [menuName, menuPassword]);
 
   const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
   const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
   // Only true main menu without live spectate should open lobby watcher WS
-  const roomStats = useRoomStats(mode === 'menu' && !menuOverLive, playMode);
+  const roomStats = useRoomStats(mode === 'menu', playMode);
   const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
   const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
   const hudScale = hudSizeScale(playerPrefs.hudSize);
@@ -1173,6 +1403,50 @@ export function App() {
           roomBlue={roomStats.blue}
           roomRed={roomStats.red}
           soloFightTop={roomStats.soloFightTop}
+          skinPreviewUrl={selectedSkinUrl}
+          accountLogin={accountLogin}
+          registerError={registerError}
+          registerBusy={registerBusy}
+          onRegisterAccount={(login, password) => {
+            setRegisterBusy(true);
+            setRegisterError(null);
+            const ids = getOrCreateDeviceId();
+            deviceIdRef.current = ids.deviceId;
+            fingerprintRef.current = ids.fingerprint;
+            if (mpRef.current) {
+              mpRef.current.setDeviceIdentity(ids.deviceId, ids.fingerprint);
+              mpRef.current.registerAccount(login, password);
+              return;
+            }
+            const ws = new WebSocket(resolveServerUrl());
+            ws.onopen = () => {
+              ws.send(JSON.stringify({
+                type: 'registerAccount',
+                deviceId: ids.deviceId,
+                fingerprint: ids.fingerprint,
+                login,
+                password,
+              }));
+            };
+            ws.onmessage = (ev) => {
+              try {
+                const msg = JSON.parse(String(ev.data));
+                if (msg.type === 'registerAccountResult') {
+                  setRegisterBusy(false);
+                  if (!msg.ok) setRegisterError(msg.message);
+                  else if (msg.accountLogin) {
+                    setAccountLogin(msg.accountLogin);
+                    try { localStorage.setItem('agarvaAccountLogin', msg.accountLogin); } catch {}
+                  }
+                  ws.close();
+                }
+              } catch {}
+            };
+            ws.onerror = () => {
+              setRegisterBusy(false);
+              setRegisterError('Ошибка соединения');
+            };
+          }}
         />
       )}
 
@@ -1198,6 +1472,8 @@ export function App() {
         onSave={handleSaveAdminSettings}
         onImport={handleImportConfig}
         onExport={handleExportConfig}
+        onDownloadDb={handleDownloadDb}
+        onUploadDb={handleUploadDb}
       />
 
       <SkinPicker

@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { listSkins, type SkinInfo } from '../skins/loadSkins';
 
 interface SkinPickerProps {
@@ -8,6 +9,17 @@ interface SkinPickerProps {
 }
 
 export function SkinPicker({ open, selectedId, onSelect, onClose }: SkinPickerProps) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== 'Escape') return;
+      e.preventDefault();
+      onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
   const skins = listSkins();
 

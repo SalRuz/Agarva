@@ -18,7 +18,10 @@ export interface TeamFightState {
   countdownEndsAt: number;
   resetEndsAt: number;
   fightEndsAt: number;
+  /** Career wins, persisted and used by menu/Telegram tops. */
   scores: Map<string, number>;
+  /** Consecutive match wins, used only by the in-match HUD. */
+  streaks: Map<string, number>;
 }
 
 export function teamSizeFor(mode: TeamFightMode): number {
@@ -56,7 +59,14 @@ export function syncTeamFightFromClassic(classic: GameplayConfig): GameplayConfi
 }
 
 export function createEmptyTeamFightState(): TeamFightState {
-  return { phase: 'waiting', countdownEndsAt: 0, resetEndsAt: 0, fightEndsAt: 0, scores: new Map() };
+  return {
+    phase: 'waiting',
+    countdownEndsAt: 0,
+    resetEndsAt: 0,
+    fightEndsAt: 0,
+    scores: new Map(),
+    streaks: new Map(),
+  };
 }
 
 export function teamFightSpawnPoint(
@@ -76,12 +86,18 @@ export function teamFightSpawnPoint(
 export function makeTeamFightHud(
   mode: TeamFightMode,
   state: TeamFightState,
-  members: (team: FightTeam) => { name: string; alive: boolean }[]
+  members: (team: FightTeam) => { name: string; alive: boolean }[],
+  spectators = 0
 ): TeamFightHudMessage {
   const now = Date.now();
   const toSide = (team: FightTeam) => {
     const list = members(team);
-    return { alive: list.filter((x) => x.alive).length, total: teamSizeFor(mode), members: list.map((x) => x.name) };
+    return {
+      alive: list.filter((x) => x.alive).length,
+      total: teamSizeFor(mode),
+      members: list.map((x) => x.name),
+      streaks: Object.fromEntries(list.map((x) => [x.name, state.streaks.get(x.name) ?? 0])),
+    };
   };
   return {
     type: 'teamFightHud',
@@ -97,6 +113,7 @@ export function makeTeamFightHud(
       state.phase === 'fighting' ? Math.max(0, Math.ceil((state.fightEndsAt - now) / 1000)) : undefined,
     blue: toSide('blue'),
     red: toSide('red'),
+    spectators,
   };
 }
 

@@ -13,9 +13,13 @@ export interface JoinMessage {
   /** Equipped skin id (filename), optional */
   skin?: string;
   /** Room mode (default classic) */
-  mode?: RoomMode;
+  mode: RoomMode;
   /** Required for team fight rooms; selected before joining the match. */
   team?: FightTeam;
+  /** Stable browser/device id for profile persistence */
+  deviceId?: string;
+  /** Soft fingerprint for recovery if localStorage cleared */
+  fingerprint?: string;
 }
 
 export interface InputMessage {
@@ -134,6 +138,32 @@ export interface LobbyMessage {
   mode?: RoomMode;
 }
 
+export interface SyncProfileMessage {
+  type: 'syncProfile';
+  deviceId: string;
+  fingerprint?: string;
+  lastNick?: string;
+  skinId?: string | null;
+  prefs?: Record<string, unknown>;
+}
+
+export interface RegisterAccountMessage {
+  type: 'registerAccount';
+  deviceId: string;
+  fingerprint?: string;
+  login: string;
+  password: string;
+}
+
+export interface AdminDownloadDbMessage {
+  type: 'adminDownloadDb';
+}
+
+export interface AdminUploadDbMessage {
+  type: 'adminUploadDb';
+  json: string;
+}
+
 export type ClientMessage =
   | JoinMessage
   | InputMessage
@@ -157,7 +187,11 @@ export type ClientMessage =
   | MultiboxSpawnMessage
   | MultiboxSwitchMessage
   | ChatSendMessage
-  | LobbyMessage;
+  | LobbyMessage
+  | SyncProfileMessage
+  | RegisterAccountMessage
+  | AdminDownloadDbMessage
+  | AdminUploadDbMessage;
 
 export interface WelcomeMessage {
   type: 'welcome';
@@ -260,6 +294,8 @@ export interface ChatBroadcastMessage {
   text: string;
   t: number;
   color?: string;
+  /** Message was injected from the linked Telegram bot. */
+  fromTg?: boolean;
 }
 
 export interface SettingsMessage {
@@ -287,6 +323,7 @@ export interface SoloFightHudMessage {
   countdown: number;
   /** Seconds left in the 5-minute fight timer while fighting */
   fightSecondsLeft?: number;
+  /** Current consecutive wins, not career total. */
   a: { name: string; score: number };
   b: { name: string; score: number };
 }
@@ -302,14 +339,43 @@ export interface TeamFightHudMessage {
   phase: 'waiting' | 'countdown' | 'fighting' | 'ended' | 'resetting' | 'between';
   countdown: number;
   fightSecondsLeft?: number;
-  blue: { alive: number; total: number; members: string[] };
-  red: { alive: number; total: number; members: string[] };
+  /** `streaks` contains current consecutive wins by member name. */
+  blue: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
+  red: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
+  spectators?: number;
 }
 
 export interface TeamFightTopMessage {
   type: 'teamFightTop';
   mode: FightRoomMode;
   entries: { name: string; score: number }[];
+}
+
+export interface PlayerProfileMessage {
+  type: 'playerProfile';
+  deviceId: string;
+  lastNick?: string;
+  skinId?: string;
+  prefs?: Record<string, unknown>;
+  accountLogin?: string;
+}
+
+export interface RegisterAccountResultMessage {
+  type: 'registerAccountResult';
+  ok: boolean;
+  message: string;
+  accountLogin?: string;
+}
+
+export interface AdminDbExportMessage {
+  type: 'adminDbExport';
+  json: string;
+}
+
+export interface AdminDbResultMessage {
+  type: 'adminDbResult';
+  ok: boolean;
+  message: string;
 }
 
 export type ServerMessage =
@@ -326,4 +392,8 @@ export type ServerMessage =
   | SoloFightHudMessage
   | SoloFightTopMessage
   | TeamFightHudMessage
-  | TeamFightTopMessage;
+  | TeamFightTopMessage
+  | PlayerProfileMessage
+  | RegisterAccountResultMessage
+  | AdminDbExportMessage
+  | AdminDbResultMessage;

@@ -35,6 +35,13 @@ interface StartScreenProps {
   roomRed?: number | null;
   /** Fight total-wins leaderboard (shown beside menu) */
   soloFightTop?: SoloFightTopEntry[];
+  /** Selected skin preview URL (null = plain ball) */
+  skinPreviewUrl?: string | null;
+  /** Registered profile login (locked to device) */
+  accountLogin?: string | null;
+  onRegisterAccount?: (login: string, password: string) => void;
+  registerError?: string | null;
+  registerBusy?: boolean;
 }
 
 export function StartScreen({
@@ -60,9 +67,18 @@ export function StartScreen({
   roomBlue = null,
   roomRed = null,
   soloFightTop = [],
+  skinPreviewUrl = null,
+  accountLogin = null,
+  onRegisterAccount,
+  registerError = null,
+  registerBusy = false,
 }: StartScreenProps) {
   const [localError, setLocalError] = useState<string | null>(null);
   const [teamPicking, setTeamPicking] = useState(false);
+  const [regOpen, setRegOpen] = useState(false);
+  const [regLogin, setRegLogin] = useState('');
+  const [regPassword, setRegPassword] = useState('');
+  const [regLocalError, setRegLocalError] = useState<string | null>(null);
   const adminName = isAdminName(name);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -94,9 +110,82 @@ export function StartScreen({
     e.stopPropagation();
   };
 
+  const submitRegister = (e: React.FormEvent) => {
+    e.preventDefault();
+    setRegLocalError(null);
+    if (!/^[a-zA-Z0-9]+$/.test(regLogin.trim())) {
+      setRegLocalError('Логин: только латинские буквы и цифры');
+      return;
+    }
+    if (!regPassword || regPassword.length > 8) {
+      setRegLocalError('Пароль: максимум 8 символов');
+      return;
+    }
+    onRegisterAccount?.(regLogin.trim(), regPassword);
+  };
+
   return (
     <div className="absolute inset-0 flex items-center justify-center p-4 pointer-events-none z-50">
       <div className="flex items-stretch justify-center gap-4 max-w-full">
+        <div className="pointer-events-auto w-[140px] shrink-0 flex flex-col items-center justify-center gap-3 self-center">
+          <div className="w-[100px] h-[100px] rounded-full overflow-hidden border-2 border-white/25 bg-gradient-to-br from-emerald-400 to-sky-500 shadow-lg">
+            {skinPreviewUrl ? (
+              <img src={skinPreviewUrl} alt="" className="w-full h-full object-cover" />
+            ) : null}
+          </div>
+          {accountLogin ? (
+            <div className="text-center text-amber-300 font-bold text-sm tracking-wide drop-shadow px-1 break-all">
+              {accountLogin}
+            </div>
+          ) : regOpen ? (
+            <form onSubmit={submitRegister} className="w-full space-y-2" onKeyDown={stopKeys} onKeyUp={stopKeys}>
+              <input
+                value={regLogin}
+                onChange={(e) => setRegLogin(e.target.value)}
+                placeholder="Логин"
+                maxLength={15}
+                className="w-full px-2 py-1.5 rounded bg-black/60 border border-white/20 text-white text-xs"
+              />
+              <input
+                type="password"
+                value={regPassword}
+                onChange={(e) => setRegPassword(e.target.value)}
+                placeholder="Пароль"
+                maxLength={8}
+                className="w-full px-2 py-1.5 rounded bg-black/60 border border-white/20 text-white text-xs"
+              />
+              {(regLocalError || registerError) && (
+                <div className="text-[10px] text-red-300 leading-tight">{regLocalError || registerError}</div>
+              )}
+              <button
+                type="submit"
+                disabled={registerBusy}
+                className="w-full py-1.5 rounded bg-amber-600 text-white text-xs font-semibold disabled:opacity-50"
+              >
+                {registerBusy ? '…' : 'Создать'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setRegOpen(false)}
+                className="w-full py-1 rounded bg-white/10 text-gray-300 text-[10px]"
+              >
+                Отмена
+              </button>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setRegOpen(true);
+                setRegLocalError(null);
+              }}
+              className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-semibold border border-white/20"
+            >
+              Регистрация
+            </button>
+          )}
+        </div>
+
         <div
           className="bg-black/70 backdrop-blur-lg rounded-2xl p-8 max-w-md w-full border border-white/20 pointer-events-auto"
           onKeyDown={stopKeys}
@@ -148,7 +237,7 @@ export function StartScreen({
               className={`py-2 rounded-lg font-semibold transition-all ${playMode === 'duoFight' ? 'bg-blue-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'}`}
             >
               Дуо файт
-              {playMode === 'duoFight' && <span className="block text-xs font-normal text-blue-100/90 mt-0.5">Бой: {roomPlayers ?? '—'} / 4</span>}
+              {playMode === 'duoFight' && <span className="block text-xs font-normal text-blue-100/90 mt-0.5">Бой: {roomPlayers ?? '—'} / 4 · Спеки: {roomSpectators ?? '—'}</span>}
             </button>
             <button
               type="button"
@@ -156,7 +245,7 @@ export function StartScreen({
               className={`py-2 rounded-lg font-semibold transition-all ${playMode === 'trioFight' ? 'bg-violet-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'}`}
             >
               Трио файт
-              {playMode === 'trioFight' && <span className="block text-xs font-normal text-violet-100/90 mt-0.5">Бой: {roomPlayers ?? '—'} / 6</span>}
+              {playMode === 'trioFight' && <span className="block text-xs font-normal text-violet-100/90 mt-0.5">Бой: {roomPlayers ?? '—'} / 6 · Спеки: {roomSpectators ?? '—'}</span>}
             </button>
           </div>
 
@@ -220,7 +309,7 @@ export function StartScreen({
 
             {teamPicking && (playMode === 'duoFight' || playMode === 'trioFight') && (
               <div className="rounded-lg border border-white/20 bg-white/5 p-3 space-y-2">
-                <div className="text-center text-sm text-white font-semibold">Выберите команду</div>
+                <div className="text-center text-sm text-white font-semibold">Выберите команду · Спектаторы: {roomSpectators ?? '—'}</div>
                 <div className="grid grid-cols-2 gap-2">
                   <button type="button" disabled={(roomBlue ?? 0) >= (playMode === 'duoFight' ? 2 : 3)} onClick={() => joinTeam('blue')} className="py-2 rounded bg-blue-600 text-white disabled:opacity-40">
                     Синяя команда {roomBlue ?? 0}/{playMode === 'duoFight' ? 2 : 3}
@@ -359,7 +448,7 @@ export function useRoomStats(
           entries?: SoloFightTopEntry[];
         };
         if (msg.type === 'roomInfo') {
-          if (msg.mode && msg.mode !== mode) return;
+          if (msg.mode !== mode) return;
           setPlayers(typeof msg.players === 'number' ? msg.players : 0);
           const specs =
             typeof msg.spectators === 'number'
