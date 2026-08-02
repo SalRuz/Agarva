@@ -202,6 +202,12 @@ export class PersistentStore {
     }
   }
 
+  /** Replaces the complete durable game store with the initial empty schema. */
+  wipeAll() {
+    this.data = emptyData();
+    this.flushNotify();
+  }
+
   existsOnDisk() {
     return existsSync(storePath);
   }
@@ -322,6 +328,10 @@ export class PersistentStore {
     return { ok: true, account };
   }
 
+  getAccount(login: string): AccountRecord | undefined {
+    return this.data.accounts[login.trim().toLowerCase()];
+  }
+
   /** Verify an account and restore it only on the device that created it. */
   loginAccountOnDevice(
     deviceId: string,
@@ -353,6 +363,30 @@ export class PersistentStore {
 
   getTelegramLogin(chatId: number | string): string | undefined {
     return this.data.tgAccounts[String(chatId)];
+  }
+
+  /** Finds the Telegram chat linked to this account (case-insensitive login). */
+  getTelegramChatId(login: string): string | undefined {
+    const key = login.trim().toLowerCase();
+    for (const [chatId, linkedLogin] of Object.entries(this.data.tgAccounts)) {
+      if (linkedLogin.trim().toLowerCase() === key) return chatId;
+    }
+    return undefined;
+  }
+
+  updateAccountPassword(
+    login: string,
+    password: string
+  ): { ok: true; account: AccountRecord } | { ok: false; error: string } {
+    const cleanLogin = login.trim();
+    if (!/^[a-zA-Z0-9]{1,15}$/.test(cleanLogin) || !password || password.length > 8) {
+      return { ok: false, error: 'Неверные данные для сброса пароля' };
+    }
+    const account = this.data.accounts[cleanLogin.toLowerCase()];
+    if (!account) return { ok: false, error: 'Аккаунт не найден' };
+    account.passwordHash = hashPassword(password);
+    this.save();
+    return { ok: true, account };
   }
 
   unlinkTelegram(chatId: number | string) {

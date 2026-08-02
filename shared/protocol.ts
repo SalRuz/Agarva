@@ -163,6 +163,19 @@ export interface LoginAccountMessage {
   password: string;
 }
 
+export interface RequestPasswordResetMessage {
+  type: 'requestPasswordReset';
+  login: string;
+  deviceId?: string;
+}
+
+export interface ConfirmPasswordResetMessage {
+  type: 'confirmPasswordReset';
+  login: string;
+  code: string;
+  newPassword: string;
+}
+
 export interface AdminDownloadDbMessage {
   type: 'adminDownloadDb';
 }
@@ -170,6 +183,15 @@ export interface AdminDownloadDbMessage {
 export interface AdminUploadDbMessage {
   type: 'adminUploadDb';
   json: string;
+}
+
+export interface AdminWipeDatabaseMessage {
+  type: 'adminWipeDatabase';
+  confirmation: string;
+}
+
+export interface AdminGetBotLogsMessage {
+  type: 'adminGetBotLogs';
 }
 
 export type ClientMessage =
@@ -199,8 +221,12 @@ export type ClientMessage =
   | SyncProfileMessage
   | RegisterAccountMessage
   | LoginAccountMessage
+  | RequestPasswordResetMessage
+  | ConfirmPasswordResetMessage
   | AdminDownloadDbMessage
-  | AdminUploadDbMessage;
+  | AdminUploadDbMessage
+  | AdminWipeDatabaseMessage
+  | AdminGetBotLogsMessage;
 
 export interface WelcomeMessage {
   type: 'welcome';
@@ -383,6 +409,13 @@ export interface LoginAccountResultMessage {
   accountLogin?: string;
 }
 
+export interface PasswordResetResultMessage {
+  type: 'passwordResetResult';
+  action: 'request' | 'confirm';
+  ok: boolean;
+  message: string;
+}
+
 export interface AdminDbExportMessage {
   type: 'adminDbExport';
   json: string;
@@ -392,6 +425,11 @@ export interface AdminDbResultMessage {
   type: 'adminDbResult';
   ok: boolean;
   message: string;
+}
+
+export interface AdminBotLogsMessage {
+  type: 'adminBotLogs';
+  text: string;
 }
 
 export type ServerMessage =
@@ -412,5 +450,7 @@ export type ServerMessage =
   | PlayerProfileMessage
   | RegisterAccountResultMessage
   | LoginAccountResultMessage
+  | PasswordResetResultMessage
   | AdminDbExportMessage
-  | AdminDbResultMessage;
+  | AdminDbResultMessage
+  | AdminBotLogsMessage;

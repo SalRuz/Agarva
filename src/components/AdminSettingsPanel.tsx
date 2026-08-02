@@ -229,6 +229,9 @@ interface AdminSettingsPanelProps {
   onExport: () => void;
   onDownloadDb?: () => void;
   onUploadDb?: (text: string) => void;
+  onWipeDatabase?: () => void;
+  onGetBotLogs?: () => void;
+  botLogs?: string;
 }
 
 export function AdminSettingsPanel({
@@ -245,9 +248,15 @@ export function AdminSettingsPanel({
   onExport,
   onDownloadDb,
   onUploadDb,
+  onWipeDatabase,
+  onGetBotLogs,
+  botLogs = '',
 }: AdminSettingsPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dbFileInputRef = useRef<HTMLInputElement>(null);
+  const [wipeConfirmation, setWipeConfirmation] = useState('');
+  const [wipeOpen, setWipeOpen] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
   const totalFields = useMemo(() => SECTIONS.reduce((sum, section) => sum + section.fields.length, 0), []);
 
   if (!open) return null;
@@ -325,6 +334,26 @@ export function AdminSettingsPanel({
                   e.currentTarget.value = '';
                 }}
               />
+              <button
+                type="button"
+                onClick={() => {
+                  setWipeConfirmation('');
+                  setWipeOpen(true);
+                }}
+                className="px-4 py-2 rounded-xl bg-red-700 text-white hover:bg-red-800 transition"
+              >
+                Стереть всю базу данных
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onGetBotLogs?.();
+                  setLogsOpen(true);
+                }}
+                className="px-4 py-2 rounded-xl bg-violet-700 text-white hover:bg-violet-800 transition"
+              >
+                Логи Telegram-бота
+              </button>
             </div>
           </section>
 
@@ -388,6 +417,54 @@ export function AdminSettingsPanel({
           </button>
         </div>
       </div>
+      {wipeOpen && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-4">
+          <div className="w-full max-w-md rounded-2xl border border-red-500/40 bg-slate-950 p-6 shadow-2xl">
+            <h3 className="text-xl font-bold text-red-200">Стереть всю базу?</h3>
+            <p className="mt-2 text-sm text-slate-300">
+              Необратимо удалятся аккаунты, Telegram-привязки, профили устройств, топы и сохранённый админ-конфиг.
+              Введите <strong>CONFIRM</strong> для подтверждения.
+            </p>
+            <input
+              autoFocus
+              value={wipeConfirmation}
+              onChange={(event) => setWipeConfirmation(event.target.value)}
+              className="mt-4 w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white"
+              placeholder="CONFIRM"
+            />
+            <div className="mt-4 flex justify-end gap-3">
+              <button type="button" onClick={() => setWipeOpen(false)} className="rounded-xl bg-white/10 px-4 py-2 text-white">Отмена</button>
+              <button
+                type="button"
+                disabled={wipeConfirmation !== 'CONFIRM'}
+                onClick={() => {
+                  onWipeDatabase?.();
+                  setWipeOpen(false);
+                }}
+                className="rounded-xl bg-red-700 px-4 py-2 font-semibold text-white disabled:opacity-40"
+              >
+                Стереть навсегда
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {logsOpen && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-4">
+          <div className="flex h-[80vh] w-full max-w-4xl flex-col rounded-2xl border border-violet-400/30 bg-slate-950 p-5 shadow-2xl">
+            <div className="mb-3 flex items-center justify-between gap-4">
+              <h3 className="text-xl font-bold text-white">Логи Telegram-бота</h3>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => onGetBotLogs?.()} className="rounded-lg bg-violet-700 px-3 py-1.5 text-sm text-white">Обновить</button>
+                <button type="button" onClick={() => setLogsOpen(false)} className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white">Закрыть</button>
+              </div>
+            </div>
+            <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap rounded-xl bg-black/40 p-4 text-xs text-emerald-200">
+              {botLogs || 'Запрашиваю логи…'}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

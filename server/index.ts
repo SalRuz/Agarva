@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { execSync } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomInt } from 'node:crypto';
 import 'dotenv/config';
 import { GameEngine } from '../shared/GameEngine';
 import {
@@ -50,6 +51,8 @@ import {
   TEAM_FIGHT_START_MASS,
 } from './teamFight';
 import { PersistentStore, type FightMode } from './persistentStore';
+import { BotLogBuffer } from './botLogs';
+import { startTelegramBot } from '../bot/index';
 
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
 /** Physics stays at 30 Hz; mobile snapshots are sent at 10 Hz. */
@@ -59,6 +62,7 @@ const NETWORK_FOOD_MAX = 48;
 const NETWORK_EJECT_MAX = 25;
 const STATE_BACKPRESSURE_BYTES = 32_000;
 const BOT_CHAT_BUFFER_SIZE = 200;
+const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000;
 
 interface ClientSession {
   ws: WebSocket;
@@ -101,6 +105,17 @@ interface BotChatLine {
   name: string;
   text: string;
   t: number;
+}
+
+interface BotOutboxMessage {
+  id: number;
+  chatId: string;
+  text: string;
+}
+
+interface PasswordResetCode {
+  code: string;
+  expiresAt: number;
 }
 
 function parseMode(mode?: string): RoomMode {
@@ -185,6 +200,7 @@ function sanitizeChat(text: string): string {
 
 function startServer(attempt = 0) {
   const persistentStore = new PersistentStore();
+  const botLogs = new BotLogBuffer();
   let classicConfig: GameplayConfig = sanitizeGameplayConfig(
     persistentStore.getConfig() ?? defaultGameplayConfig
   );
@@ -234,6 +250,9 @@ function startServer(attempt = 0) {
     trioFight: [],
   };
   let nextBotChatId = 1;
+  const botOutbox: BotOutboxMessage[] = [];
+  let nextBotOutboxId = 1;
+  const passwordResetCodes = new Map<string, PasswordResetCode>();
 
   function removePendingFightJoin(session: ClientSession) {
     for (let i = pendingSoloFightJoins.length - 1; i >= 0; i--) {
@@ -283,6 +302,10 @@ function startServer(attempt = 0) {
     const t = Date.now();
     broadcastToRoom(room, { type: 'chat', name, text, t, color });
     queueGameChat(room, name, text, t);
+  }
+
+  function queueBotMessage(chatId: string, text: string) {
+    botOutbox.push({ id: nextBotOutboxId++, chatId, text });
   }
 
   function toNetPlayer(
@@ -542,6 +565,24 @@ function startServer(attempt = 0) {
     }
   }
 
+  function wipePersistentGameData() {
+    persistentStore.wipeAll();
+    applyClassicConfigAndSyncSf(defaultGameplayConfig);
+    sfState.scores = persistentStore.getScores('soloFight');
+    teamStates.duoFight.scores = persistentStore.getScores('duoFight');
+    teamStates.trioFight.scores = persistentStore.getScores('trioFight');
+    passwordResetCodes.clear();
+    broadcastToRoom('classic', { type: 'settings', settings: classicConfig, mode: 'classic' });
+    broadcastToRoom('soloFight', { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
+    for (const mode of ['duoFight', 'trioFight'] as TeamFightMode[]) {
+      broadcastToRoom(mode, { type: 'settings', settings: configFor(mode), mode });
+    }
+    broadcastSoloFightTop();
+    broadcastTeamMeta('duoFight');
+    broadcastTeamMeta('trioFight');
+    broadcastRoomInfo();
+  }
+
   function getRoomInfo(mode: RoomMode): { type: 'roomInfo'; players: number; lobby: number; mode: RoomMode; blue?: number; red?: number } {
     let players = 0;
     let lobby = 0;
@@ -643,6 +684,13 @@ function startServer(attempt = 0) {
       const since = Math.max(0, Number(url.searchParams.get('since')) || 0);
       const lines = botChatLines[room].filter((line) => line.id > since);
       writeBotApi(res, 200, { lines, lastId: lines.at(-1)?.id ?? since });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/bot/outbox') {
+      // Drain atomically from the single game process. The bot polls frequently
+      // and retries on its next request if the API call itself fails.
+      const messages = botOutbox.splice(0, botOutbox.length);
+      writeBotApi(res, 200, { messages });
       return;
     }
     try {
@@ -1503,6 +1551,12 @@ function startServer(attempt = 0) {
     console.log(`[agar-server] PORT env: ${process.env.PORT || '(default ' + DEFAULT_SERVER_PORT + ')'}`);
     console.log(`[agar-server] ADMIN nicknames: salruz (pass required)`);
     console.log(`[agar-server] classic ${c.worldWidth}x${c.worldHeight}, soloFight ${s.worldWidth}x${s.worldHeight}`);
+    const gameApiUrl = process.env.GAME_API_URL?.trim().replace(/\/+$/, '') || `http://127.0.0.1:${PORT}`;
+    try {
+      startTelegramBot(botLogs, gameApiUrl);
+    } catch (error) {
+      botLogs.write('error', `Бот не запущен: ${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 
   httpServer.on('error', (err: NodeJS.ErrnoException) => {
@@ -2042,6 +2096,61 @@ function startServer(attempt = 0) {
           });
           break;
         }
+        case 'requestPasswordReset': {
+          const login = String(msg.login || '').trim();
+          if (!/^[a-zA-Z0-9]{1,15}$/.test(login) || !persistentStore.getAccount(login)) {
+            send(ws, { type: 'passwordResetResult', action: 'request', ok: false, message: 'Аккаунт не найден' });
+            break;
+          }
+          const chatId = persistentStore.getTelegramChatId(login);
+          if (!chatId) {
+            send(ws, {
+              type: 'passwordResetResult',
+              action: 'request',
+              ok: false,
+              message: 'Аккаунт не привязан к Telegram. Войдите в боте и привяжите аккаунт.',
+            });
+            break;
+          }
+          const code = String(randomInt(0, 10_000)).padStart(4, '0');
+          passwordResetCodes.set(login.toLowerCase(), { code, expiresAt: Date.now() + PASSWORD_RESET_TTL_MS });
+          queueBotMessage(chatId, `Код для сброса пароля Agarva: ${code}`);
+          send(ws, {
+            type: 'passwordResetResult',
+            action: 'request',
+            ok: true,
+            message: 'Код отправлен в Telegram. Введите его и новый пароль.',
+          });
+          break;
+        }
+        case 'confirmPasswordReset': {
+          const login = String(msg.login || '').trim();
+          const code = String(msg.code || '').trim();
+          const reset = passwordResetCodes.get(login.toLowerCase());
+          if (!reset || reset.expiresAt < Date.now() || reset.code !== code) {
+            if (reset?.expiresAt && reset.expiresAt < Date.now()) passwordResetCodes.delete(login.toLowerCase());
+            send(ws, {
+              type: 'passwordResetResult',
+              action: 'confirm',
+              ok: false,
+              message: 'Неверный или просроченный код',
+            });
+            break;
+          }
+          const result = persistentStore.updateAccountPassword(login, String(msg.newPassword || ''));
+          if (!result.ok) {
+            send(ws, { type: 'passwordResetResult', action: 'confirm', ok: false, message: result.error });
+            break;
+          }
+          passwordResetCodes.delete(login.toLowerCase());
+          send(ws, {
+            type: 'passwordResetResult',
+            action: 'confirm',
+            ok: true,
+            message: 'Пароль изменён. Теперь войдите с новым паролем.',
+          });
+          break;
+        }
         case 'adminDownloadDb': {
           if (!session.isAdmin) {
             send(ws, { type: 'error', message: 'Admin only' });
@@ -2073,6 +2182,29 @@ function startServer(attempt = 0) {
           broadcastTeamMeta('trioFight');
           broadcastRoomInfo();
           send(ws, { type: 'adminDbResult', ok: true, message: 'База данных загружена' });
+          break;
+        }
+        case 'adminWipeDatabase': {
+          refreshAdmin(session);
+          if (!session.isAdmin) {
+            send(ws, { type: 'adminDbResult', ok: false, message: 'Только для администратора' });
+            break;
+          }
+          if (msg.confirmation !== 'CONFIRM') {
+            send(ws, { type: 'adminDbResult', ok: false, message: 'Подтверждение не принято' });
+            break;
+          }
+          wipePersistentGameData();
+          send(ws, { type: 'adminDbResult', ok: true, message: 'Вся база данных стёрта и сброшена к значениям по умолчанию' });
+          break;
+        }
+        case 'adminGetBotLogs': {
+          refreshAdmin(session);
+          if (!session.isAdmin) {
+            send(ws, { type: 'error', message: 'Admin only' });
+            break;
+          }
+          send(ws, { type: 'adminBotLogs', text: botLogs.getText() });
           break;
         }
         default:

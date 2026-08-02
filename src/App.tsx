@@ -87,6 +87,7 @@ export function App() {
   const [adminSettingsError, setAdminSettingsError] = useState<string | null>(null);
   const [adminSettingsSaving, setAdminSettingsSaving] = useState(false);
   const [adminSaveNotice, setAdminSaveNotice] = useState<string | null>(null);
+  const [telegramBotLogs, setTelegramBotLogs] = useState('');
   const [showSkinPicker, setShowSkinPicker] = useState(false);
   const [accountLogin, setAccountLogin] = useState<string | null>(() => {
     try {
@@ -99,6 +100,10 @@ export function App() {
   const [registerBusy, setRegisterBusy] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
+  const [passwordResetError, setPasswordResetError] = useState<string | null>(null);
+  const [passwordResetNotice, setPasswordResetNotice] = useState<string | null>(null);
+  const [passwordResetBusy, setPasswordResetBusy] = useState(false);
+  const [passwordResetCodeSent, setPasswordResetCodeSent] = useState(false);
   const [selectedSkinId, setSelectedSkinId] = useState<string | null>(() => loadSelectedSkinId());
   const selectedSkinUrl = resolveSkinUrl(selectedSkinId);
   const [menuName, setMenuName] = useState(() => {
@@ -587,6 +592,19 @@ export function App() {
           }
         }
       },
+      onPasswordResetResult: (action: 'request' | 'confirm', ok: boolean, message: string) => {
+        setPasswordResetBusy(false);
+        if (!ok) {
+          setPasswordResetError(message);
+          return;
+        }
+        setPasswordResetError(null);
+        if (action === 'request') setPasswordResetCodeSent(true);
+        else {
+          setPasswordResetCodeSent(false);
+          setPasswordResetNotice(message);
+        }
+      },
       onAdminDbExport: (json: string) => {
         const blob = new Blob([json], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
@@ -600,6 +618,9 @@ export function App() {
       onAdminDbResult: (ok: boolean, message: string) => {
         if (ok) setAdminSaveNotice(message);
         else setAdminSettingsError(message);
+      },
+      onAdminBotLogs: (text: string) => {
+        setTelegramBotLogs(text);
       },
       onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[], ownedIds?: string[]) => {
         gameStateRef.current = state;
@@ -1322,6 +1343,24 @@ export function App() {
     }
   }, [menuName, menuPassword]);
 
+  const handleWipeDatabase = useCallback(() => {
+    setAdminSettingsError(null);
+    if (!mpRef.current || !isAdminRef.current) {
+      setAdminSettingsError('Очистка БД доступна только в активном подключении администратора');
+      return;
+    }
+    mpRef.current.adminWipeDatabase();
+  }, []);
+
+  const handleGetTelegramBotLogs = useCallback(() => {
+    setAdminSettingsError(null);
+    if (!mpRef.current || !isAdminRef.current) {
+      setAdminSettingsError('Логи доступны только в активном подключении администратора');
+      return;
+    }
+    mpRef.current.adminGetBotLogs();
+  }, []);
+
   const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
   const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
   // Only true main menu without live spectate should open lobby watcher WS
@@ -1427,6 +1466,10 @@ export function App() {
           registerBusy={registerBusy}
           loginError={loginError}
           loginBusy={loginBusy}
+          passwordResetError={passwordResetError}
+          passwordResetNotice={passwordResetNotice}
+          passwordResetBusy={passwordResetBusy}
+          passwordResetCodeSent={passwordResetCodeSent}
           onRegisterAccount={(login, password) => {
             setRegisterBusy(true);
             setRegisterError(null);
@@ -1507,6 +1550,63 @@ export function App() {
               setLoginError('Ошибка соединения');
             };
           }}
+          onRequestPasswordReset={(login) => {
+            setPasswordResetBusy(true);
+            setPasswordResetError(null);
+            setPasswordResetNotice(null);
+            setPasswordResetCodeSent(false);
+            if (mpRef.current) {
+              mpRef.current.requestPasswordReset(login);
+              return;
+            }
+            const ws = new WebSocket(resolveServerUrl());
+            ws.onopen = () => ws.send(JSON.stringify({ type: 'requestPasswordReset', login, deviceId: deviceIdRef.current || undefined }));
+            ws.onmessage = (ev) => {
+              try {
+                const msg = JSON.parse(String(ev.data));
+                if (msg.type === 'passwordResetResult' && msg.action === 'request') {
+                  setPasswordResetBusy(false);
+                  if (msg.ok) setPasswordResetCodeSent(true);
+                  else setPasswordResetError(msg.message);
+                  ws.close();
+                }
+              } catch {}
+            };
+            ws.onerror = () => {
+              setPasswordResetBusy(false);
+              setPasswordResetError('Ошибка соединения');
+            };
+          }}
+          onConfirmPasswordReset={(login, code, newPassword) => {
+            setPasswordResetBusy(true);
+            setPasswordResetError(null);
+            setPasswordResetNotice(null);
+            if (mpRef.current) {
+              mpRef.current.confirmPasswordReset(login, code, newPassword);
+              return;
+            }
+            const ws = new WebSocket(resolveServerUrl());
+            ws.onopen = () => ws.send(JSON.stringify({ type: 'confirmPasswordReset', login, code, newPassword }));
+            ws.onmessage = (ev) => {
+              try {
+                const msg = JSON.parse(String(ev.data));
+                if (msg.type === 'passwordResetResult' && msg.action === 'confirm') {
+                  setPasswordResetBusy(false);
+                  if (msg.ok) {
+                    setPasswordResetCodeSent(false);
+                    setPasswordResetNotice(msg.message);
+                  } else {
+                    setPasswordResetError(msg.message);
+                  }
+                  ws.close();
+                }
+              } catch {}
+            };
+            ws.onerror = () => {
+              setPasswordResetBusy(false);
+              setPasswordResetError('Ошибка соединения');
+            };
+          }}
         />
       )}
 
@@ -1534,6 +1634,9 @@ export function App() {
         onExport={handleExportConfig}
         onDownloadDb={handleDownloadDb}
         onUploadDb={handleUploadDb}
+        onWipeDatabase={handleWipeDatabase}
+        onGetBotLogs={handleGetTelegramBotLogs}
+        botLogs={telegramBotLogs}
       />
 
       <SkinPicker

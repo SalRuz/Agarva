@@ -49,8 +49,10 @@ export interface MultiplayerCallbacks {
   }) => void;
   onRegisterAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
   onLoginAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
+  onPasswordResetResult?: (action: 'request' | 'confirm', ok: boolean, message: string) => void;
   onAdminDbExport?: (json: string) => void;
   onAdminDbResult?: (ok: boolean, message: string) => void;
+  onAdminBotLogs?: (text: string) => void;
 }
 
 interface Snap {
@@ -524,11 +526,17 @@ export class MultiplayerClient {
       case 'loginAccountResult':
         this.callbacks.onLoginAccountResult?.(msg.ok, msg.message, msg.accountLogin);
         break;
+      case 'passwordResetResult':
+        this.callbacks.onPasswordResetResult?.(msg.action, msg.ok, msg.message);
+        break;
       case 'adminDbExport':
         this.callbacks.onAdminDbExport?.(msg.json);
         break;
       case 'adminDbResult':
         this.callbacks.onAdminDbResult?.(msg.ok, msg.message);
+        break;
+      case 'adminBotLogs':
+        this.callbacks.onAdminBotLogs?.(msg.text);
         break;
       case 'teamFightHud':
         this.callbacks.onTeamFightHud?.(msg);
@@ -701,6 +709,14 @@ export class MultiplayerClient {
     this.send({ type: 'adminUploadDb', json });
   }
 
+  adminWipeDatabase() {
+    this.send({ type: 'adminWipeDatabase', confirmation: 'CONFIRM' });
+  }
+
+  adminGetBotLogs() {
+    this.send({ type: 'adminGetBotLogs' });
+  }
+
   registerAccount(login: string, password: string) {
     this.send({
       type: 'registerAccount',
@@ -719,6 +735,14 @@ export class MultiplayerClient {
       login,
       password,
     });
+  }
+
+  requestPasswordReset(login: string) {
+    this.send({ type: 'requestPasswordReset', login, deviceId: this.deviceId || undefined });
+  }
+
+  confirmPasswordReset(login: string, code: string, newPassword: string) {
+    this.send({ type: 'confirmPasswordReset', login, code, newPassword });
   }
 
   resetStarter() {

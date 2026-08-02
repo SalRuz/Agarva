@@ -45,6 +45,12 @@ interface StartScreenProps {
   onLoginAccount?: (login: string, password: string) => void;
   loginError?: string | null;
   loginBusy?: boolean;
+  onRequestPasswordReset?: (login: string) => void;
+  onConfirmPasswordReset?: (login: string, code: string, newPassword: string) => void;
+  passwordResetError?: string | null;
+  passwordResetNotice?: string | null;
+  passwordResetBusy?: boolean;
+  passwordResetCodeSent?: boolean;
 }
 
 export function StartScreen({
@@ -78,6 +84,12 @@ export function StartScreen({
   onLoginAccount,
   loginError = null,
   loginBusy = false,
+  onRequestPasswordReset,
+  onConfirmPasswordReset,
+  passwordResetError = null,
+  passwordResetNotice = null,
+  passwordResetBusy = false,
+  passwordResetCodeSent = false,
 }: StartScreenProps) {
   const [localError, setLocalError] = useState<string | null>(null);
   const [teamPicking, setTeamPicking] = useState(false);
@@ -89,7 +101,16 @@ export function StartScreen({
   const [loginLogin, setLoginLogin] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [loginLocalError, setLoginLocalError] = useState<string | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetLogin, setResetLogin] = useState('');
+  const [resetCode, setResetCode] = useState('');
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetLocalError, setResetLocalError] = useState<string | null>(null);
   const adminName = isAdminName(name);
+
+  useEffect(() => {
+    if (passwordResetCodeSent) setResetOpen(true);
+  }, [passwordResetCodeSent]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -148,10 +169,32 @@ export function StartScreen({
     onLoginAccount?.(loginLogin.trim(), loginPassword);
   };
 
+  const submitPasswordReset = (e: React.FormEvent) => {
+    e.preventDefault();
+    setResetLocalError(null);
+    if (!/^[a-zA-Z0-9]{1,15}$/.test(resetLogin.trim())) {
+      setResetLocalError('Логин: только латинские буквы и цифры');
+      return;
+    }
+    if (!passwordResetCodeSent) {
+      onRequestPasswordReset?.(resetLogin.trim());
+      return;
+    }
+    if (!/^\d{4}$/.test(resetCode)) {
+      setResetLocalError('Введите 4-значный код');
+      return;
+    }
+    if (!resetPassword || resetPassword.length > 8) {
+      setResetLocalError('Пароль: максимум 8 символов');
+      return;
+    }
+    onConfirmPasswordReset?.(resetLogin.trim(), resetCode, resetPassword);
+  };
+
   return (
     <div className="absolute inset-0 flex items-center justify-center p-4 pointer-events-none z-50">
       <div className="flex items-stretch justify-center gap-4 max-w-full">
-        <div className="pointer-events-auto w-[140px] shrink-0 flex flex-col items-center gap-3 self-start mt-10">
+        <div className="pointer-events-auto w-[172px] shrink-0 flex flex-col items-center gap-3 self-start mt-4">
           <div className="w-[100px] h-[100px] rounded-full overflow-hidden border-2 border-white/25 bg-gradient-to-br from-emerald-400 to-sky-500 shadow-lg">
             {skinPreviewUrl ? (
               <img src={skinPreviewUrl} alt="" className="w-full h-full object-cover" />
@@ -199,6 +242,60 @@ export function StartScreen({
                 Отмена
               </button>
             </form>
+          ) : resetOpen ? (
+            <form onSubmit={submitPasswordReset} className="w-full space-y-2" onKeyDown={stopKeys} onKeyUp={stopKeys}>
+              <input
+                value={resetLogin}
+                onChange={(e) => setResetLogin(e.target.value)}
+                placeholder="Логин"
+                maxLength={15}
+                autoComplete="username"
+                disabled={passwordResetCodeSent}
+                className="w-full px-2 py-1.5 rounded bg-black/60 border border-white/20 text-white text-xs disabled:opacity-60"
+              />
+              {passwordResetCodeSent && (
+                <>
+                  <input
+                    value={resetCode}
+                    onChange={(e) => setResetCode(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="Код из Telegram"
+                    inputMode="numeric"
+                    maxLength={4}
+                    className="w-full px-2 py-1.5 rounded bg-black/60 border border-white/20 text-white text-xs"
+                  />
+                  <input
+                    type="password"
+                    value={resetPassword}
+                    onChange={(e) => setResetPassword(e.target.value)}
+                    placeholder="Новый пароль"
+                    maxLength={8}
+                    autoComplete="new-password"
+                    className="w-full px-2 py-1.5 rounded bg-black/60 border border-white/20 text-white text-xs"
+                  />
+                </>
+              )}
+              {(resetLocalError || passwordResetError) && (
+                <div className="text-[10px] text-red-300 leading-tight">{resetLocalError || passwordResetError}</div>
+              )}
+              {passwordResetNotice && <div className="text-[10px] text-emerald-300 leading-tight">{passwordResetNotice}</div>}
+              <button
+                type="submit"
+                disabled={passwordResetBusy}
+                className="w-full py-1.5 rounded bg-violet-600 text-white text-xs font-semibold disabled:opacity-50"
+              >
+                {passwordResetBusy ? '…' : passwordResetCodeSent ? 'Сменить пароль' : 'Получить код'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setResetOpen(false);
+                  setResetLocalError(null);
+                }}
+                className="w-full py-1 rounded bg-white/10 text-gray-300 text-[10px]"
+              >
+                Отмена
+              </button>
+            </form>
           ) : loginOpen ? (
             <form onSubmit={submitLogin} className="w-full space-y-2" onKeyDown={stopKeys} onKeyUp={stopKeys}>
               <input
@@ -238,16 +335,27 @@ export function StartScreen({
               >
                 Отмена
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setLoginOpen(false);
+                  setResetOpen(true);
+                  setResetLocalError(null);
+                }}
+                className="w-full py-1 text-sky-200 text-[10px] underline underline-offset-2"
+              >
+                Забыл пароль
+              </button>
             </form>
           ) : (
-            <div className="flex flex-wrap justify-center gap-2">
+            <div className="grid w-full grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => {
                   setRegOpen(true);
                   setRegLocalError(null);
                 }}
-                className="px-2 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-semibold border border-white/20"
+                className="min-w-0 px-1 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-semibold border border-white/20"
               >
                 Регистрация
               </button>
@@ -257,7 +365,7 @@ export function StartScreen({
                   setLoginOpen(true);
                   setLoginLocalError(null);
                 }}
-                className="px-3 py-2 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-100 text-xs font-semibold border border-sky-300/30"
+                className="min-w-0 px-1 py-2 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-100 text-xs font-semibold border border-sky-300/30"
               >
                 Вход
               </button>
