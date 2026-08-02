@@ -1,7 +1,5 @@
 # Деплой Агарва на VPS (Timeweb / Reg.ru)
-JK>hg<26
-jYBg3C77Hw^R6d
-y-6^b+G**YdQr7
+
 Клиент: статика из `dist/` (один `index.html` после `npm run build`).  
 Сервер: Node WebSocket на порту **3001** (только localhost за nginx).  
 Клиенты ходят на **`wss://ВАШ_ДОМЕН/ws`** (same-origin; руками URL задавать не нужно).
@@ -69,6 +67,18 @@ npm run build
 ---
 
 ## 3. Запуск WebSocket-сервера (PM2)
+
+Создайте `/opt/agarwa/.env` на VPS и не добавляйте его в git:
+
+```bash
+cd /opt/agarwa
+nano .env
+```
+
+Минимально нужны `PORT=3001`, `TELEGRAM_BOT_ENABLED=1`, `TELEGRAM_BOT_TOKEN=...`
+и `GAME_API_SECRET=...`. `GAME_API_SECRET` должен быть одним и тем же для сервера
+и встроенного бота; `GAME_API_URL` обычно не задавайте — будет использован
+`http://127.0.0.1:PORT`.
 
 ```bash
 cd /opt/agarwa
@@ -164,14 +174,29 @@ localStorage.removeItem('agarServerUrl')
 
 ## 7. Обновление версии
 
+Если `git pull` сообщает, что локальный `dist/index.html` будет перезаписан,
+он **ничего не обновил**. Сначала уберите только сгенерированную статику из
+рабочего дерева, затем повторите обновление:
+
 ```bash
 cd /opt/agarwa
-git pull          # или залить новые файлы
+# Нужно только при переходе с версии, где .env ошибочно был в git:
+cp .env /opt/agarwa.env.backup
+git checkout -- dist/index.html
+git pull
+# Верните локальные секреты: новый коммит больше не хранит .env в репозитории.
+cp /opt/agarwa.env.backup .env
+chmod 600 .env
+ls bot
 npm ci
 npm run build
 sudo rsync -a --delete dist/ /var/www/agarwa/
-pm2 restart agarwa-server
+pm2 restart agarwa-server --update-env
+pm2 logs agarwa-server --lines 100
 ```
+
+`ls bot` должен показать `index.ts`. После изменения переменных в `.env`
+всегда используйте `pm2 restart agarwa-server --update-env`.
 
 ---
 
