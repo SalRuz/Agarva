@@ -20,6 +20,24 @@ export function randomColor(): string {
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
+/** High-saturation pellet palette; gameplay food never uses muted player colors. */
+const VIVID_FOOD_COLORS = [
+  '#ff1744', // red
+  '#ff6d00', // orange
+  '#ffea00', // yellow
+  '#76ff03', // lime
+  '#00e676', // green
+  '#00e5ff', // cyan
+  '#2979ff', // blue
+  '#651fff', // indigo
+  '#d500f9', // violet
+  '#f50057', // pink
+] as const;
+
+export function randomFoodColor(): string {
+  return VIVID_FOOD_COLORS[Math.floor(Math.random() * VIVID_FOOD_COLORS.length)];
+}
+
 export function distance(a: Position, b: Position): number {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
@@ -265,7 +283,7 @@ export function createFood(
       x: Math.random() * worldW,
       y: Math.random() * worldH,
       radius: r,
-      color: randomColor()
+      color: randomFoodColor()
     });
   }
   return food;

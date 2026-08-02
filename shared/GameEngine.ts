@@ -26,6 +26,7 @@ import {
   distributeVirusPopMass,
   bounceOffWalls,
   getFoodRadius,
+  getPlayerViewRadius,
 } from './physics';
 import { SPATIAL_CELL_SIZE } from './constants';
 import {
@@ -70,6 +71,8 @@ export class GameEngine {
   private foodHash = new SpatialHash<Food>(SPATIAL_CELL_SIZE);
   private foodQueryBuf: Food[] = [];
   private foodHashDirty = true;
+  /** Throttle real-food relocation into active player FOVs. */
+  private lastFoodViewMaintenance = 0;
   /**
    * Broad-phase for cell interactions. A coarser grid keeps queries cheap even
    * for large split pieces, while avoiding every W testing every player cell.
@@ -139,6 +142,64 @@ export class GameEngine {
   private rebuildFoodHash() {
     this.foodHash.rebuild(this.state.food);
     this.foodHashDirty = false;
+  }
+
+  /**
+   * Keep actual pellets (not client-only decoration) dense in moving player
+   * FOVs. A small, throttled portion of distant food is relocated each pass,
+   * preserving the global food cap and avoiding snapshot traffic bursts.
+   */
+  private maintainFoodAroundPlayers(now: number) {
+    if (
+      this.foodTargetCount <= 0 ||
+      this.state.food.length === 0 ||
+      now - this.lastFoodViewMaintenance < 250
+    ) {
+      return;
+    }
+    this.lastFoodViewMaintenance = now;
+
+    const players = this.state.players.filter((player) => !player.isBot && player.cells.length > 0);
+    if (players.length === 0) return;
+
+    const views = players.map((player) => ({
+      center: getPlayerCenter(player),
+      radius: getPlayerViewRadius(player, this.config),
+    }));
+    const inAnyView = (food: Food) =>
+      views.some((view) => {
+        const dx = food.x - view.center.x;
+        const dy = food.y - view.center.y;
+        return dx * dx + dy * dy <= view.radius * view.radius;
+      });
+    const protectedFood = new Set(this.state.food.filter(inAnyView).map((food) => food.id));
+    const movable = this.state.food.filter((food) => !protectedFood.has(food.id));
+    if (movable.length === 0) return;
+
+    let moved = 0;
+    const maxMoves = Math.min(32, movable.length);
+    for (const view of views) {
+      if (moved >= maxMoves) break;
+      const visible = this.state.food.reduce((count, food) => {
+        const dx = food.x - view.center.x;
+        const dy = food.y - view.center.y;
+        return count + (dx * dx + dy * dy <= view.radius * view.radius ? 1 : 0);
+      }, 0);
+      const worldDensity = this.state.food.length / Math.max(1, this.WW * this.WH);
+      const desired = Math.min(240, Math.max(32, Math.round(worldDensity * Math.PI * view.radius * view.radius * 1.25)));
+      const needed = Math.min(maxMoves - moved, Math.max(0, desired - visible));
+      for (let i = 0; i < needed; i++) {
+        const food = movable.pop();
+        if (!food) break;
+        const angle = Math.random() * Math.PI * 2;
+        const distance = Math.sqrt(Math.random()) * view.radius;
+        food.x = clamp(view.center.x + Math.cos(angle) * distance, food.radius, this.WW - food.radius);
+        food.y = clamp(view.center.y + Math.sin(angle) * distance, food.radius, this.WH - food.radius);
+        protectedFood.add(food.id);
+        moved++;
+      }
+    }
+    if (moved > 0) this.foodHashDirty = true;
   }
 
   private rebuildCellHash() {
@@ -921,11 +982,15 @@ export class GameEngine {
     }
     const cx = cell.x;
     const cy = cell.y;
+    // Virus-pop inertia is a shared admin setting in every mode.
+    const keepInertia = this.config.virusPopKeepInertia >= 0.5;
+    const inheritedVelocityX = keepInertia ? cell.velocityX : 0;
+    const inheritedVelocityY = keepInertia ? cell.velocityY : 0;
     applyMass(cell, masses[0], this.config);
     cell.x = cx;
     cell.y = cy;
-    cell.velocityX = 0;
-    cell.velocityY = 0;
+    cell.velocityX = inheritedVelocityX;
+    cell.velocityY = inheritedVelocityY;
     // Pin the main piece for a short time so separation won't push it away from the center.
     this.cellPinnedUntil.set(cell.id, now + 220);
 
@@ -950,8 +1015,8 @@ export class GameEngine {
         visualRadius: r * 0.35,
         targetRadius: r,
         color: cell.color,
-        velocityX: Math.cos(angle) * launch,
-        velocityY: Math.sin(angle) * launch,
+        velocityX: inheritedVelocityX + Math.cos(angle) * launch,
+        velocityY: inheritedVelocityY + Math.sin(angle) * launch,
         splitDirX: Math.cos(angle),
         splitDirY: Math.sin(angle),
         splitMaxSpeed: 0,
@@ -1283,14 +1348,36 @@ export class GameEngine {
       for (const virus of this.state.viruses) {
         if (virusesToRemove.has(virus.id)) continue;
 
-        const virusSpeed = Math.abs(virus.velocityX) + Math.abs(virus.velocityY);
-        const flying = virusSpeed > 2;
+        const virusSpeed = Math.hypot(virus.velocityX, virus.velocityY);
+        const virusFlying = virusSpeed > 2;
 
         // Absorb / bounce only when eject is deep enough inside the virus
         if (!coversCell(virus, mass, this.config.virusEjectCoverage)) continue;
 
+        const ejectSpeed = Math.hypot(mass.velocityX, mass.velocityY);
+        const ejectFlying = ejectSpeed > 2;
+
+        // Mode 2 is intentionally stricter than the legacy rule: a bounce
+        // requires both the virus and W to still be in flight. A settled
+        // virus always consumes W and uses its normal 7-charge shot.
+        const ejectInteractionMode = this.config.virusEjectInteractionMode;
+        if (ejectInteractionMode === 2 && virusFlying && ejectFlying) {
+          const hitNx = mass.velocityX / ejectSpeed;
+          const hitNy = mass.velocityY / ejectSpeed;
+          const push = Math.max(virusSpeed * 0.15, this.config.virusSplitSpeed * 0.35);
+          virus.velocityX = -virus.velocityX - hitNx * push;
+          virus.velocityY = -virus.velocityY - hitNy * push;
+          const length = Math.hypot(virus.velocityX, virus.velocityY) || 1;
+          virus.splitDirX = virus.velocityX / length;
+          virus.splitDirY = virus.velocityY / length;
+          this.state.ejectedMass.splice(i, 1);
+          this.previousMassPositions.delete(mass.id);
+          hitVirus = true;
+          break;
+        }
+
         // Flying virus: bounce off W (reflect velocity away from impact)
-        if (flying) {
+        if (virusFlying && ejectInteractionMode !== 2) {
           if (this.config.virusBounceFromEject < 0.5) continue;
 
           const moveDirX = mass.x - prevPos.x;
@@ -1509,6 +1596,8 @@ export class GameEngine {
         this.foodHashDirty = true;
       }
     }
+
+    this.maintainFoodAroundPlayers(now);
 
     // Auto-split after all mass changes this tick
     for (const player of this.state.players) {

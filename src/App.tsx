@@ -3,7 +3,7 @@ import { GameEngine } from './engine/GameEngine';
 import { GameCanvas } from './components/GameCanvas';
 import { Leaderboard } from './components/Leaderboard';
 import { Minimap } from './components/Minimap';
-import { StartScreen, useRoomStats, type PlayRoomMode } from './components/StartScreen';
+import { StartScreen, useLobbySnapshot, type PlayRoomMode } from './components/StartScreen';
 import { SoloFightHud } from './components/SoloFightHud';
 import { TeamFightHud } from './components/TeamFightHud';
 import { HUD } from './components/HUD';
@@ -26,6 +26,9 @@ import { getSectorLabelAt } from '../shared/sectors';
 import { requestRemoteAdminSettings, requestRemoteAdminDbDownload, requestRemoteAdminDbUpload } from './net/adminSettings';
 import {
   loadSelectedSkinId,
+  loadCustomSkins,
+  uploadCustomSkin,
+  deleteCustomSkin,
   resolveSkinUrl,
   saveSelectedSkinId,
   type SkinInfo,
@@ -65,6 +68,7 @@ export function App() {
   const [playMode, setPlayMode] = useState<PlayRoomMode>('classic');
   /** Mode of the live MP session (may differ from menu playMode while switching) */
   const [connectedPlayMode, setConnectedPlayMode] = useState<PlayRoomMode>('classic');
+  const [liveRoomSpectators, setLiveRoomSpectators] = useState(0);
   const [soloFightHud, setSoloFightHud] = useState<{
     phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
     countdown: number;
@@ -105,6 +109,7 @@ export function App() {
   const [passwordResetBusy, setPasswordResetBusy] = useState(false);
   const [passwordResetCodeSent, setPasswordResetCodeSent] = useState(false);
   const [selectedSkinId, setSelectedSkinId] = useState<string | null>(() => loadSelectedSkinId());
+  const [customSkins, setCustomSkins] = useState<SkinInfo[]>([]);
   const selectedSkinUrl = resolveSkinUrl(selectedSkinId);
   const [menuName, setMenuName] = useState(() => {
     try {
@@ -115,6 +120,9 @@ export function App() {
   });
   const [menuPassword, setMenuPassword] = useState('');
   const [frozen, setFrozen] = useState(false);
+  const [isTouchDevice] = useState(
+    () => typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)
+  );
 
   const engineRef = useRef<GameEngine | null>(null);
   const playerIdRef = useRef<string | null>(null);
@@ -150,6 +158,15 @@ export function App() {
   /** True while the main menu deliberately keeps a live MP spectator connection. */
   const menuOverLiveRef = useRef(false);
   const soloFightHudKeyRef = useRef('');
+  const preferFullscreenRef = useRef(
+    (() => {
+      try {
+        return localStorage.getItem('agarvaPreferFullscreen') === '1';
+      } catch {
+        return false;
+      }
+    })()
+  );
 
   useEffect(() => {
     modeRef.current = mode;
@@ -182,6 +199,15 @@ export function App() {
   useEffect(() => {
     selectedSkinIdRef.current = selectedSkinId;
   }, [selectedSkinId]);
+
+  const refreshCustomSkins = useCallback(async () => {
+    const skins = await loadCustomSkins();
+    setCustomSkins(skins);
+  }, []);
+
+  useEffect(() => {
+    void refreshCustomSkins();
+  }, [refreshCustomSkins]);
 
   useEffect(() => {
     try {
@@ -358,6 +384,79 @@ export function App() {
     return () => clearInterval(interval);
   }, []);
 
+  const toggleFullscreen = useCallback(async () => {
+    const root = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void> | void;
+    };
+    const fullscreenDocument = document as Document & { webkitFullscreenElement?: Element | null };
+    const entering = !(document.fullscreenElement || fullscreenDocument.webkitFullscreenElement);
+    preferFullscreenRef.current = entering;
+    try {
+      localStorage.setItem('agarvaPreferFullscreen', entering ? '1' : '0');
+    } catch {
+      /* preference remains available for this session */
+    }
+    try {
+      if (entering) {
+        if (root.requestFullscreen) await root.requestFullscreen();
+        else root.webkitRequestFullscreen?.();
+      } else {
+        await document.exitFullscreen?.();
+      }
+    } catch {
+      // Fullscreen is browser-controlled and may require a fresh user gesture.
+    }
+  }, []);
+
+  useEffect(() => {
+    const keepEscapeForGame = (event: KeyboardEvent) => {
+      if (event.code !== 'Escape' || !preferFullscreenRef.current) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable) return;
+      const opensGameMenu =
+        modeRef.current === 'playing' ||
+        modeRef.current === 'spectating' ||
+        (modeRef.current === 'menu' && menuOverLiveRef.current);
+      if (!opensGameMenu) return;
+      // Intercept Escape before the browser's fullscreen shortcut. The normal
+      // Escape handler below still opens/closes the in-game menu.
+      event.preventDefault();
+    };
+    const restorePreferredFullscreen = () => {
+      const fullscreenDocument = document as Document & { webkitFullscreenElement?: Element | null };
+      if (
+        !preferFullscreenRef.current ||
+        document.fullscreenElement ||
+        fullscreenDocument.webkitFullscreenElement
+      ) {
+        return;
+      }
+      const root = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void> | void;
+      };
+      // Browsers that reserve Escape may leave fullscreen before keydown can
+      // cancel it. Re-enter on the state change while the user gesture is fresh.
+      requestAnimationFrame(() => {
+        if (
+          !preferFullscreenRef.current ||
+          document.fullscreenElement ||
+          fullscreenDocument.webkitFullscreenElement
+        ) {
+          return;
+        }
+        Promise.resolve(root.requestFullscreen?.() ?? root.webkitRequestFullscreen?.()).catch(() => {});
+      });
+    };
+    window.addEventListener('keydown', keepEscapeForGame, true);
+    document.addEventListener('fullscreenchange', restorePreferredFullscreen);
+    document.addEventListener('webkitfullscreenchange', restorePreferredFullscreen);
+    return () => {
+      window.removeEventListener('keydown', keepEscapeForGame, true);
+      document.removeEventListener('fullscreenchange', restorePreferredFullscreen);
+      document.removeEventListener('webkitfullscreenchange', restorePreferredFullscreen);
+    };
+  }, []);
+
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
       if (e.code !== 'Escape') return;
@@ -402,11 +501,19 @@ export function App() {
         }
         // Always main menu (with live background if still connected) — never death overlay
         handleBackToMenuRef.current();
+        return;
+      }
+      // A live player may inspect another room's roster from the ESC menu.
+      // Escape from that preview restores the actual room instead of trapping
+      // the overlay on the preview selection.
+      if (modeRef.current === 'menu' && menuOverLiveRef.current) {
+        e.preventDefault();
+        setPlayMode(connectedPlayMode);
       }
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [showAdminSettings, showSkinPicker, showPlayerSettings, menuName]);
+  }, [showAdminSettings, showSkinPicker, showPlayerSettings, menuName, connectedPlayMode]);
 
   // Enter toggles chat in multiplayer (playing, dead, or spectating)
   useEffect(() => {
@@ -430,7 +537,8 @@ export function App() {
     mpRef.current?.disconnect();
     mpRef.current = null;
     mpRenderRef.current = null;
-    setChatMessages([]);
+    // Keep the room history across the menu → rejoin handoff. The App itself
+    // owns this history, so replacing the websocket must not wipe the chat.
     setChatOpen(false);
     setIsAdmin(false);
     setPingMs(null);
@@ -459,10 +567,11 @@ export function App() {
           setFrozen(false);
           return;
         }
-        playerIdRef.current = opts?.spectate ? null : id;
-        if (!opts?.spectate && id) ownedIdsRef.current = [id];
+        const spectating = opts?.spectate || mpRef.current?.isSpectateOnly() === true;
+        playerIdRef.current = spectating ? null : id;
+        if (!spectating && id) ownedIdsRef.current = [id];
         setIsConnecting(false);
-        if (opts?.spectate) {
+        if (spectating) {
           setMode('spectating');
           setIsAdmin(false);
           isAdminRef.current = false;
@@ -519,6 +628,11 @@ export function App() {
         red: { alive: number; total: number; members: string[]; streaks: Record<string, number> };
         spectators?: number;
       }) => setTeamFightHud(hud),
+      onRoomInfo: (info: { mode?: PlayRoomMode; spectators: number }) => {
+        if (!info.mode || info.mode === playModeRef.current) {
+          setLiveRoomSpectators(info.spectators);
+        }
+      },
       onSoloFightTop: () => {
         /* tops also arrive via lobby WS; keep callback for live sessions */
       },
@@ -689,6 +803,25 @@ export function App() {
     (name: string, serverUrl: string, password?: string, mode: PlayRoomMode = 'classic', team?: 'blue' | 'red') => {
       setConnectionError(null);
       setIsConnecting(true);
+      const liveClient = mpRef.current;
+      if (
+        liveClient &&
+        sessionKindRef.current === 'multiplayer' &&
+        modeRef.current === 'playing' &&
+        showEscapeMenuRef.current
+      ) {
+        // One ordered WS transition releases the old team's slot before joining
+        // the new room; closing and reconnecting could overlap those events.
+        setPlayMode(mode);
+        setConnectedPlayMode(mode);
+        setLiveRoomSpectators(0);
+        soloFightHudKeyRef.current = '';
+        setSoloFightHud(null);
+        setTeamFightHud(null);
+        liveClient.setSkin(selectedSkinIdRef.current);
+        liveClient.switchRoom(mode, team);
+        return;
+      }
       engineRef.current = null;
       menuOverLiveRef.current = false;
       disconnectMultiplayer();
@@ -697,6 +830,7 @@ export function App() {
       setSoloFightHud(null);
       setPlayMode(mode);
       setConnectedPlayMode(mode);
+      setLiveRoomSpectators(0);
 
       setSessionKind('multiplayer');
       sessionKindRef.current = 'multiplayer';
@@ -709,7 +843,6 @@ export function App() {
       setLastScore(0);
       setIsAdmin(false);
       isAdminRef.current = false;
-      setChatMessages([]);
       setFrozen(false);
 
       const client = new MultiplayerClient(
@@ -732,6 +865,31 @@ export function App() {
     (mode: PlayRoomMode = playMode) => {
       setConnectionError(null);
       setIsConnecting(true);
+      const liveClient = mpRef.current;
+      if (liveClient && sessionKindRef.current === 'multiplayer') {
+        // Use the existing socket so the server releases the old room (and
+        // any fight slot) before making this session a spectator in the new one.
+        if (liveClient.getRoomMode() === mode) {
+          setIsConnecting(false);
+          return;
+        }
+        menuOverLiveRef.current = false;
+        setPlayMode(mode);
+        setConnectedPlayMode(mode);
+        setLiveRoomSpectators(0);
+        soloFightHudKeyRef.current = '';
+        setSoloFightHud(null);
+        setTeamFightHud(null);
+        playerIdRef.current = null;
+        ownedIdsRef.current = [];
+        currentPlayerRef.current = undefined;
+        setCurrentPlayer(undefined);
+        setFrozen(false);
+        liveClient.setRoomMode(mode);
+        liveClient.setRoomTeam(undefined);
+        liveClient.enterSpectate();
+        return;
+      }
       engineRef.current = null;
       menuOverLiveRef.current = false;
       disconnectMultiplayer();
@@ -740,6 +898,7 @@ export function App() {
       setSoloFightHud(null);
       setPlayMode(mode);
       setConnectedPlayMode(mode);
+      setLiveRoomSpectators(0);
       setSessionKind('multiplayer');
       sessionKindRef.current = 'multiplayer';
       serverUrlRef.current = resolveServerUrl();
@@ -1363,8 +1522,9 @@ export function App() {
 
   const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
   const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
-  // Only true main menu without live spectate should open lobby watcher WS
-  const roomStats = useRoomStats(mode === 'menu' && !menuOverLive, playMode);
+  // One always-on menu socket receives atomic occupancy for every room.
+  const lobbyStats = useLobbySnapshot(showMenuOverlay);
+  const roomStats = lobbyStats[playMode];
   const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
   const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
   const hudScale = hudSizeScale(playerPrefs.hudSize);
@@ -1434,6 +1594,12 @@ export function App() {
         ownedIdsRef={ownedIdsRef}
         onMultibox={handleMultibox}
         onSendCoords={handleSendCoords}
+        onWorldPointerDown={() => {
+          if (chatOpenRef.current) {
+            setChatOpen(false);
+            setChatFocused(false);
+          }
+        }}
       />
 
       {showMenuOverlay && (
@@ -1445,21 +1611,25 @@ export function App() {
           playMode={playMode}
           onPlayModeChange={setPlayMode}
           onStart={handleStartMultiplayer}
-          onSpectate={mode === 'menu' ? handleSpectateClassic : undefined}
-          spectateDisabled={mode === 'playing'}
+          onSpectate={handleSpectateClassic}
+          spectateDisabled={mode === 'playing' && playMode === connectedPlayMode}
           escapeOverlay={mode === 'playing' && showEscapeMenu}
           activePlayMode={sessionKind === 'multiplayer' ? connectedPlayMode : undefined}
           onResume={handleResume}
           onAdminSettings={handleOpenAdminSettings}
           onOpenSkins={() => setShowSkinPicker(true)}
           onOpenSettings={() => setShowPlayerSettings(true)}
+          onToggleFullscreen={toggleFullscreen}
           connectionError={connectionError}
           isConnecting={isConnecting}
           roomPlayers={roomStats.players}
           roomSpectators={roomStats.spectators}
           roomBlue={roomStats.blue}
           roomRed={roomStats.red}
-          soloFightTop={roomStats.soloFightTop}
+          roomBlueMembers={roomStats.blueMembers}
+          roomRedMembers={roomStats.redMembers}
+          lobbyStats={lobbyStats}
+          soloFightTop={[]}
           skinPreviewUrl={selectedSkinUrl}
           accountLogin={accountLogin}
           registerError={registerError}
@@ -1637,6 +1807,43 @@ export function App() {
         onWipeDatabase={handleWipeDatabase}
         onGetBotLogs={handleGetTelegramBotLogs}
         botLogs={telegramBotLogs}
+        customSkins={customSkins}
+        onUploadSkin={async (file, name) => {
+          setAdminSettingsError(null);
+          try {
+            await uploadCustomSkin(
+              file,
+              name,
+              adminSettingsNameRef.current || menuName,
+              adminPasswordRef.current || menuPassword
+            );
+            await refreshCustomSkins();
+            setAdminSaveNotice('Скин добавлен и доступен всем игрокам');
+          } catch (error) {
+            setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось добавить скин');
+            throw error;
+          }
+        }}
+        onDeleteSkin={async (skin) => {
+          setAdminSettingsError(null);
+          try {
+            await deleteCustomSkin(
+              skin,
+              adminSettingsNameRef.current || menuName,
+              adminPasswordRef.current || menuPassword
+            );
+            if (selectedSkinIdRef.current === skin.id) {
+              setSelectedSkinId(null);
+              selectedSkinIdRef.current = null;
+              saveSelectedSkinId(null);
+            }
+            await refreshCustomSkins();
+            setAdminSaveNotice('Скин удалён');
+          } catch (error) {
+            setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось удалить скин');
+            throw error;
+          }
+        }}
       />
 
       <SkinPicker
@@ -1646,7 +1853,7 @@ export function App() {
         onClose={() => setShowSkinPicker(false)}
       />
 
-      {(mode !== 'menu' || menuOverLive) && !showEscapeMenu && (
+      {(mode !== 'menu' || menuOverLive) && !showEscapeMenu && !isTouchDevice && (
         <div
           className="contents"
           style={{
@@ -1657,12 +1864,13 @@ export function App() {
             {(connectedPlayMode === 'duoFight' || connectedPlayMode === 'trioFight') && teamFightHud ? (
               <TeamFightHud {...teamFightHud} />
             ) : (connectedPlayMode === 'soloFight' || playMode === 'soloFight') && soloFightHud ? (
-              <SoloFightHud {...soloFightHud} />
+              <SoloFightHud {...soloFightHud} spectators={liveRoomSpectators} />
             ) : (
               <Leaderboard
                 entries={leaderboard}
                 currentPlayerName={currentPlayer?.name || playerNameRef.current}
                 onClickNick={sessionKind === 'multiplayer' ? handleMentionNick : undefined}
+                spectators={liveRoomSpectators}
               />
             )}
           </div>
@@ -1694,7 +1902,7 @@ export function App() {
         </div>
       )}
 
-      {sessionKind === 'multiplayer' && mode !== 'menu' && !showEscapeMenu && (
+      {sessionKind === 'multiplayer' && (mode !== 'menu' || menuOverLive) && !showEscapeMenu && !isTouchDevice && (
         <div style={{ zoom: hudScale } as React.CSSProperties}>
           <ChatPanel
             messages={chatMessages}
@@ -1739,7 +1947,7 @@ export function App() {
         />
       )}
 
-      {mode === 'spectating' && (
+      {mode === 'spectating' && !isTouchDevice && (
         <div className="absolute top-4 left-4 bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2 select-none">
           <div className="text-white font-bold text-lg">Режим наблюдения</div>
           <div className="text-gray-400 text-xs">

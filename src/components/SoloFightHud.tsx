@@ -4,6 +4,7 @@ interface SoloFightHudProps {
   fightSecondsLeft?: number;
   a: { name: string; score: number };
   b: { name: string; score: number };
+  spectators?: number;
 }
 
 function formatFightClock(totalSec: number): string {
@@ -13,7 +14,7 @@ function formatFightClock(totalSec: number): string {
   return `${m}:${r.toString().padStart(2, '0')}`;
 }
 
-export function SoloFightHud({ phase, countdown, fightSecondsLeft, a, b }: SoloFightHudProps) {
+export function SoloFightHud({ phase, countdown, fightSecondsLeft, a, b, spectators = 0 }: SoloFightHudProps) {
   const phaseLabel =
     phase === 'waiting'
       ? 'Ожидание соперника…'
@@ -42,6 +43,7 @@ export function SoloFightHud({ phase, countdown, fightSecondsLeft, a, b }: SoloF
             <span className="font-mono text-emerald-300">🔥 {b.score}</span>
           </div>
         </div>
+        <div className="mt-2 text-center text-xs text-sky-300">Спектаторы: {spectators}</div>
       </div>
     </div>
   );

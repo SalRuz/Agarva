@@ -40,6 +40,10 @@ export interface MultiplayerCallbacks {
   onSoloFightTop?: (entries: { name: string; score: number }[]) => void;
   onTeamFightHud?: (hud: { mode: 'duoFight' | 'trioFight'; phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting'; countdown: number; fightSecondsLeft?: number; blue: { alive: number; total: number; members: string[]; streaks: Record<string, number> }; red: { alive: number; total: number; members: string[]; streaks: Record<string, number> } }) => void;
   onTeamFightTop?: (mode: 'soloFight' | 'duoFight' | 'trioFight', entries: { name: string; score: number }[]) => void;
+  onRoomInfo?: (info: { mode?: 'classic' | 'soloFight' | 'duoFight' | 'trioFight'; players: number; spectators: number; blue?: number; red?: number }) => void;
+  onLobbySnapshot?: (rooms: Record<'classic' | 'soloFight' | 'duoFight' | 'trioFight', {
+    players: number; spectators: number; blue?: number; red?: number; blueMembers?: string[]; redMembers?: string[];
+  }>) => void;
   onPlayerProfile?: (profile: {
     deviceId: string;
     lastNick?: string;
@@ -140,25 +144,40 @@ function lerpById<T extends { id: string; x: number; y: number }>(
   fromList: T[],
   toList: T[],
   t: number,
-  merge: (f: T | undefined, cur: T, x: number, y: number) => T
+  merge: (f: T | undefined, cur: T, x: number, y: number) => T,
+  keepMissingWhileInterpolating = false
 ): T[] {
   const fromMap = new Map(fromList.map((e) => [e.id, e]));
-  return toList.map((cur) => {
+  const result = toList.map((cur) => {
     const prev = fromMap.get(cur.id);
     if (!prev) return merge(undefined, cur, cur.x, cur.y);
     return merge(prev, cur, lerp(prev.x, cur.x, t), lerp(prev.y, cur.y, t));
   });
+  // A capped snapshot can omit an object for one tick even while it exists.
+  // Keep it only during the interpolation interval, never indefinitely.
+  if (keepMissingWhileInterpolating && t < 1) {
+    const currentIds = new Set(toList.map((e) => e.id));
+    for (const prev of fromList) {
+      if (!currentIds.has(prev.id)) result.push(prev);
+    }
+  }
+  return result;
 }
 
 function interpolateStates(from: Snap, to: Snap, t: number): { state: GameState; you: Player | undefined } {
   const players = lerpPlayers(from.state, to.state, t);
   const food = lerpById(from.state.food, to.state.food, t, (_f, cur, x, y) => ({ ...cur, x, y }));
-  const viruses = lerpById(from.state.viruses, to.state.viruses, t, (f, cur, x, y) => ({
-    ...cur,
-    x,
-    y,
-    radius: f ? lerp(f.radius, cur.radius, t) : cur.radius,
-  }));
+  const viruses = lerpById(
+    from.state.viruses,
+    to.state.viruses,
+    t,
+    (f, cur, x, y) => ({
+      ...cur,
+      x,
+      y,
+      radius: f ? lerp(f.radius, cur.radius, t) : cur.radius,
+    })
+  );
   const ejectedMass = lerpById(from.state.ejectedMass, to.state.ejectedMass, t, (f, cur, x, y) => ({
     ...cur,
     x,
@@ -240,6 +259,8 @@ export function resolveAdminToken(): string {
 }
 
 export class MultiplayerClient {
+  /** A single capped packet omission must not make an entity visibly disappear. */
+  private static readonly ENTITY_MISSING_GRACE_MS = 550;
   private ws: WebSocket | null = null;
   private callbacks: MultiplayerCallbacks;
   private playerId: string | null = null;
@@ -252,8 +273,8 @@ export class MultiplayerClient {
   private worldH = WORLD_HEIGHT;
   private isAdmin = false;
   private lastPingMs: number | null = null;
-  /** Render ~half a tick behind latest snap so we can interpolate smoothly */
-  private interpDelayMs = 35;
+  /** Render one snapshot behind latest data; leaves enough history for smooth motion. */
+  private interpDelayMs = 90;
   private config: GameplayConfig = defaultGameplayConfig;
   private lastInputSentAt = 0;
   private lastInputMx = Number.NaN;
@@ -270,6 +291,9 @@ export class MultiplayerClient {
   /** Retain skins when server omits unchanged skin fields */
   private skinCache = new Map<string, string>();
   private lastLeaderboard: LeaderboardEntry[] = [];
+  private foodSeenAt = new Map<string, number>();
+  private virusSeenAt = new Map<string, number>();
+  private ejectSeenAt = new Map<string, number>();
 
   constructor(name: string, callbacks: MultiplayerCallbacks = {}, password?: string, skin?: string) {
     this.name = name;
@@ -305,6 +329,16 @@ export class MultiplayerClient {
 
   getOwnedIds() {
     return this.ownedIds;
+  }
+
+  /** A room/welcome boundary must never interpolate entities from the prior session. */
+  private clearSnapshotState() {
+    this.snapPrev = null;
+    this.snapCurr = null;
+    this.ownedIds = [];
+    this.foodSeenAt.clear();
+    this.virusSeenAt.clear();
+    this.ejectSeenAt.clear();
   }
 
   private joinPayload(name = this.name) {
@@ -352,7 +386,7 @@ export class MultiplayerClient {
 
   /**
    * Smooth state for rendering (call every frame).
-   * Solo-like feel: lerp between the last two server snapshots.
+   * Render slightly behind the latest snapshot, then extrapolate only a short tail.
    */
   getRenderState(): { state: GameState; you: Player | undefined } | null {
     if (!this.snapCurr) return null;
@@ -364,7 +398,8 @@ export class MultiplayerClient {
     const renderT = performance.now() - this.interpDelayMs;
     let alpha = (renderT - this.snapPrev.localT) / span;
     if (alpha < 0) alpha = 0;
-    if (alpha > 1) alpha = 1;
+    // A short tail covers normal packet jitter without holding a stale pose.
+    if (alpha > 1.25) alpha = 1.25;
 
     return interpolateStates(this.snapPrev, this.snapCurr, alpha);
   }
@@ -461,9 +496,83 @@ export class MultiplayerClient {
     };
   }
 
+  private retainBriefly<T extends { id: string }>(
+    current: T[],
+    previous: T[],
+    seenAt: Map<string, number>,
+    now: number,
+    removedIds: readonly string[] = []
+  ): T[] {
+    const previousById = new Map(previous.map((entity) => [entity.id, entity]));
+    const currentIds = new Set<string>();
+    const removed = new Set(removedIds);
+    for (const id of removed) seenAt.delete(id);
+    for (const entity of current) {
+      currentIds.add(entity.id);
+      seenAt.set(entity.id, now);
+      const prior = previousById.get(entity.id) as (T & { x?: number; y?: number; velocityX?: number; velocityY?: number }) | undefined;
+      const moving = entity as T & { x?: number; y?: number; velocityX?: number; velocityY?: number };
+      if (prior && typeof prior.x === 'number' && typeof prior.y === 'number' && typeof moving.x === 'number' && typeof moving.y === 'number') {
+        // Network entities do not transmit velocities. Preserve the measured
+        // per-snapshot delta so a briefly omitted flying W/virus continues
+        // smoothly instead of freezing before its grace timeout.
+        moving.velocityX = moving.x - prior.x;
+        moving.velocityY = moving.y - prior.y;
+      }
+    }
+    const retained = [...current];
+    for (const entity of previous) {
+      if (
+        !currentIds.has(entity.id) &&
+        !removed.has(entity.id) &&
+        now - (seenAt.get(entity.id) ?? 0) <= MultiplayerClient.ENTITY_MISSING_GRACE_MS
+      ) {
+        const prior = entity as T & { x?: number; y?: number; velocityX?: number; velocityY?: number };
+        const held = { ...prior };
+        if (typeof prior.x === 'number' && typeof prior.y === 'number') {
+          held.x = prior.x + (prior.velocityX ?? 0);
+          held.y = prior.y + (prior.velocityY ?? 0);
+        }
+        retained.push(held);
+      }
+    }
+    for (const [id, lastSeen] of seenAt) {
+      if (now - lastSeen > MultiplayerClient.ENTITY_MISSING_GRACE_MS) seenAt.delete(id);
+    }
+    return retained;
+  }
+
+  private retainSnapshotGaps(state: GameState, now: number, msg: StateMessage) {
+    const previous = this.snapCurr?.state;
+    if (!previous) {
+      for (const food of state.food) this.foodSeenAt.set(food.id, now);
+      for (const virus of state.viruses) this.virusSeenAt.set(virus.id, now);
+      for (const eject of state.ejectedMass) this.ejectSeenAt.set(eject.id, now);
+      return;
+    }
+
+    // The server distinguishes a capped/FOV omission from destruction. Only
+    // omitted live entities get a grace period; consumed/despawned ones vanish
+    // in this snapshot without waiting for the anti-flicker timeout.
+    state.food = this.retainBriefly(state.food, previous.food, this.foodSeenAt, now, msg.removedFoodIds);
+    state.viruses = this.retainBriefly(state.viruses, previous.viruses, this.virusSeenAt, now, msg.removedVirusIds);
+    state.ejectedMass = this.retainBriefly(
+      state.ejectedMass,
+      previous.ejectedMass,
+      this.ejectSeenAt,
+      now,
+      msg.removedEjectedIds
+    );
+
+    // Player cells are authoritative, unlike capped food/W snapshots. Keeping
+    // omitted foreign cells here produced a short-lived ghost on joins and
+    // room changes, so remove them as soon as the server stops sending them.
+  }
+
   private handleMessage(msg: ServerMessage) {
     switch (msg.type) {
       case 'welcome':
+        this.clearSnapshotState();
         this.playerId = msg.id;
         this.worldW = msg.world.w;
         this.worldH = msg.world.h;
@@ -541,13 +650,31 @@ export class MultiplayerClient {
       case 'teamFightHud':
         this.callbacks.onTeamFightHud?.(msg);
         break;
+      case 'roomInfo':
+        this.callbacks.onRoomInfo?.({
+          mode: msg.mode,
+          players: msg.players,
+          spectators: msg.lobby,
+          blue: msg.blue,
+          red: msg.red,
+        });
+        break;
+      case 'lobbySnapshot':
+        this.callbacks.onLobbySnapshot?.({
+          classic: { ...msg.rooms.classic, spectators: msg.rooms.classic.lobby },
+          soloFight: { ...msg.rooms.soloFight, spectators: msg.rooms.soloFight.lobby },
+          duoFight: { ...msg.rooms.duoFight, spectators: msg.rooms.duoFight.lobby },
+          trioFight: { ...msg.rooms.trioFight, spectators: msg.rooms.trioFight.lobby },
+        });
+        break;
       case 'state': {
         const { state, you } = this.buildStateFromMsg(msg);
+        this.retainSnapshotGaps(state, performance.now(), msg);
         // Adapt delay to measured tick spacing
         if (this.snapCurr) {
           const gap = performance.now() - this.snapCurr.localT;
-          if (gap > 10 && gap < 120) {
-            this.interpDelayMs = Math.min(50, Math.max(20, gap * 0.55));
+          if (gap > 40 && gap < 180) {
+            this.interpDelayMs = Math.min(120, Math.max(75, gap * 0.9));
           }
         }
         if (msg.leaderboard) this.lastLeaderboard = msg.leaderboard;
@@ -624,6 +751,15 @@ export class MultiplayerClient {
   enterSpectate() {
     this.spectateOnly = true;
     this.send({ type: 'spectate', mode: this.roomMode });
+  }
+
+  switchRoom(mode: 'classic' | 'soloFight' | 'duoFight' | 'trioFight', team?: 'blue' | 'red') {
+    this.roomMode = mode;
+    this.roomTeam = team;
+    this.spectateOnly = false;
+    // One socket lets the server vacate the old room before assigning the new
+    // one, so team slots and lobby snapshots never overlap during a switch.
+    this.send(this.joinPayload());
   }
 
   rename(name: string, password?: string, skin?: string | null) {
@@ -764,8 +900,7 @@ export class MultiplayerClient {
       this.ws.close();
       this.ws = null;
     }
-    this.snapPrev = null;
-    this.snapCurr = null;
+    this.clearSnapshotState();
     this.playerId = null;
     this.isAdmin = false;
     this.spectateOnly = false;

@@ -6,6 +6,15 @@ import { ADMIN_PASSWORD } from '../../shared/constants';
 export type PlayRoomMode = 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
 
 export type SoloFightTopEntry = { name: string; score: number };
+export type LobbyRoomStats = {
+  players: number | null;
+  spectators: number | null;
+  blue: number | null;
+  red: number | null;
+  blueMembers: string[];
+  redMembers: string[];
+};
+export type LobbyStatsByMode = Record<PlayRoomMode, LobbyRoomStats>;
 
 interface StartScreenProps {
   name: string;
@@ -26,6 +35,7 @@ interface StartScreenProps {
   onAdminSettings?: (ctx: { name: string; password: string }) => void;
   onOpenSkins?: () => void;
   onOpenSettings?: () => void;
+  onToggleFullscreen?: () => void;
   connectionError?: string | null;
   isConnecting?: boolean;
   roomPlayers?: number | null;
@@ -33,6 +43,10 @@ interface StartScreenProps {
   roomSpectators?: number | null;
   roomBlue?: number | null;
   roomRed?: number | null;
+  roomBlueMembers?: string[];
+  roomRedMembers?: string[];
+  /** Complete, server-authored snapshot for every mode preview card. */
+  lobbyStats?: LobbyStatsByMode;
   /** Fight total-wins leaderboard (shown beside menu) */
   soloFightTop?: SoloFightTopEntry[];
   /** Selected skin preview URL (null = plain ball) */
@@ -69,12 +83,16 @@ export function StartScreen({
   onAdminSettings,
   onOpenSkins,
   onOpenSettings,
+  onToggleFullscreen,
   connectionError,
   isConnecting,
   roomPlayers = null,
   roomSpectators = null,
   roomBlue = null,
   roomRed = null,
+  roomBlueMembers = [],
+  roomRedMembers = [],
+  lobbyStats,
   soloFightTop = [],
   skinPreviewUrl = null,
   accountLogin = null,
@@ -92,7 +110,6 @@ export function StartScreen({
   passwordResetCodeSent = false,
 }: StartScreenProps) {
   const [localError, setLocalError] = useState<string | null>(null);
-  const [teamPicking, setTeamPicking] = useState(false);
   const [regOpen, setRegOpen] = useState(false);
   const [regLogin, setRegLogin] = useState('');
   const [regPassword, setRegPassword] = useState('');
@@ -107,6 +124,15 @@ export function StartScreen({
   const [resetPassword, setResetPassword] = useState('');
   const [resetLocalError, setResetLocalError] = useState<string | null>(null);
   const adminName = isAdminName(name);
+  const statsFor = (mode: PlayRoomMode): LobbyRoomStats =>
+    lobbyStats?.[mode] ?? {
+      players: mode === playMode ? roomPlayers : null,
+      spectators: mode === playMode ? roomSpectators : null,
+      blue: mode === playMode ? roomBlue : null,
+      red: mode === playMode ? roomRed : null,
+      blueMembers: mode === playMode ? roomBlueMembers : [],
+      redMembers: mode === playMode ? roomRedMembers : [],
+    };
 
   useEffect(() => {
     if (passwordResetCodeSent) setResetOpen(true);
@@ -126,7 +152,6 @@ export function StartScreen({
       return;
     }
     if (playMode === 'duoFight' || playMode === 'trioFight') {
-      setTeamPicking(true);
       return;
     }
     onStart(name.trim(), resolveServerUrl(), adminName ? password : undefined, playMode);
@@ -398,11 +423,7 @@ export function StartScreen({
               }`}
             >
               Классик
-              {playMode === 'classic' && (
-                <span className="block text-xs font-normal text-sky-100/90 mt-0.5">
-                  Игроки: {roomPlayers ?? '—'} · Спеки: {roomSpectators ?? '—'}
-                </span>
-              )}
+              <span className="block text-xs font-normal text-sky-100/90 mt-0.5">Игроки: {statsFor('classic').players ?? '—'} · Спеки: {statsFor('classic').spectators ?? '—'}</span>
             </button>
             <button
               type="button"
@@ -412,27 +433,23 @@ export function StartScreen({
               }`}
             >
               Соло файт
-              {playMode === 'soloFight' && (
-                <span className="block text-xs font-normal text-rose-100/90 mt-0.5">
-                  Бой: {roomPlayers ?? '—'} / 2 · Спеки: {roomSpectators ?? '—'}
-                </span>
-              )}
+              <span className="block text-xs font-normal text-rose-100/90 mt-0.5">Бой: {statsFor('soloFight').players ?? '—'} / 2 · Спеки: {statsFor('soloFight').spectators ?? '—'}</span>
             </button>
             <button
               type="button"
-              onClick={() => { setTeamPicking(false); onPlayModeChange('duoFight'); }}
+              onClick={() => onPlayModeChange('duoFight')}
               className={`py-2 rounded-lg font-semibold transition-all ${playMode === 'duoFight' ? 'bg-blue-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'}`}
             >
               Дуо файт
-              {playMode === 'duoFight' && <span className="block text-xs font-normal text-blue-100/90 mt-0.5">Бой: {roomPlayers ?? '—'} / 4 · Спеки: {roomSpectators ?? '—'}</span>}
+              <span className="block text-xs font-normal text-blue-100/90 mt-0.5">Бой: {statsFor('duoFight').players ?? '—'} / 4</span>
             </button>
             <button
               type="button"
-              onClick={() => { setTeamPicking(false); onPlayModeChange('trioFight'); }}
+              onClick={() => onPlayModeChange('trioFight')}
               className={`py-2 rounded-lg font-semibold transition-all ${playMode === 'trioFight' ? 'bg-violet-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'}`}
             >
               Трио файт
-              {playMode === 'trioFight' && <span className="block text-xs font-normal text-violet-100/90 mt-0.5">Бой: {roomPlayers ?? '—'} / 6 · Спеки: {roomSpectators ?? '—'}</span>}
+              <span className="block text-xs font-normal text-violet-100/90 mt-0.5">Бой: {statsFor('trioFight').players ?? '—'} / 6</span>
             </button>
           </div>
 
@@ -494,21 +511,27 @@ export function StartScreen({
                   : '▶ Войти в комнату'}
             </button>
 
-            {teamPicking && (playMode === 'duoFight' || playMode === 'trioFight') && (
+            {(playMode === 'duoFight' || playMode === 'trioFight') && (
               <div className="rounded-lg border border-white/20 bg-white/5 p-3 space-y-2">
                 <div className="text-center text-sm text-white font-semibold">Выберите команду · Спектаторы: {roomSpectators ?? '—'}</div>
                 <div className="grid grid-cols-2 gap-2">
-                  <button type="button" disabled={(roomBlue ?? 0) >= (playMode === 'duoFight' ? 2 : 3)} onClick={() => joinTeam('blue')} className="py-2 rounded bg-blue-600 text-white disabled:opacity-40">
-                    Синяя команда {roomBlue ?? 0}/{playMode === 'duoFight' ? 2 : 3}
+                  <button type="button" disabled={(roomBlue ?? 0) >= (playMode === 'duoFight' ? 2 : 3)} onClick={() => joinTeam('blue')} className="min-w-0 rounded bg-blue-600 px-2 py-2 text-white disabled:opacity-40">
+                    <span className="block">Синяя {roomBlue ?? 0}/{playMode === 'duoFight' ? 2 : 3}</span>
+                    <span className="mt-1 flex flex-col gap-0.5 whitespace-normal break-words text-left text-xs font-normal leading-4">
+                      {roomBlueMembers.length ? roomBlueMembers.map((nick) => <span key={nick} className="block">{nick}</span>) : 'Свободно'}
+                    </span>
                   </button>
-                  <button type="button" disabled={(roomRed ?? 0) >= (playMode === 'duoFight' ? 2 : 3)} onClick={() => joinTeam('red')} className="py-2 rounded bg-red-600 text-white disabled:opacity-40">
-                    Красная команда {roomRed ?? 0}/{playMode === 'duoFight' ? 2 : 3}
+                  <button type="button" disabled={(roomRed ?? 0) >= (playMode === 'duoFight' ? 2 : 3)} onClick={() => joinTeam('red')} className="min-w-0 rounded bg-red-600 px-2 py-2 text-white disabled:opacity-40">
+                    <span className="block">Красная {roomRed ?? 0}/{playMode === 'duoFight' ? 2 : 3}</span>
+                    <span className="mt-1 flex flex-col gap-0.5 whitespace-normal break-words text-left text-xs font-normal leading-4">
+                      {roomRedMembers.length ? roomRedMembers.map((nick) => <span key={nick} className="block">{nick}</span>) : 'Свободно'}
+                    </span>
                   </button>
                 </div>
               </div>
             )}
 
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               {onOpenSettings && (
                 <button
                   type="button"
@@ -544,6 +567,13 @@ export function StartScreen({
                   Скины
                 </button>
               )}
+              <button
+                type="button"
+                onClick={onToggleFullscreen}
+                className="py-3 rounded-lg bg-white/10 border border-white/20 text-white font-bold text-sm hover:bg-white/20 transition-all"
+              >
+                На весь экран
+              </button>
             </div>
 
             {onAdminSettings && adminName && (
@@ -593,79 +623,158 @@ export function StartScreen({
   );
 }
 
-/** Lightweight WS watcher for menu room counts + solo fight top */
+/** One persistent menu observer. `lobbySnapshot` always includes all room keys,
+ * so state is updated atomically and no mode can bleed into another card. */
+export function useLobbySnapshot(active: boolean): LobbyStatsByMode {
+  const empty = (): LobbyRoomStats => ({
+    players: null, spectators: null, blue: null, red: null, blueMembers: [], redMembers: [],
+  });
+  const [stats, setStats] = useState<LobbyStatsByMode>({
+    classic: empty(), soloFight: empty(), duoFight: empty(), trioFight: empty(),
+  });
+  useEffect(() => {
+    if (!active) return;
+    let closed = false;
+    let socket: WebSocket | null = null;
+    try {
+      socket = new WebSocket(resolveServerUrl());
+      socket.onopen = () => socket?.send(JSON.stringify({ type: 'lobby', mode: 'classic' }));
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(String(event.data)) as {
+            type?: string;
+            rooms?: Record<PlayRoomMode, { players: number; lobby: number; blue?: number; red?: number; blueMembers?: string[]; redMembers?: string[] }>;
+          };
+          if (closed || message.type !== 'lobbySnapshot' || !message.rooms) return;
+          setStats({
+            classic: toLobbyStats(message.rooms.classic),
+            soloFight: toLobbyStats(message.rooms.soloFight),
+            duoFight: toLobbyStats(message.rooms.duoFight),
+            trioFight: toLobbyStats(message.rooms.trioFight),
+          });
+        } catch { /* malformed network frame */ }
+      };
+    } catch { /* connection errors leave unavailable stats as dashes */ }
+    return () => {
+      closed = true;
+      socket?.close();
+    };
+  }, [active]);
+  return stats;
+}
+
+function toLobbyStats(room: { players: number; lobby: number; blue?: number; red?: number; blueMembers?: string[]; redMembers?: string[] }): LobbyRoomStats {
+  return {
+    players: room.players,
+    spectators: room.lobby,
+    blue: room.blue ?? null,
+    red: room.red ?? null,
+    blueMembers: Array.isArray(room.blueMembers) ? room.blueMembers : [],
+    redMembers: Array.isArray(room.redMembers) ? room.redMembers : [],
+  };
+}
+
+/** Legacy per-room observer kept for compatibility with external consumers. */
 export function useRoomStats(
   active: boolean,
   mode: PlayRoomMode = 'classic'
-): { players: number | null; spectators: number | null; blue: number | null; red: number | null; soloFightTop: SoloFightTopEntry[] } {
-  const [players, setPlayers] = useState<number | null>(null);
-  const [spectators, setSpectators] = useState<number | null>(null);
-  const [blue, setBlue] = useState<number | null>(null);
-  const [red, setRed] = useState<number | null>(null);
-  const [soloFightTop, setSoloFightTop] = useState<SoloFightTopEntry[]>([]);
+): { players: number | null; spectators: number | null; blue: number | null; red: number | null; blueMembers: string[]; redMembers: string[]; soloFightTop: SoloFightTopEntry[] } {
+  type RoomStats = {
+    players: number | null;
+    spectators: number | null;
+    blue: number | null;
+    red: number | null;
+    blueMembers: string[];
+    redMembers: string[];
+    soloFightTop: SoloFightTopEntry[];
+  };
+  const emptyStats = (): RoomStats => ({
+    players: null, spectators: null, blue: null, red: null, blueMembers: [], redMembers: [], soloFightTop: [],
+  });
+  const [statsByMode, setStatsByMode] = useState<Record<PlayRoomMode, RoomStats>>({
+    classic: emptyStats(),
+    soloFight: emptyStats(),
+    duoFight: emptyStats(),
+    trioFight: emptyStats(),
+  });
 
   useEffect(() => {
     if (!active) return;
-    setPlayers(null);
-    setSpectators(null);
-    setBlue(null);
-    setRed(null);
-    setSoloFightTop([]);
-    let ws: WebSocket | null = null;
+    const modes: PlayRoomMode[] = ['classic', 'soloFight', 'duoFight', 'trioFight'];
+    setStatsByMode({
+      classic: emptyStats(),
+      soloFight: emptyStats(),
+      duoFight: emptyStats(),
+      trioFight: emptyStats(),
+    });
     let closed = false;
-    try {
-      ws = new WebSocket(resolveServerUrl());
-    } catch {
-      return;
-    }
-    ws.onopen = () => {
-      if (closed) return;
-      ws?.send(JSON.stringify({ type: 'lobby', mode }));
-    };
-    ws.onmessage = (ev) => {
+    const sockets = modes.flatMap((watchMode) => {
+      let ws: WebSocket;
       try {
-        const msg = JSON.parse(String(ev.data)) as {
-          type: string;
-          players?: number;
-          lobby?: number;
-          spectators?: number;
-          blue?: number;
-          red?: number;
-          mode?: string;
-          entries?: SoloFightTopEntry[];
-        };
-        if (msg.type === 'roomInfo') {
-          if (msg.mode !== mode) return;
-          setPlayers(typeof msg.players === 'number' ? msg.players : 0);
-          const specs =
-            typeof msg.spectators === 'number'
-              ? msg.spectators
-              : typeof msg.lobby === 'number'
-                ? msg.lobby
-                : 0;
-          setSpectators(specs);
-          setBlue(typeof msg.blue === 'number' ? msg.blue : null);
-          setRed(typeof msg.red === 'number' ? msg.red : null);
-        }
-        if (msg.type === 'soloFightTop' && mode === 'soloFight') {
-          setSoloFightTop(Array.isArray(msg.entries) ? msg.entries : []);
-        }
-        if (msg.type === 'teamFightTop' && (mode === 'duoFight' || mode === 'trioFight')) {
-          setSoloFightTop(Array.isArray(msg.entries) ? msg.entries : []);
-        }
+        ws = new WebSocket(resolveServerUrl());
       } catch {
-        /* ignore */
+        return [];
       }
-    };
+      ws.onopen = () => {
+        if (!closed) ws.send(JSON.stringify({ type: 'lobby', mode: watchMode }));
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data)) as {
+            type: string;
+            players?: number;
+            lobby?: number;
+            spectators?: number;
+            blue?: number;
+            red?: number;
+            blueMembers?: string[];
+            redMembers?: string[];
+            mode?: PlayRoomMode;
+            entries?: SoloFightTopEntry[];
+          };
+          if (msg.type === 'roomInfo' && msg.mode === watchMode) {
+            setStatsByMode((previous) => ({
+              ...previous,
+              [watchMode]: {
+                ...previous[watchMode],
+                players: typeof msg.players === 'number' ? msg.players : 0,
+                spectators: typeof msg.spectators === 'number' ? msg.spectators : typeof msg.lobby === 'number' ? msg.lobby : 0,
+                blue: typeof msg.blue === 'number' ? msg.blue : null,
+                red: typeof msg.red === 'number' ? msg.red : null,
+                blueMembers: Array.isArray(msg.blueMembers) ? msg.blueMembers : [],
+                redMembers: Array.isArray(msg.redMembers) ? msg.redMembers : [],
+              },
+            }));
+          }
+          if (msg.type === 'soloFightTop' && watchMode === 'soloFight') {
+            setStatsByMode((previous) => ({
+              ...previous,
+              soloFight: { ...previous.soloFight, soloFightTop: Array.isArray(msg.entries) ? msg.entries : [] },
+            }));
+          }
+          if (msg.type === 'teamFightTop' && (watchMode === 'duoFight' || watchMode === 'trioFight')) {
+            setStatsByMode((previous) => ({
+              ...previous,
+              [watchMode]: { ...previous[watchMode], soloFightTop: Array.isArray(msg.entries) ? msg.entries : [] },
+            }));
+          }
+        } catch {
+          /* ignore */
+        }
+      };
+      return [ws];
+    });
     return () => {
       closed = true;
-      try {
-        ws?.close();
-      } catch {
-        /* ignore */
+      for (const ws of sockets) {
+        try {
+          ws.close();
+        } catch {
+          /* ignore */
+        };
       }
     };
-  }, [active, mode]);
+  }, [active]);
 
-  return { players, spectators, blue, red, soloFightTop };
+  return statsByMode[mode];
 }

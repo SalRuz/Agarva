@@ -4,9 +4,10 @@ interface LeaderboardProps {
   entries: { name: string; score: number; isBot: boolean }[];
   currentPlayerName?: string;
   onClickNick?: (name: string) => void;
+  spectators?: number;
 }
 
-export function Leaderboard({ entries, currentPlayerName, onClickNick }: LeaderboardProps) {
+export function Leaderboard({ entries, currentPlayerName, onClickNick, spectators = 0 }: LeaderboardProps) {
   return (
     <div className="absolute top-4 right-4 z-30">
       <HudPanel
@@ -44,6 +45,7 @@ export function Leaderboard({ entries, currentPlayerName, onClickNick }: Leaderb
             </li>
           ))}
         </ul>
+        <div className="mt-2 text-center text-xs text-sky-300">Спектаторы: {spectators}</div>
       </HudPanel>
     </div>
   );

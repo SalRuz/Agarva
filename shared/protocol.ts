@@ -292,6 +292,10 @@ export interface StateMessage {
   food: NetFood[];
   viruses: NetVirus[];
   ejected: NetEjected[];
+  /** Entity ids that existed in an earlier snapshot but were destroyed server-side. */
+  removedFoodIds?: string[];
+  removedVirusIds?: string[];
+  removedEjectedIds?: string[];
   /** Omitted on some ticks — client should keep last leaderboard */
   leaderboard?: LeaderboardEntry[];
   /** All player ids owned by this session (multibox); active is `you` */
@@ -349,6 +353,16 @@ export interface RoomInfoMessage {
   /** Team lobby occupancy for Duo/Trio Fight. */
   blue?: number;
   red?: number;
+  /** Live team roster for the mode-preview menu. */
+  blueMembers?: string[];
+  redMembers?: string[];
+}
+
+/** Complete lobby state. Sent to the single menu observer once per second and
+ * immediately after every room/team membership change. */
+export interface LobbySnapshotMessage {
+  type: 'lobbySnapshot';
+  rooms: Record<RoomMode, Omit<RoomInfoMessage, 'type' | 'mode'>>;
 }
 
 export interface SoloFightHudMessage {
@@ -443,6 +457,7 @@ export type ServerMessage =
   | SettingsMessage
   | ChatBroadcastMessage
   | RoomInfoMessage
+  | LobbySnapshotMessage
   | SoloFightHudMessage
   | SoloFightTopMessage
   | TeamFightHudMessage

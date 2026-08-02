@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { listSkins, type SkinInfo } from '../skins/loadSkins';
+import { useEffect, useState } from 'react';
+import { listSkins, loadCustomSkins, type SkinInfo } from '../skins/loadSkins';
 
 interface SkinPickerProps {
   open: boolean;
@@ -9,8 +9,10 @@ interface SkinPickerProps {
 }
 
 export function SkinPicker({ open, selectedId, onSelect, onClose }: SkinPickerProps) {
+  const [, setRevision] = useState(0);
   useEffect(() => {
     if (!open) return;
+    void loadCustomSkins().then(() => setRevision((revision) => revision + 1));
     const onKey = (e: KeyboardEvent) => {
       if (e.code !== 'Escape') return;
       e.preventDefault();

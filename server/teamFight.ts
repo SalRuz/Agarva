@@ -76,7 +76,9 @@ export function teamFightSpawnPoint(
   index: number,
   teamSize: number
 ): { x: number; y: number } {
-  const ySpacing = 750;
+  // Each teammate receives a fixed, separate slot. Keep both Duo and Trio at
+  // twice the former 1200-unit spacing so teammates never spawn touching.
+  const ySpacing = 2400;
   return {
     x: worldW / 2 + (team === 'blue' ? -2000 : 2000),
     y: worldH / 2 + (index - (teamSize - 1) / 2) * ySpacing,

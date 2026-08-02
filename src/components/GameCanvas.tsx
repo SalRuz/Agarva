@@ -23,6 +23,14 @@ import { resolveSkinUrl } from '../skins/loadSkins';
 
 export type SessionKind = 'solo' | 'multiplayer';
 
+function matchesBind(code: string, primary: string, secondary: string): boolean {
+  return code === primary || (!!secondary && code === secondary);
+}
+
+function matchesKeyboardBind(code: string, primary: string, secondary: string): boolean {
+  return matchesBind(code, primary, secondary) && !isMouseBind(code);
+}
+
 interface GameCanvasProps {
   engineRef: MutableRefObject<GameEngine | null>;
   gameStateRef: MutableRefObject<GameState | null>;
@@ -63,6 +71,8 @@ interface GameCanvasProps {
   ownedIdsRef?: MutableRefObject<string[]>;
   onMultibox?: () => void;
   onSendCoords?: () => void;
+  /** Clicking the world dismisses chat compose mode. */
+  onWorldPointerDown?: () => void;
 }
 
 export function GameCanvas({
@@ -98,6 +108,7 @@ export function GameCanvas({
   ownedIdsRef,
   onMultibox,
   onSendCoords,
+  onWorldPointerDown,
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef({
@@ -139,6 +150,7 @@ export function GameCanvas({
   const skinCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const onMultiboxRef = useRef(onMultibox);
   const onSendCoordsRef = useRef(onSendCoords);
+  const onEjectRef = useRef(onEject);
   const lastSpectateDragRef = useRef<{ x: number; y: number } | null>(null);
   const cellVisualsRef = useRef(
     new Map<
@@ -148,9 +160,16 @@ export function GameCanvas({
   );
   // Stable id->hash for deterministic z-order tie-breaking (prevents virus "flicker" when radii match)
   const idHashRef = useRef<Map<string, number>>(new Map());
-  const ejectKeyDownRef = useRef(false);
+  const ejectHeldKeysRef = useRef<Set<string>>(new Set());
+  const lastEjectAtRef = useRef(0);
   /** Held mouse button for eject bind (null = none); LMB default uses lmbDownRef */
   const ejectMouseBtnRef = useRef<number | null>(null);
+  const lmbDownRef = useRef(false);
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const pinchDistanceRef = useRef<number | null>(null);
+  const [touchControls] = useState(
+    () => typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)
+  );
 
   useEffect(() => {
     onMouseMoveRef.current = onMouseMove;
@@ -224,6 +243,10 @@ export function GameCanvas({
     onMultiboxRef.current = onMultibox;
     onSendCoordsRef.current = onSendCoords;
   }, [onMultibox, onSendCoords]);
+
+  useEffect(() => {
+    onEjectRef.current = onEject;
+  }, [onEject]);
 
   // Leaving spectate: reset wheel zoom so gameplay isn't stuck at ultra-zoom
   useEffect(() => {
@@ -465,7 +488,8 @@ export function GameCanvas({
         isEntityNearView(x, y, r, viewerCenter.x, viewerCenter.y, viewR);
 
       const pad = 50;
-      // Food: fill only, no stroke — cheap path
+      // Use the entities' normal world radii instead of cosmetic screen-space
+      // dots, so food density and scale match the classic renderer.
       for (const food of gameState.food) {
         if (!inView(food.x, food.y)) continue;
         if (
@@ -482,6 +506,8 @@ export function GameCanvas({
         ctx.fill();
       }
 
+      // W uses its normal game radius too; snapshot selection already limits
+      // this to real nearby ejects rather than cosmetic filler.
       for (const mass of gameState.ejectedMass) {
         if (!inView(mass.x, mass.y)) continue;
         if (
@@ -797,6 +823,24 @@ export function GameCanvas({
         onSpectateMoveRef.current?.(st.x, st.y);
       }
 
+      // Poll held binds in the render loop instead of relying on OS key-repeat.
+      // This gives keyboard eject the same immediate, steady cadence as held LMB.
+      const ejectHeld =
+        ejectHeldKeysRef.current.size > 0 ||
+        lmbDownRef.current ||
+        ejectMouseBtnRef.current !== null;
+      if (
+        ejectHeld &&
+        gameplayKeysEnabledRef.current &&
+        !isSpectatingRef.current &&
+        !isPausedRef.current &&
+        !inputBlockedRef.current &&
+        nowPerf - lastEjectAtRef.current >= 100
+      ) {
+        lastEjectAtRef.current = nowPerf;
+        onEjectRef.current();
+      }
+
       // Solo: GameCanvas owns update + draw (no React setState per frame)
       if (
         sessionKindRef.current === 'solo' &&
@@ -887,6 +931,46 @@ export function GameCanvas({
     cameraRef.current.userZoom = Math.max(minZoom, Math.min(maxZoom, cameraRef.current.userZoom * factor));
   }, []);
 
+  const handleTouchStart = useCallback((event: React.TouchEvent<HTMLCanvasElement>) => {
+    if (inputBlockedRef.current || isSpectatingRef.current) return;
+    if (event.touches.length === 1) {
+      const touch = event.touches[0];
+      touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+      pinchDistanceRef.current = null;
+    } else if (event.touches.length === 2) {
+      const [a, b] = [event.touches[0], event.touches[1]];
+      pinchDistanceRef.current = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      touchStartRef.current = null;
+    }
+  }, []);
+
+  const handleTouchMove = useCallback((event: React.TouchEvent<HTMLCanvasElement>) => {
+    if (inputBlockedRef.current || isSpectatingRef.current) return;
+    event.preventDefault();
+    if (event.touches.length === 2) {
+      const [a, b] = [event.touches[0], event.touches[1]];
+      const distance = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      const previous = pinchDistanceRef.current;
+      if (previous && previous > 0) {
+        const factor = Math.max(0.85, Math.min(1.15, distance / previous));
+        cameraRef.current.userZoom = Math.max(0.4, Math.min(2.2, cameraRef.current.userZoom * factor));
+      }
+      pinchDistanceRef.current = distance;
+      return;
+    }
+    const start = touchStartRef.current;
+    const touch = event.touches[0];
+    const player = currentPlayerRef.current;
+    if (!start || !touch || !player?.cells.length) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 8) return;
+    const center = getPlayerCenter(player);
+    const reach = 3500;
+    onMouseMoveRef.current(center.x + (dx / length) * reach, center.y + (dy / length) * reach);
+  }, [currentPlayerRef]);
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (inputBlockedRef.current) return;
@@ -898,8 +982,7 @@ export function GameCanvas({
       const p = prefsRef.current;
       if (
         gameplayKeysEnabledRef.current &&
-        !isMouseBind(p.keySplit) &&
-        e.code === p.keySplit
+        matchesKeyboardBind(e.code, p.keySplit, p.keySplitSecondary)
       ) {
         e.preventDefault();
         onSplit();
@@ -908,20 +991,21 @@ export function GameCanvas({
 
       if (
         gameplayKeysEnabledRef.current &&
-        p.keyEject &&
-        !isMouseBind(p.keyEject) &&
-        e.code === p.keyEject
+        matchesKeyboardBind(e.code, p.keyEject, p.keyEjectSecondary)
       ) {
         e.preventDefault();
-        ejectKeyDownRef.current = true;
-        onEject();
+        const wasHeld = ejectHeldKeysRef.current.has(e.code);
+        ejectHeldKeysRef.current.add(e.code);
+        if (!wasHeld) {
+          lastEjectAtRef.current = performance.now();
+          onEject();
+        }
         return;
       }
 
       if (
         gameplayKeysEnabledRef.current &&
-        !isMouseBind(p.keyFreeze) &&
-        e.code === p.keyFreeze
+        matchesKeyboardBind(e.code, p.keyFreeze, p.keyFreezeSecondary)
       ) {
         e.preventDefault();
         onFreezeRef.current?.();
@@ -930,8 +1014,7 @@ export function GameCanvas({
 
       if (
         gameplayKeysEnabledRef.current &&
-        !isMouseBind(p.keyMultibox) &&
-        e.code === p.keyMultibox
+        matchesKeyboardBind(e.code, p.keyMultibox, p.keyMultiboxSecondary)
       ) {
         e.preventDefault();
         onMultiboxRef.current?.();
@@ -940,8 +1023,7 @@ export function GameCanvas({
 
       if (
         gameplayKeysEnabledRef.current &&
-        !isMouseBind(p.keyCoords) &&
-        e.code === p.keyCoords
+        matchesKeyboardBind(e.code, p.keyCoords, p.keyCoordsSecondary)
       ) {
         e.preventDefault();
         onSendCoordsRef.current?.();
@@ -980,36 +1062,34 @@ export function GameCanvas({
   );
 
   const handleKeyUp = useCallback((e: KeyboardEvent) => {
-    const p = prefsRef.current;
-    if (p.keyEject && !isMouseBind(p.keyEject) && e.code === p.keyEject) {
-      ejectKeyDownRef.current = false;
-    }
+    ejectHeldKeysRef.current.delete(e.code);
   }, []);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
     window.addEventListener('wheel', handleWheel, { passive: false });
+    const releaseHeldInputs = () => {
+      ejectHeldKeysRef.current.clear();
+      ejectMouseBtnRef.current = null;
+      lmbDownRef.current = false;
+    };
+    window.addEventListener('blur', releaseHeldInputs);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('blur', releaseHeldInputs);
     };
   }, [handleKeyDown, handleKeyUp, handleWheel]);
-
-  const [lmbDown, setLmbDown] = useState(false);
-  const lmbDownRef = useRef(false);
-  const [mouseEjectHeld, setMouseEjectHeld] = useState(false);
 
   useEffect(() => {
     const up = (e: MouseEvent) => {
       if (e.button === 0) {
         lmbDownRef.current = false;
-        setLmbDown(false);
       }
       if (ejectMouseBtnRef.current !== null && e.button === ejectMouseBtnRef.current) {
         ejectMouseBtnRef.current = null;
-        setMouseEjectHeld(false);
       }
     };
     window.addEventListener('mouseup', up);
@@ -1024,9 +1104,8 @@ export function GameCanvas({
       }
       const p = prefsRef.current;
       const usesRmb =
-        parseMouseButton(p.keySplit) === 2 ||
-        parseMouseButton(p.keyEject || '') === 2 ||
-        parseMouseButton(p.keyFreeze) === 2;
+        [p.keySplit, p.keySplitSecondary, p.keyEject, p.keyEjectSecondary, p.keyFreeze, p.keyFreezeSecondary]
+          .some((bind) => parseMouseButton(bind) === 2);
       if (usesRmb) {
         e.preventDefault();
       }
@@ -1035,27 +1114,13 @@ export function GameCanvas({
     return () => window.removeEventListener('contextmenu', onCtx);
   }, []);
 
-  useEffect(() => {
-    if (isSpectating || inputBlocked) return;
-    if (!ejectKeyDownRef.current && !lmbDown && !mouseEjectHeld) return;
-
-    onEject();
-
-    const interval = setInterval(() => {
-      if (ejectKeyDownRef.current || lmbDownRef.current || ejectMouseBtnRef.current !== null) {
-        onEject();
-      }
-    }, 100);
-
-    return () => clearInterval(interval);
-  }, [lmbDown, mouseEjectHeld, onEject, isSpectating, inputBlocked]);
-
   return (
     <>
       <canvas
         ref={canvasRef}
         onMouseMove={handleMouseMove}
         onMouseDown={(e) => {
+          onWorldPointerDown?.();
           if (isSpectatingRef.current) {
             if (e.button !== 0) return;
             const canvas = canvasRef.current;
@@ -1076,26 +1141,25 @@ export function GameCanvas({
           const p = prefsRef.current;
           const code = mouseButtonCode(e.button);
 
-          if (code === p.keySplit) {
+          if (matchesBind(code, p.keySplit, p.keySplitSecondary)) {
             e.preventDefault();
             onSplit();
             return;
           }
-          if (code === p.keyFreeze) {
+          if (matchesBind(code, p.keyFreeze, p.keyFreezeSecondary)) {
             e.preventDefault();
             onFreezeRef.current?.();
             return;
           }
 
           // Explicit mouse eject bind (including Mouse0)
-          if (p.keyEject && code === p.keyEject) {
+          if (matchesBind(code, p.keyEject, p.keyEjectSecondary)) {
             e.preventDefault();
             ejectMouseBtnRef.current = e.button;
-            setMouseEjectHeld(true);
             if (e.button === 0) {
               lmbDownRef.current = true;
-              setLmbDown(true);
             }
+            lastEjectAtRef.current = performance.now();
             onEject();
             return;
           }
@@ -1103,7 +1167,7 @@ export function GameCanvas({
           // Default LMB eject (always available unless LMB is bound to split/freeze)
           if (e.button === 0) {
             lmbDownRef.current = true;
-            setLmbDown(true);
+            lastEjectAtRef.current = performance.now();
             onEject();
           }
         }}
@@ -1112,13 +1176,27 @@ export function GameCanvas({
         }}
         onMouseLeave={() => {
           lmbDownRef.current = false;
-          setLmbDown(false);
           ejectMouseBtnRef.current = null;
-          setMouseEjectHeld(false);
           lastSpectateDragRef.current = null;
         }}
-        className="block cursor-crosshair"
+        onContextMenu={(e) => e.preventDefault()}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={() => {
+          touchStartRef.current = null;
+          pinchDistanceRef.current = null;
+        }}
+        className="block cursor-crosshair touch-none"
       />
+      {touchControls && gameplayKeysEnabled && !isSpectating && !inputBlocked && (
+        <div className="absolute inset-x-0 bottom-5 z-30 flex items-end justify-between px-5 pointer-events-none">
+          <div className="h-24 w-24 rounded-full border-2 border-white/30 bg-black/25" aria-label="Сенсорный джойстик" />
+          <div className="flex gap-3 pointer-events-auto">
+            <button type="button" onTouchStart={(e) => { e.preventDefault(); onSplit(); }} className="h-16 w-16 rounded-full border border-white/35 bg-blue-600/80 text-xs font-bold text-white active:bg-blue-500">ДЕЛ</button>
+            <button type="button" onTouchStart={(e) => { e.preventDefault(); onEject(); }} className="h-16 w-16 rounded-full border border-white/35 bg-emerald-600/80 text-xs font-bold text-white active:bg-emerald-500">W</button>
+          </div>
+        </div>
+      )}
       {frozen && !isSpectating && (
         <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-20">
           <div className="text-white text-4xl font-bold tracking-wide drop-shadow-lg select-none">

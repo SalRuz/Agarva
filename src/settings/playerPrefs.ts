@@ -8,14 +8,24 @@ export interface PlayerPrefs {
   disableSkins: boolean;
   /** KeyboardEvent.code for split (default Space) */
   keySplit: string;
+  /** Optional second binding for split */
+  keySplitSecondary: string;
   /** KeyboardEvent.code for eject; empty = LMB only */
   keyEject: string;
+  /** Optional second binding for eject */
+  keyEjectSecondary: string;
   /** KeyboardEvent.code for freeze (default KeyF) */
   keyFreeze: string;
+  /** Optional second binding for freeze */
+  keyFreezeSecondary: string;
   /** KeyboardEvent.code for multibox spawn/switch (default Tab) */
   keyMultibox: string;
+  /** Optional second binding for multibox */
+  keyMultiboxSecondary: string;
   /** KeyboardEvent.code for posting map sector to chat (default KeyC) */
   keyCoords: string;
+  /** Optional second binding for posting map sector */
+  keyCoordsSecondary: string;
 }
 
 export const DEFAULT_PLAYER_PREFS: PlayerPrefs = {
@@ -23,10 +33,15 @@ export const DEFAULT_PLAYER_PREFS: PlayerPrefs = {
   hudSize: 'standard',
   disableSkins: false,
   keySplit: 'Space',
+  keySplitSecondary: '',
   keyEject: '',
+  keyEjectSecondary: '',
   keyFreeze: 'KeyF',
+  keyFreezeSecondary: '',
   keyMultibox: 'Tab',
+  keyMultiboxSecondary: '',
   keyCoords: 'KeyC',
+  keyCoordsSecondary: '',
 };
 
 const STORAGE_KEY = 'agarPlayerPrefs';
@@ -82,11 +97,18 @@ export function sanitizePlayerPrefs(input: Partial<PlayerPrefs> | null | undefin
     hudSize,
     disableSkins,
     keySplit: typeof base.keySplit === 'string' && base.keySplit ? base.keySplit : 'Space',
+    keySplitSecondary: typeof base.keySplitSecondary === 'string' ? base.keySplitSecondary : '',
     keyEject: typeof base.keyEject === 'string' ? base.keyEject : '',
+    keyEjectSecondary: typeof base.keyEjectSecondary === 'string' ? base.keyEjectSecondary : '',
     keyFreeze: typeof base.keyFreeze === 'string' && base.keyFreeze ? base.keyFreeze : 'KeyF',
+    keyFreezeSecondary: typeof base.keyFreezeSecondary === 'string' ? base.keyFreezeSecondary : '',
     keyMultibox:
       typeof base.keyMultibox === 'string' && base.keyMultibox ? base.keyMultibox : 'Tab',
+    keyMultiboxSecondary:
+      typeof base.keyMultiboxSecondary === 'string' ? base.keyMultiboxSecondary : '',
     keyCoords: typeof base.keyCoords === 'string' && base.keyCoords ? base.keyCoords : 'KeyC',
+    keyCoordsSecondary:
+      typeof base.keyCoordsSecondary === 'string' ? base.keyCoordsSecondary : '',
   };
 }
 

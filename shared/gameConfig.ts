@@ -66,6 +66,8 @@ export interface GameplayConfig {
   virusMaxCharge: number;
   virusCount: number;
   virusPopSpeed: number;
+  /** 1 = preserve cell momentum through a virus pop; 0 = classic stop. */
+  virusPopKeepInertia: number;
   /** Extra launch sharpness for smaller virus-pop fragments (multiplies virusPopSpeed) */
   virusPopSharpnessSmall: number;
   /** Extra launch sharpness for larger virus-pop fragments */
@@ -81,6 +83,8 @@ export interface GameplayConfig {
   virusAbsorbCoverage: number;
   /** 1 = flying virus bounces off ejected mass (W); 0 = W ignored while flying */
   virusBounceFromEject: number;
+  /** 1 = classic bounce; 2 = only flying W bounces a virus, settled W is absorbed. */
+  virusEjectInteractionMode: number;
   ejectLoss: number;
   ejectGain: number;
   ejectPickupMinMass: number;
@@ -179,8 +183,8 @@ export const defaultGameplayConfig: GameplayConfig = {
   foodViewPerSumRadius: 5.5,
   foodViewPerMaxRadius: 4,
   foodViewMax: 9000,
-  // Capped snapshots: enough density to navigate, without sending hundreds of
-  // repeated JSON food records on every remote state update.
+  // Defaults stay conservative for mobile snapshots; the admin may raise them
+  // when a denser FOV is required.
   foodNetMax: 48,
   virusMass: 130,
   virusBonusMass: 100,
@@ -188,6 +192,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   virusMaxCharge: 7,
   virusCount: 64,
   virusPopSpeed: 15,
+  virusPopKeepInertia: 0,
   virusPopSharpnessSmall: 1,
   virusPopSharpnessLarge: 100,
   virusPopRangeSmall: 1,
@@ -197,6 +202,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   virusEjectCoverage: 0.7,
   virusAbsorbCoverage: 0.6,
   virusBounceFromEject: 1,
+  virusEjectInteractionMode: 1,
   ejectLoss: 16,
   ejectGain: 15,
   ejectPickupMinMass: 1,
@@ -299,6 +305,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.virusMaxCharge = Math.max(1, Math.round(out.virusMaxCharge));
   out.virusCount = Math.max(0, Math.round(out.virusCount));
   out.virusPopSpeed = Math.max(0, out.virusPopSpeed);
+  out.virusPopKeepInertia = out.virusPopKeepInertia >= 0.5 ? 1 : 0;
   out.virusPopSharpnessSmall = Math.max(0, out.virusPopSharpnessSmall);
   out.virusPopSharpnessLarge = Math.max(0, out.virusPopSharpnessLarge);
   out.virusPopRangeSmall = Math.max(0, out.virusPopRangeSmall);
@@ -308,6 +315,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.virusEjectCoverage = clamp01(out.virusEjectCoverage);
   out.virusAbsorbCoverage = clamp01(out.virusAbsorbCoverage);
   out.virusBounceFromEject = out.virusBounceFromEject >= 0.5 ? 1 : 0;
+  out.virusEjectInteractionMode = Math.round(out.virusEjectInteractionMode) === 2 ? 2 : 1;
   out.ejectLoss = Math.max(0.1, out.ejectLoss);
   out.ejectGain = Math.max(0.1, out.ejectGain);
   out.ejectPickupMinMass = Math.max(0, out.ejectPickupMinMass);
@@ -318,7 +326,10 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.ejectGracePeriod = Math.max(0, Math.round(out.ejectGracePeriod));
   out.ejectFriction = clampRange(out.ejectFriction, 0, 0.9999);
   out.ejectMaxCount = Math.max(1, Math.round(out.ejectMaxCount));
-  out.ejectNetMax = clampRange(Math.round(out.ejectNetMax), 1, 200);
+  // These are admin-controlled per-snapshot limits. Keep a practical ceiling
+  // instead of the old 200 cap so dense food/W scenes can be configured.
+  out.foodNetMax = clampRange(Math.round(out.foodNetMax), 1, 1000);
+  out.ejectNetMax = clampRange(Math.round(out.ejectNetMax), 1, 1000);
   out.massDecayPerSec = Math.max(0, out.massDecayPerSec);
   out.massDecayMin = Math.max(0, out.massDecayMin);
   out.botAiIntervalMs = Math.max(10, Math.round(out.botAiIntervalMs));

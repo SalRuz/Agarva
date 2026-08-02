@@ -26,8 +26,16 @@ export interface AccountRecord {
   createdAt: number;
 }
 
+export interface CustomSkinRecord {
+  id: string;
+  name: string;
+  fileName: string;
+  mime: 'image/png' | 'image/jpeg' | 'image/webp';
+  createdAt: number;
+}
+
 export interface PersistedData {
-  version: 3;
+  version: 4;
   fightTops: Record<FightMode, Record<string, number>>;
   adminGameplayConfig?: GameplayConfig;
   players: Record<string, PlayerProfile>;
@@ -36,6 +44,7 @@ export interface PersistedData {
   accounts: Record<string, AccountRecord>;
   /** telegram chatId → login */
   tgAccounts: Record<string, string>;
+  customSkins: Record<string, CustomSkinRecord>;
 }
 
 const storePath = join(process.cwd(), 'data', 'agarva.db.json');
@@ -43,13 +52,33 @@ const HALF_DAY_MS = 12 * 60 * 60 * 1000;
 const SAVE_DEBOUNCE_MS = 750;
 
 const emptyData = (): PersistedData => ({
-  version: 3,
+  version: 4,
   fightTops: { soloFight: {}, duoFight: {}, trioFight: {} },
   players: {},
   fingerprints: {},
   accounts: {},
   tgAccounts: {},
+  customSkins: {},
 });
+
+function mergeTopEntries(entries: Record<string, number> | undefined): Record<string, number> {
+  const merged: Record<string, number> = {};
+  for (const [rawName, rawScore] of Object.entries(entries ?? {})) {
+    const name = rawName.trim().toLocaleLowerCase() || rawName.trim();
+    const score = Number(rawScore);
+    if (!name || !Number.isFinite(score) || score <= 0) continue;
+    merged[name] = (merged[name] ?? 0) + score;
+  }
+  return merged;
+}
+
+function mergedFightTops(tops: Partial<Record<FightMode, Record<string, number>>> | undefined) {
+  return {
+    soloFight: mergeTopEntries(tops?.soloFight),
+    duoFight: mergeTopEntries(tops?.duoFight),
+    trioFight: mergeTopEntries(tops?.trioFight),
+  };
+}
 
 export function hashPassword(password: string): string {
   return createHash('sha256').update(`agarva:${password}`).digest('hex');
@@ -90,17 +119,14 @@ export class PersistentStore {
     try {
       const parsed = JSON.parse(readFileSync(storePath, 'utf8')) as Partial<PersistedData>;
       return {
-        version: 3,
-        fightTops: {
-          soloFight: parsed.fightTops?.soloFight ?? {},
-          duoFight: parsed.fightTops?.duoFight ?? {},
-          trioFight: parsed.fightTops?.trioFight ?? {},
-        },
+        version: 4,
+        fightTops: mergedFightTops(parsed.fightTops),
         adminGameplayConfig: parsed.adminGameplayConfig,
         players: parsed.players ?? {},
         fingerprints: parsed.fingerprints ?? {},
         accounts: parsed.accounts ?? {},
         tgAccounts: parsed.tgAccounts ?? {},
+        customSkins: parsed.customSkins ?? {},
       };
     } catch {
       return emptyData();
@@ -183,17 +209,14 @@ export class PersistentStore {
         return { ok: false, error: 'Некорректный JSON' };
       }
       this.data = {
-        version: 3,
-        fightTops: {
-          soloFight: parsed.fightTops?.soloFight ?? {},
-          duoFight: parsed.fightTops?.duoFight ?? {},
-          trioFight: parsed.fightTops?.trioFight ?? {},
-        },
+        version: 4,
+        fightTops: mergedFightTops(parsed.fightTops),
         adminGameplayConfig: parsed.adminGameplayConfig,
         players: parsed.players ?? {},
         fingerprints: parsed.fingerprints ?? {},
         accounts: parsed.accounts ?? {},
         tgAccounts: parsed.tgAccounts ?? {},
+        customSkins: parsed.customSkins ?? {},
       };
       this.flushNotify();
       return { ok: true };
@@ -221,15 +244,33 @@ export class PersistentStore {
     this.save();
   }
 
+  getCustomSkins(): CustomSkinRecord[] {
+    return Object.values(this.data.customSkins).sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  addCustomSkin(skin: CustomSkinRecord) {
+    this.data.customSkins[skin.id] = skin;
+    this.save();
+  }
+
+  removeCustomSkin(id: string): CustomSkinRecord | undefined {
+    const skin = this.data.customSkins[id];
+    if (!skin) return undefined;
+    delete this.data.customSkins[id];
+    this.save();
+    return skin;
+  }
+
   getScores(mode: FightMode) {
     return new Map(Object.entries(this.data.fightTops[mode]));
   }
 
   recordWin(mode: FightMode, name: string) {
     const scores = this.data.fightTops[mode];
-    scores[name] = (scores[name] ?? 0) + 1;
+    const canonicalName = name.trim().toLocaleLowerCase() || 'player';
+    scores[canonicalName] = (scores[canonicalName] ?? 0) + 1;
     this.save();
-    return scores[name];
+    return scores[canonicalName];
   }
 
   /**

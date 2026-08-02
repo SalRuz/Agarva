@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { GameplayConfig } from '../../shared/gameConfig';
+import type { SkinInfo } from '../skins/loadSkins';
 
 type ConfigKey = keyof GameplayConfig;
 
@@ -28,8 +29,8 @@ const SECTIONS: SectionDef[] = [
         step: 100,
       },
       { key: 'serverTickHz', label: 'Tick rate сервера', help: 'Частота обновления сервера в секунду.', step: 1 },
-      { key: 'foodNetMax', label: 'Лимит еды в снапшоте', help: 'Сколько кусочков еды максимум отправлять клиенту.', step: 1 },
-      { key: 'ejectNetMax', label: 'Макс. W в обзоре', help: 'Сколько W максимум отображать и отправлять клиенту в его обзоре (1–200).', step: 1 },
+      { key: 'foodNetMax', label: 'Лимит еды в снапшоте', help: 'Сколько кусочков еды максимум отправлять клиенту (1–1000).', step: 1 },
+      { key: 'ejectNetMax', label: 'Макс. W в обзоре', help: 'Сколько W максимум отображать и отправлять клиенту в его обзоре (1–1000).', step: 1 },
     ],
   },
   {
@@ -79,9 +80,9 @@ const SECTIONS: SectionDef[] = [
     title: 'Еда',
     fields: [
       { key: 'foodMass', label: 'Масса еды', help: 'Сколько массы даёт одна маленькая частица.', step: 0.1 },
-      { key: 'foodCountMp', label: 'Еда на карте', help: 'Целевое количество еды на сервере.', step: 1 },
+      { key: 'foodCountMp', label: 'Лимит мелкой еды (кап)', help: 'Целевое максимальное количество мелких пеллет на карте.', step: 1 },
       { key: 'foodRespawnThreshold', label: 'Порог респавна еды', help: 'Когда еды меньше этого числа, сервер добавляет новую.', step: 1 },
-      { key: 'foodRespawnBatch', label: 'Пачка респавна еды', help: 'Сколько еды добавляется за один респавн.', step: 1 },
+      { key: 'foodRespawnBatch', label: 'Скорость спавна еды', help: 'Сколько пеллет сервер добавляет за тик, когда еды меньше порога. Больше = быстрее восстановление.', step: 1 },
       { key: 'foodViewRadius', label: 'Базовый FOV еды', help: 'Базовая дальность видимости еды.', step: 10 },
       { key: 'foodViewPerSumRadius', label: 'FOV от суммы радиусов', help: 'Насколько обзор растёт от общей суммы клеток.', step: 0.1 },
       { key: 'foodViewPerMaxRadius', label: 'FOV от максимального радиуса', help: 'Насколько обзор растёт от самой большой клетки.', step: 0.1 },
@@ -97,11 +98,13 @@ const SECTIONS: SectionDef[] = [
       { key: 'virusCount', label: 'Количество колючек', help: 'Сколько колючек поддерживать на карте.', step: 1 },
       { key: 'virusMaxCharge', label: 'Заряд колючки', help: 'Сколько W нужно скормить, чтобы колючка выстрелила.', step: 1 },
       { key: 'virusPopSpeed', label: 'Скорость разлёта частей', help: 'Базовая скорость осколков после взрыва об колючку.', step: 0.1 },
+      { key: 'virusPopKeepInertia', label: 'Сохранять инерцию после колючки (0/1)', help: '1 = после взрыва об колючку основная клетка и осколки сохраняют текущий импульс; 0 = останавливаются, как раньше.', step: 1 },
       { key: 'virusSplitSpeed', label: 'Скорость вылета колючки', help: 'Скорость новой летящей колючки после перекорма.', step: 0.1 },
       { key: 'virusFriction', label: 'Трение летящей колючки', help: 'Как быстро затухает скорость летящей колючки.', step: 0.001 },
       { key: 'virusEjectCoverage', label: 'Порог кормления колючки', help: 'Насколько глубоко W должна войти в колючку.', step: 0.01 },
       { key: 'virusAbsorbCoverage', label: 'Порог поглощения колючки', help: 'Какая доля колючки должна войти в клетку, чтобы она поглотилась / взорвала игрока.', step: 0.01 },
       { key: 'virusBounceFromEject', label: 'Отскок колючки от W (0/1)', help: '1 = летящая колючка отскакивает от выброшенной массы (W) в обратную сторону; 0 = выключено.', step: 1 },
+      { key: 'virusEjectInteractionMode', label: 'Режим W/колючек: 1/2', help: '1 = старый отскок. 2 = отскок только при встрече летящей колючки и летящей W; неподвижная колючка всегда поглощает W и стреляет после заполнения.', step: 1 },
       { key: 'virusPopSharpnessSmall', label: 'Резкость мелких осколков (вирус)', help: 'Множитель скорости вылета мелких частей при взрыве об колючку.', step: 0.05 },
       { key: 'virusPopSharpnessLarge', label: 'Резкость крупных осколков (вирус)', help: 'Множитель скорости вылета крупных частей при взрыве об колючку.', step: 0.05 },
       { key: 'virusPopRangeSmall', label: 'Дальность мелких осколков (вирус)', help: 'Множитель дистанции разлёта мелких частей при взрыве.', step: 0.05 },
@@ -232,6 +235,9 @@ interface AdminSettingsPanelProps {
   onWipeDatabase?: () => void;
   onGetBotLogs?: () => void;
   botLogs?: string;
+  customSkins?: SkinInfo[];
+  onUploadSkin?: (file: File, name: string) => Promise<void>;
+  onDeleteSkin?: (skin: SkinInfo) => Promise<void>;
 }
 
 export function AdminSettingsPanel({
@@ -251,12 +257,18 @@ export function AdminSettingsPanel({
   onWipeDatabase,
   onGetBotLogs,
   botLogs = '',
+  customSkins = [],
+  onUploadSkin,
+  onDeleteSkin,
 }: AdminSettingsPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dbFileInputRef = useRef<HTMLInputElement>(null);
   const [wipeConfirmation, setWipeConfirmation] = useState('');
   const [wipeOpen, setWipeOpen] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
+  const skinFileInputRef = useRef<HTMLInputElement>(null);
+  const [skinName, setSkinName] = useState('');
+  const [skinBusy, setSkinBusy] = useState(false);
   const totalFields = useMemo(() => SECTIONS.reduce((sum, section) => sum + section.fields.length, 0), []);
 
   if (!open) return null;
@@ -355,6 +367,79 @@ export function AdminSettingsPanel({
                 Логи Telegram-бота
               </button>
             </div>
+          </section>
+
+          <section className="rounded-2xl border border-fuchsia-400/25 bg-fuchsia-500/5 p-4">
+            <h3 className="text-xl font-semibold text-white mb-2">Пользовательские скины</h3>
+            <p className="text-xs text-slate-400 mb-3">
+              PNG, JPG или WEBP до 10 МБ. После загрузки скин сразу появится у всех игроков в выборе скинов.
+            </p>
+            <div className="flex flex-wrap gap-3 items-end">
+              <label className="block">
+                <span className="mb-1 block text-xs text-slate-300">Название</span>
+                <input
+                  value={skinName}
+                  onChange={(event) => setSkinName(event.target.value)}
+                  maxLength={40}
+                  className="rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white"
+                  placeholder="Например, мой скин"
+                />
+              </label>
+              <button
+                type="button"
+                disabled={skinBusy}
+                onClick={() => skinFileInputRef.current?.click()}
+                className="rounded-xl bg-fuchsia-700 px-4 py-2 text-white disabled:opacity-50"
+              >
+                {skinBusy ? 'Загрузка…' : 'Добавить фото'}
+              </button>
+              <input
+                ref={skinFileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="hidden"
+                onChange={async (event) => {
+                  const file = event.target.files?.[0];
+                  event.currentTarget.value = '';
+                  if (!file || !onUploadSkin) return;
+                  setSkinBusy(true);
+                  try {
+                    await onUploadSkin(file, skinName);
+                    setSkinName('');
+                  } finally {
+                    setSkinBusy(false);
+                  }
+                }}
+              />
+            </div>
+            {customSkins.length > 0 ? (
+              <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+                {customSkins.map((skin) => (
+                  <div key={skin.id} className="rounded-xl border border-white/10 bg-black/20 p-2">
+                    <img src={skin.url} alt={skin.name} className="aspect-square w-full rounded-lg object-cover" />
+                    <div className="mt-2 truncate text-sm text-white" title={skin.name}>{skin.name}</div>
+                    <button
+                      type="button"
+                      disabled={skinBusy}
+                      onClick={async () => {
+                        if (!onDeleteSkin || !window.confirm(`Удалить скин «${skin.name}»?`)) return;
+                        setSkinBusy(true);
+                        try {
+                          await onDeleteSkin(skin);
+                        } finally {
+                          setSkinBusy(false);
+                        }
+                      }}
+                      className="mt-2 w-full rounded-lg bg-red-800 px-2 py-1 text-xs text-white disabled:opacity-50"
+                    >
+                      Удалить
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-4 text-sm text-slate-400">Пока нет загруженных скинов.</p>
+            )}
           </section>
 
           {SECTIONS.map((section) => (

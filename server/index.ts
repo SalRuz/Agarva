@@ -1,7 +1,10 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { execSync } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { randomInt } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import 'dotenv/config';
 import { GameEngine } from '../shared/GameEngine';
 import {
@@ -57,9 +60,15 @@ import { startTelegramBot } from '../bot/index';
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
 /** Physics stays at 30 Hz; mobile snapshots are sent at 10 Hz. */
 const STATE_SEND_MODULO = 3;
-/** Absolute transport ceilings; admin settings cannot exceed these on the wire. */
-const NETWORK_FOOD_MAX = 48;
-const NETWORK_EJECT_MAX = 25;
+/** Safety ceilings for admin-configurable per-snapshot entity limits. */
+const NETWORK_FOOD_MAX = 1000;
+const NETWORK_EJECT_MAX = 1000;
+/** Retain capped entities across snapshot boundaries so they do not pop in/out. */
+const SNAPSHOT_STICKY_MS = 900;
+const SNAPSHOT_STICKY_VIEW_MULT = 1.28;
+const LOCAL_EJECT_PRIORITY_MS = 2_500;
+const CUSTOM_SKIN_MAX_BYTES = 10 * 1024 * 1024;
+const customSkinDir = join(process.cwd(), 'data', 'skins');
 const STATE_BACKPRESSURE_BYTES = 32_000;
 const BOT_CHAT_BUFFER_SIZE = 200;
 const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000;
@@ -81,6 +90,8 @@ interface ClientSession {
   /** Which engine/room this session belongs to */
   room: RoomMode;
   team?: FightTeam;
+  /** Fixed Duo/Trio spawn slot; released immediately on leave. */
+  spawnSlot?: number;
   /** View center for FOV when not controlling a live player */
   viewX: number;
   viewY: number;
@@ -97,6 +108,14 @@ interface ClientSession {
   lastSfHudKey: string;
   /** Last skin per entity sent to this client; removed when it leaves this FOV. */
   sentSkins: Map<string, string>;
+  /** Entity ids recently included in this client's capped snapshots. */
+  sentFoodUntil: Map<string, number>;
+  sentEjectUntil: Map<string, number>;
+  sentVirusUntil: Map<string, number>;
+  /** Every entity id this client can still render until explicitly destroyed. */
+  knownFoodIds: Set<string>;
+  knownEjectIds: Set<string>;
+  knownVirusIds: Set<string>;
 }
 
 interface BotChatLine {
@@ -332,57 +351,81 @@ function startServer(attempt = 0) {
     return net;
   }
 
-  function collectInViewCapped<T extends { x: number; y: number }, U>(
+  /**
+   * Restore the classic view: the nearest real food/W inside the FOV are sent
+   * first. Recently sent entities get a short expanded-FOV grace period only
+   * to avoid boundary flicker between snapshots.
+   */
+  function collectStableInView<T extends { id: string; x: number; y: number }>(
     items: T[],
     cx: number,
     cy: number,
-    viewR2: number,
+    viewR: number,
     max: number,
-    mapFn: (item: T) => U
-  ): U[] {
+    stickyUntil: Map<string, number>,
+    priority?: (item: T) => number
+  ): T[] {
     if (max <= 0 || items.length === 0) return [];
-    // Keep exactly the nearest objects to the camera. The previous rotating
-    // scan changed the capped set every snapshot, which made food and W blink.
-    // A bounded max-heap makes this O(items × log(max)) without sorting all food.
-    const heap: { item: T; d2: number }[] = [];
-    const swap = (a: number, b: number) => ([heap[a], heap[b]] = [heap[b], heap[a]]);
-    const siftUp = (index: number) => {
-      for (let child = index; child > 0;) {
-        const parent = (child - 1) >> 1;
-        if (heap[parent].d2 >= heap[child].d2) break;
-        swap(parent, child);
-        child = parent;
-      }
-    };
-    const siftDown = () => {
-      for (let parent = 0;;) {
-        const left = parent * 2 + 1;
-        const right = left + 1;
-        let largest = parent;
-        if (left < heap.length && heap[left].d2 > heap[largest].d2) largest = left;
-        if (right < heap.length && heap[right].d2 > heap[largest].d2) largest = right;
-        if (largest === parent) return;
-        swap(parent, largest);
-        parent = largest;
-      }
-    };
-    for (const item of items) {
+    const now = Date.now();
+    const viewR2 = viewR * viewR;
+    const expandedR = viewR * SNAPSHOT_STICKY_VIEW_MULT;
+    const expandedR2 = expandedR * expandedR;
+    const byId = new Map(items.map((item) => [item.id, item]));
+    const distanceSq = (item: T) => {
       const dx = item.x - cx;
       const dy = item.y - cy;
-      const d2 = dx * dx + dy * dy;
-      if (d2 > viewR2) continue;
-      if (heap.length < max) {
-        heap.push({ item, d2 });
-        siftUp(heap.length - 1);
-      } else if (d2 < heap[0].d2) {
-        heap[0] = { item, d2 };
-        siftDown();
+      return dx * dx + dy * dy;
+    };
+    const isExpanded = (item: T) => {
+      return distanceSq(item) <= expandedR2;
+    };
+    for (const [id, until] of stickyUntil) {
+      const item = byId.get(id);
+      if (!item || until < now || !isExpanded(item)) stickyUntil.delete(id);
+    }
+
+    const selected: T[] = [];
+    const selectedIds = new Set<string>();
+    const add = (item: T) => {
+      if (selected.length >= max || selectedIds.has(item.id) || !isExpanded(item)) return;
+      selected.push(item);
+      selectedIds.add(item.id);
+    };
+
+    const compare = (a: T, b: T) =>
+      (priority?.(b) ?? 0) - (priority?.(a) ?? 0) ||
+      distanceSq(a) - distanceSq(b) ||
+      a.id.localeCompare(b.id);
+    for (const item of [...items]
+      .filter((item) => stickyUntil.has(item.id))
+      .sort(compare)) {
+      add(item);
+    }
+    if (selected.length < max) {
+      for (const item of [...items]
+        .filter((item) => !selectedIds.has(item.id) && distanceSq(item) <= viewR2)
+        .sort(compare)) {
+        add(item);
+        if (selected.length === max) break;
       }
     }
-    // Identical ordering on every snapshot avoids unnecessary client churn.
-    return heap
-      .sort((a, b) => a.d2 - b.d2)
-      .map(({ item }) => mapFn(item));
+    for (const item of selected) stickyUntil.set(item.id, now + SNAPSHOT_STICKY_MS);
+    return selected;
+  }
+
+  /**
+   * A cap/FOV omission is not a despawn. Only ids that were previously sent
+   * and no longer exist in the authoritative engine state are tombstoned.
+   */
+  function collectDestroyedIds<T extends { id: string }>(knownIds: Set<string>, live: T[]): string[] {
+    const liveIds = new Set(live.map((entity) => entity.id));
+    const removed: string[] = [];
+    for (const id of knownIds) {
+      if (liveIds.has(id)) continue;
+      knownIds.delete(id);
+      removed.push(id);
+    }
+    return removed;
   }
 
   function buildStateFor(session: ClientSession, includeLeaderboard: boolean): StateMessage {
@@ -405,6 +448,7 @@ function startServer(attempt = 0) {
       }
     }
     const playing = !!(youPlayer && youPlayer.cells.length > 0);
+    const youId = youPlayer?.id;
     const center = playing
       ? getPlayerCenter(youPlayer!)
       : {
@@ -414,17 +458,20 @@ function startServer(attempt = 0) {
 
     const viewMult = playing ? cfg.playViewRadiusMult : cfg.spectateViewRadiusMult;
     const viewR = getEntityViewRadius(ww, wh, viewMult);
-    const viewR2 = viewR * viewR;
     const cellInView = (x: number, y: number, r: number) =>
       isEntityNearView(x, y, r, center.x, center.y, viewR);
+    const removedFoodIds = collectDestroyedIds(session.knownFoodIds, state.food);
+    const removedVirusIds = collectDestroyedIds(session.knownVirusIds, state.viruses);
+    const removedEjectedIds = collectDestroyedIds(session.knownEjectIds, state.ejectedMass);
 
-    const food = collectInViewCapped(
+    const food = collectStableInView(
       state.food,
       center.x,
       center.y,
-      viewR2,
+      viewR,
       Math.min(cfg.foodNetMax, NETWORK_FOOD_MAX),
-      (f) => ({
+      session.sentFoodUntil
+    ).map((f) => ({
         id: f.id,
         x: Math.round(f.x),
         y: Math.round(f.y),
@@ -432,25 +479,38 @@ function startServer(attempt = 0) {
       })
     );
 
-    const viruses: StateMessage['viruses'] = [];
-    for (const v of state.viruses) {
-      if (!cellInView(v.x, v.y, v.radius)) continue;
-      viruses.push({
+    // Viruses are not part of the food cap, but still receive the same
+    // expanded-FOV grace. A moving or boundary-adjacent spike must not vanish
+    // simply because one 10 Hz snapshot lands just outside the circle.
+    const viruses = collectStableInView(
+      state.viruses,
+      center.x,
+      center.y,
+      viewR,
+      Number.MAX_SAFE_INTEGER,
+      session.sentVirusUntil,
+      (virus) => Math.hypot(virus.velocityX, virus.velocityY) > 2 ? 1 : 0
+    ).map((v) => ({
         id: v.id,
         x: Math.round(v.x),
         y: Math.round(v.y),
         r: Math.round(v.radius),
         ch: v.charge,
-      });
-    }
+      }));
 
-    const ejected = collectInViewCapped(
+    const ejected = collectStableInView(
       state.ejectedMass,
       center.x,
       center.y,
-      viewR2,
+      viewR,
       Math.min(cfg.ejectNetMax, NETWORK_EJECT_MAX),
-      (e) => ({
+      session.sentEjectUntil,
+      (eject) => {
+        const isLocalRecent = eject.ownerId === youId && Date.now() - eject.createdAt <= LOCAL_EJECT_PRIORITY_MS;
+        const isFlying = Math.hypot(eject.velocityX, eject.velocityY) > 2;
+        return (isLocalRecent ? 4 : 0) + (isFlying ? 2 : 0);
+      }
+    ).map((e) => ({
         id: e.id,
         x: Math.round(e.x),
         y: Math.round(e.y),
@@ -458,6 +518,9 @@ function startServer(attempt = 0) {
         c: e.color,
       })
     );
+    for (const entity of food) session.knownFoodIds.add(entity.id);
+    for (const entity of viruses) session.knownVirusIds.add(entity.id);
+    for (const entity of ejected) session.knownEjectIds.add(entity.id);
 
     const visibleIds = new Set<string>();
     const includeSkin = (p: Player) => {
@@ -467,7 +530,6 @@ function startServer(attempt = 0) {
       if (shouldSend) session.sentSkins.set(p.id, skin);
       return shouldSend;
     };
-    const youId = youPlayer?.id;
     const players = state.players
       .filter((p) => p.cells.length > 0 && p.id !== youId)
       .map((p) => {
@@ -489,6 +551,9 @@ function startServer(attempt = 0) {
       food,
       viruses,
       ejected,
+      removedFoodIds: removedFoodIds.length > 0 ? removedFoodIds : undefined,
+      removedVirusIds: removedVirusIds.length > 0 ? removedVirusIds : undefined,
+      removedEjectedIds: removedEjectedIds.length > 0 ? removedEjectedIds : undefined,
       ownedIds: session.playerIds.length > 0 ? [...session.playerIds] : undefined,
     };
     if (includeLeaderboard) {
@@ -503,7 +568,7 @@ function startServer(attempt = 0) {
   }
 
   const httpServer = createServer((req, res) => {
-    void handleBotApi(req, res);
+    void handleHttpApi(req, res);
   });
   const wss = new WebSocketServer({
     noServer: true,
@@ -583,22 +648,44 @@ function startServer(attempt = 0) {
     broadcastRoomInfo();
   }
 
-  function getRoomInfo(mode: RoomMode): { type: 'roomInfo'; players: number; lobby: number; mode: RoomMode; blue?: number; red?: number } {
+  function getRoomInfo(mode: RoomMode): {
+    type: 'roomInfo';
+    players: number;
+    lobby: number;
+    mode: RoomMode;
+    blue?: number;
+    red?: number;
+    blueMembers?: string[];
+    redMembers?: string[];
+  } {
     let players = 0;
     let lobby = 0;
     const engine = engineFor(mode);
     const state = engine.getState();
-    for (const session of clients.values()) {
-      if (session.room !== mode) continue;
+    // A session's room flags are authoritative. `teamFighters` is match-state
+    // bookkeeping and can briefly lag a disconnect or a mode transition.
+    const roomSessions = [...clients.values()].filter(
+      (session) => session.room === mode && session.ws.readyState === WebSocket.OPEN
+    );
+    const activeTeamMembers = isTeamFight(mode)
+      ? roomSessions.filter(
+          (session) =>
+            session.joined &&
+            !session.lobbyOnly &&
+            !session.spectating &&
+            (session.team === 'blue' || session.team === 'red')
+        )
+      : [];
+    for (const session of roomSessions) {
       // Menu watchers are not counted at all
       if (session.lobbyOnly) continue;
       if (mode === 'soloFight') {
-        if (sfDuelists.includes(session) && session.joined) players += 1;
+        if (session.joined && !session.spectating) players += 1;
         else if (session.spectating) lobby += 1;
         continue;
       }
       if (isTeamFight(mode)) {
-        if (teamFighters[mode].includes(session) && session.joined) players += 1;
+        if (activeTeamMembers.includes(session)) players += 1;
         else if (session.spectating) lobby += 1;
         continue;
       }
@@ -615,8 +702,10 @@ function startServer(attempt = 0) {
         players,
         lobby,
         mode,
-        blue: teamFighters[mode].filter((s) => s.team === 'blue').length,
-        red: teamFighters[mode].filter((s) => s.team === 'red').length,
+        blue: activeTeamMembers.filter((s) => s.team === 'blue').length,
+        red: activeTeamMembers.filter((s) => s.team === 'red').length,
+        blueMembers: activeTeamMembers.filter((s) => s.team === 'blue').map((s) => s.lastName),
+        redMembers: activeTeamMembers.filter((s) => s.team === 'red').map((s) => s.lastName),
       };
     }
     return { type: 'roomInfo', players, lobby, mode };
@@ -625,6 +714,189 @@ function startServer(attempt = 0) {
   function writeBotApi(res: ServerResponse, status: number, body: unknown) {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(JSON.stringify(body));
+  }
+
+  function writeSkinApi(res: ServerResponse, status: number, body: unknown) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*',
+    });
+    res.end(JSON.stringify(body));
+  }
+
+  function isSkinAdminAuthorized(name: unknown, password: unknown) {
+    const adminName = String(name ?? '').trim();
+    const adminPassword = String(password ?? '');
+    return isAdminName(adminName) && checkAdminPassword(adminPassword);
+  }
+
+  function sniffImageMime(data: Buffer): 'image/png' | 'image/jpeg' | 'image/webp' | null {
+    if (
+      data.length >= 8 &&
+      data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    ) {
+      return 'image/png';
+    }
+    if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+      return 'image/jpeg';
+    }
+    if (
+      data.length >= 12 &&
+      data.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      data.subarray(8, 12).toString('ascii') === 'WEBP'
+    ) {
+      return 'image/webp';
+    }
+    return null;
+  }
+
+  async function readLimitedBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of req) {
+      const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += part.length;
+      if (bytes > maxBytes) throw new Error('Файл слишком большой (максимум 10 МБ)');
+      chunks.push(part);
+    }
+    return Buffer.concat(chunks);
+  }
+
+  function parseMultipartSkinUpload(data: Buffer, contentType: string) {
+    const boundary = /boundary=([^;]+)/i.exec(contentType)?.[1]?.trim().replace(/^"|"$/g, '');
+    if (!boundary) throw new Error('Некорректная форма загрузки');
+    const fields = new Map<string, string>();
+    let file: Buffer | null = null;
+    const delimiter = `--${boundary}`;
+    for (const part of data.toString('latin1').split(delimiter)) {
+      const bodyStart = part.indexOf('\r\n\r\n');
+      if (bodyStart < 0) continue;
+      const headers = part.slice(0, bodyStart);
+      const disposition = /content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="[^"]*")?/i.exec(headers);
+      if (!disposition) continue;
+      const value = part.slice(bodyStart + 4).replace(/\r\n$/, '');
+      if (/;\s*filename="/i.test(headers)) {
+        file = Buffer.from(value, 'latin1');
+      } else {
+        fields.set(disposition[1], Buffer.from(value, 'latin1').toString('utf8'));
+      }
+    }
+    if (!file) throw new Error('Файл не выбран');
+    return { file, fields };
+  }
+
+  async function handleHttpApi(req: IncomingMessage, res: ServerResponse) {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (!url.pathname.startsWith('/api/skins')) {
+      await handleBotApi(req, res);
+      return;
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
+        'access-control-allow-headers': 'content-type',
+      });
+      res.end();
+      return;
+    }
+
+    const skinPath = url.pathname.match(/^\/api\/skins\/([^/]+)$/)?.[1];
+    if (req.method === 'GET' && url.pathname === '/api/skins') {
+      writeSkinApi(res, 200, {
+        skins: persistentStore.getCustomSkins().map((skin) => ({
+          id: skin.id,
+          name: skin.name,
+          url: `/api/skins/${encodeURIComponent(skin.fileName)}`,
+        })),
+      });
+      return;
+    }
+    if (req.method === 'GET' && skinPath) {
+      const skin = persistentStore.getCustomSkins().find((item) => item.fileName === skinPath);
+      const path = skin ? join(customSkinDir, skin.fileName) : '';
+      if (!skin || !existsSync(path)) {
+        writeSkinApi(res, 404, { error: 'Скин не найден' });
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': skin.mime,
+        'cache-control': 'public, max-age=3600',
+        'x-content-type-options': 'nosniff',
+        'access-control-allow-origin': '*',
+      });
+      res.end(readFileSync(path));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/skins') {
+      try {
+        const multipart = parseMultipartSkinUpload(
+          await readLimitedBody(req, CUSTOM_SKIN_MAX_BYTES + 128 * 1024),
+          String(req.headers['content-type'] ?? '')
+        );
+        if (!isSkinAdminAuthorized(multipart.fields.get('adminNick'), multipart.fields.get('adminPassword'))) {
+          writeSkinApi(res, 401, { error: 'Требуются права администратора' });
+          return;
+        }
+        const data = multipart.file;
+        if (data.length > CUSTOM_SKIN_MAX_BYTES) {
+          writeSkinApi(res, 400, { error: 'Файл слишком большой (максимум 10 МБ)' });
+          return;
+        }
+        const mime = sniffImageMime(data);
+        if (!mime) {
+          writeSkinApi(res, 400, { error: 'Разрешены только PNG, JPG и WEBP' });
+          return;
+        }
+        const ext = mime === 'image/png' ? 'png' : mime === 'image/jpeg' ? 'jpg' : 'webp';
+        const id = `custom-${randomUUID()}`;
+        const fileName = `${id}.${ext}`;
+        const name = String(multipart.fields.get('name') ?? 'Свой скин')
+          .replace(/[\u0000-\u001F<>]/g, '')
+          .trim()
+          .slice(0, 40) || 'Свой скин';
+        await mkdir(customSkinDir, { recursive: true });
+        await writeFile(join(customSkinDir, fileName), data);
+        persistentStore.addCustomSkin({ id, name, fileName, mime, createdAt: Date.now() });
+        writeSkinApi(res, 201, { id, name, url: `/api/skins/${encodeURIComponent(fileName)}` });
+      } catch (error) {
+        writeSkinApi(res, 400, { error: error instanceof Error ? error.message : 'Не удалось загрузить скин' });
+      }
+      return;
+    }
+    if (req.method === 'DELETE' && skinPath) {
+      let credentials: { adminNick?: unknown; adminPassword?: unknown };
+      try {
+        credentials = JSON.parse((await readLimitedBody(req, 64 * 1024)).toString('utf8') || '{}') as {
+          adminNick?: unknown;
+          adminPassword?: unknown;
+        };
+      } catch {
+        writeSkinApi(res, 400, { error: 'Некорректные данные авторизации' });
+        return;
+      }
+      if (!isSkinAdminAuthorized(credentials.adminNick, credentials.adminPassword)) {
+        writeSkinApi(res, 401, { error: 'Требуются права администратора' });
+        return;
+      }
+      const skin = persistentStore.getCustomSkins().find((item) => item.fileName === skinPath || item.id === skinPath);
+      if (!skin) {
+        writeSkinApi(res, 404, { error: 'Скин не найден' });
+        return;
+      }
+      persistentStore.removeCustomSkin(skin.id);
+      try {
+        await unlink(join(customSkinDir, skin.fileName));
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.error('[skins] failed to remove image:', error);
+        }
+      }
+      writeSkinApi(res, 200, { ok: true });
+      return;
+    }
+    writeSkinApi(res, 405, { error: 'Метод не поддерживается' });
   }
 
   function isBotApiAuthorized(req: IncomingMessage) {
@@ -740,11 +1012,19 @@ function startServer(attempt = 0) {
   }
 
   function broadcastRoomInfo() {
+    const rooms = {
+      classic: getRoomInfo('classic'),
+      soloFight: getRoomInfo('soloFight'),
+      duoFight: getRoomInfo('duoFight'),
+      trioFight: getRoomInfo('trioFight'),
+    };
     for (const [ws, session] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
-      // Match clients already receive state/HUD. Room metadata is menu-only.
-      if (!session.lobbyOnly) continue;
-      send(ws, getRoomInfo(session.room));
+      // One snapshot is deliberately complete: one menu socket updates all
+      // cards and cannot overwrite one mode with another observer's data.
+      send(ws, { type: 'lobbySnapshot', rooms });
+      // Retained for the live room HUD / older clients.
+      send(ws, rooms[session.room]);
       if (session.room === 'soloFight') {
         send(ws, makeSoloFightTop(sfState));
       }
@@ -794,7 +1074,7 @@ function startServer(attempt = 0) {
       const won = winnerName !== null && session.lastName === winnerName;
       sfState.streaks.set(session.lastName, won ? (sfState.streaks.get(session.lastName) ?? 0) + 1 : 0);
       if (won) {
-        sfState.scores.set(session.lastName, persistentStore.recordWin('soloFight', session.lastName));
+        sfState.scores.set(normalizeNick(session.lastName), persistentStore.recordWin('soloFight', session.lastName));
       }
     }
 
@@ -970,8 +1250,16 @@ function startServer(attempt = 0) {
 
   function teamMembers(mode: TeamFightMode, team: FightTeam) {
     const engine = engineFor(mode);
-    return teamFighters[mode]
-      .filter((s) => s.team === team)
+    return [...clients.values()]
+      .filter(
+        (s) =>
+          s.room === mode &&
+          s.joined &&
+          !s.lobbyOnly &&
+          !s.spectating &&
+          s.team === team &&
+          s.ws.readyState === WebSocket.OPEN
+      )
       .map((s) => ({
         name: s.lastName,
         alive: s.playerIds.some((id) => {
@@ -1025,7 +1313,7 @@ function startServer(attempt = 0) {
       state.streaks.set(session.lastName, won ? (state.streaks.get(session.lastName) ?? 0) + 1 : 0);
       if (won) {
         state.scores.set(
-          session.lastName,
+          normalizeNick(session.lastName),
           persistentStore.recordWin(mode as FightMode, session.lastName)
         );
       }
@@ -1156,7 +1444,19 @@ function startServer(attempt = 0) {
     session.spectating = false;
     clearSessionPlayers(session, engineFor(mode));
     const st = engineFor(mode).getState();
-    const spawn = teamFightSpawnPoint(st.worldWidth, st.worldHeight, team, onTeam.length, size);
+    // A slot is not a list position: a member leaving the middle must free
+    // that exact position, while surviving teammates keep their fixed spawn.
+    const occupied = new Set(
+      onTeam.map((fighter) => fighter.spawnSlot).filter((slot): slot is number => slot !== undefined)
+    );
+    const slot = Array.from({ length: size }, (_, index) => index).find((index) => !occupied.has(index));
+    if (slot === undefined) {
+      session.spectating = true;
+      send(session.ws, { type: 'error', message: 'Команда заполнена — режим наблюдения' });
+      broadcastRoomInfo();
+      return;
+    }
+    const spawn = teamFightSpawnPoint(st.worldWidth, st.worldHeight, team, slot, size);
     const player = engineFor(mode).addPlayer(name, false, { ...spawn, skin: skin || undefined, mass: TEAM_FIGHT_START_MASS });
     engineFor(mode).setPlayerFrozen(player.id, true);
     session.playerIds = [player.id];
@@ -1165,6 +1465,7 @@ function startServer(attempt = 0) {
     session.lastName = name;
     session.lastColor = player.color;
     session.lastSkin = skin || '';
+    session.spawnSlot = slot;
     fighters.push(session);
     teamFighters[mode] = fighters;
     if (fighters.length === size * 2) {
@@ -1183,12 +1484,18 @@ function startServer(attempt = 0) {
   }
 
   function leaveTeamFight(session: ClientSession, mode: TeamFightMode) {
-    if (!teamFighters[mode].includes(session)) return;
+    const wasMember =
+      teamFighters[mode].includes(session) ||
+      (session.room === mode && session.joined && (session.team === 'blue' || session.team === 'red'));
+    if (!wasMember) return;
     const state = teamStates[mode];
     const wasEnded = state.phase === 'ended' || state.phase === 'resetting';
     teamFighters[mode] = teamFighters[mode].filter((s) => s !== session);
     clearSessionPlayers(session, engineFor(mode));
+    session.joined = false;
+    session.spectating = false;
     session.team = undefined;
+    session.spawnSlot = undefined;
     if (state.phase === 'fighting') {
       checkTeamFightWinner(mode);
     } else if (state.phase === 'countdown') {
@@ -1209,6 +1516,7 @@ function startServer(attempt = 0) {
       return;
     }
     broadcastTeamMeta(mode);
+    broadcastRoomInfo();
   }
 
   function sendWelcome(
@@ -1425,7 +1733,6 @@ function startServer(attempt = 0) {
     let roomInfoAcc = 0;
     tickTimer = setInterval(() => {
       if (!listening) return;
-      const tickStartedAt = performance.now();
       // The two rooms have independent engines. Updating the 20-bot, 5400-food
       // classic world during a Solo Fight wastes a full simulation tick per frame.
       let hasClassicSession = false;
@@ -1531,13 +1838,9 @@ function startServer(attempt = 0) {
       }
 
       roomInfoAcc += getTickMs();
-      if (roomInfoAcc >= 2000) {
+      if (roomInfoAcc >= 1000) {
         roomInfoAcc = 0;
         broadcastRoomInfo();
-      }
-      const tickDuration = performance.now() - tickStartedAt;
-      if (tickDuration > 50) {
-        console.warn(`[agar-server] slow tick ${tickDuration.toFixed(1)}ms; clients=${clients.size}`);
       }
     }, getTickMs());
   }
@@ -1599,6 +1902,12 @@ function startServer(attempt = 0) {
       tickCount: 0,
       lastSfHudKey: '',
       sentSkins: new Map(),
+      sentFoodUntil: new Map(),
+      sentEjectUntil: new Map(),
+      sentVirusUntil: new Map(),
+      knownFoodIds: new Set(),
+      knownEjectIds: new Set(),
+      knownVirusIds: new Set(),
     };
     clients.set(ws, session);
 
@@ -1656,10 +1965,15 @@ function startServer(attempt = 0) {
             send(ws, makeTeamFightTop(mode, teamStates[mode]));
             send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team), getRoomInfo(mode).lobby));
           }
+          broadcastRoomInfo();
           break;
         }
         case 'spectate': {
           const mode = parseMode(msg.mode);
+          // Spectating the room already occupied is a no-op. In particular,
+          // never tear down a live body just because the menu re-sent the
+          // currently active mode.
+          if (mode === session.room) break;
           removePendingFightJoin(session);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
