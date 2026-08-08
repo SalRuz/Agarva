@@ -307,7 +307,18 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
       if (text === 'Загрузить БД') return void bot.sendMessage(chatId, 'Пришлите JSON-файл БД документом.');
       if (text === 'Выйти из чата') { selectedRoom.delete(chatId); return void sendMenu(chatId, 'Вы вышли из игрового чата.'); }
       const room = modes.find((mode) => labels[mode] === text);
-      if (room) { selectedRoom.set(chatId, room); return void bot.sendMessage(chatId, `Подключено к «${labels[room]}».`, { reply_markup: await keyboard(chatId, true) }); }
+      if (room) {
+        // A newly selected room must never replay the full retained buffer.
+        // Fetch just the latest five before subscribing this chat to polling.
+        const history = await api<{ lines: ChatLine[]; lastId: number }>(`/api/bot/chat-out?room=${room}&since=0&limit=5`);
+        chatCursor.set(room, history.lastId);
+        selectedRoom.set(chatId, room);
+        await bot.sendMessage(chatId, `Подключено к «${labels[room]}».`, { reply_markup: await keyboard(chatId, true) });
+        for (const line of history.lines) {
+          await bot.sendMessage(chatId, `🎮 ${line.name}: ${line.text}`);
+        }
+        return;
+      }
       const selected = selectedRoom.get(chatId);
       if (!selected) return void sendMenu(chatId, 'Сначала выберите комнату.');
       const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || msg.from?.username || 'Telegram';

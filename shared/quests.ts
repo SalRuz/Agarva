@@ -62,7 +62,7 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
   survive: {
     id: 'survive',
     title: 'Продержаться в игре',
-    base: 30,
+    base: 20,
     step: 1,
     unit: 'minutes',
     condition: 'Просто продержитесь в игре',
@@ -71,7 +71,7 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
   top: {
     id: 'top',
     title: 'Продержаться на топе',
-    base: 20,
+    base: 15,
     step: 1,
     unit: 'minutes',
     requiresFreshStart: true,

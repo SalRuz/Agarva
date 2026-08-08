@@ -1239,8 +1239,16 @@ function startServer(attempt = 0) {
     if (req.method === 'GET' && url.pathname === '/api/bot/chat-out') {
       const room = parseMode(url.searchParams.get('room') || undefined);
       const since = Math.max(0, Number(url.searchParams.get('since')) || 0);
-      const lines = botChatLines[room].filter((line) => line.id > since);
-      writeBotApi(res, 200, { lines, lastId: lines.at(-1)?.id ?? since });
+      const requestedLimit = Number(url.searchParams.get('limit'));
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(BOT_CHAT_BUFFER_SIZE, Math.floor(requestedLimit)))
+        : null;
+      const available = botChatLines[room].filter((line) => line.id > since);
+      const lines = limit === null ? available : available.slice(-limit);
+      // Advance to the room's newest cursor even when a bounded history was
+      // requested, so the next poll sends only genuinely new chat lines.
+      const lastId = available.at(-1)?.id ?? since;
+      writeBotApi(res, 200, { lines, lastId });
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/bot/outbox') {

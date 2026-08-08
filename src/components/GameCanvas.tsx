@@ -232,6 +232,14 @@ export function GameCanvas({
     gameplayKeysEnabledRef.current = gameplayKeysEnabled;
   }, [gameplayKeysEnabled]);
 
+  // A captured touch may not receive pointerup when the controls disappear
+  // (death, menu, or chat). Never carry its held-eject state into play again.
+  useEffect(() => {
+    if (!gameplayKeysEnabled || inputBlocked || isSpectating) {
+      ejectHeldKeysRef.current.delete('TouchEject');
+    }
+  }, [gameplayKeysEnabled, inputBlocked, isSpectating]);
+
   useEffect(() => {
     onPerfSampleRef.current = onPerfSample;
   }, [onPerfSample]);
@@ -480,18 +488,16 @@ export function GameCanvas({
       const startX = Math.floor(viewLeft / gridSize) * gridSize;
       const startY = Math.floor(viewTop / gridSize) * gridSize;
 
+      ctx.beginPath();
       for (let x = startX; x < viewRight; x += gridSize) {
-        ctx.beginPath();
         ctx.moveTo(x, Math.max(0, startY));
         ctx.lineTo(x, Math.min(gameState.worldHeight, viewBottom));
-        ctx.stroke();
       }
       for (let y = startY; y < viewBottom; y += gridSize) {
-        ctx.beginPath();
         ctx.moveTo(Math.max(0, startX), y);
         ctx.lineTo(Math.min(gameState.worldWidth, viewRight), y);
-        ctx.stroke();
       }
+      ctx.stroke();
 
       ctx.strokeStyle = '#ef4444';
       ctx.lineWidth = 10;
@@ -504,49 +510,58 @@ export function GameCanvas({
         const cx = worldW / 2;
         const cy = worldH / 2;
         const radius = Math.min(worldW, worldH) * 0.055;
-        ctx.save();
-        ctx.globalAlpha = 0.22;
-        ctx.beginPath();
-        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-        ctx.fillStyle = '#facc15';
-        ctx.fill();
-        let leaderSkin: HTMLImageElement | null = null;
-        if (!prefsRef.current.disableSkins && leader.skin) {
-          leaderSkin = skinCacheRef.current.get(leader.skin) ?? null;
-          if (!leaderSkin) {
-            const url = resolveSkinUrl(leader.skin);
-            if (url) {
-              leaderSkin = new Image();
-              leaderSkin.decoding = 'async';
-              leaderSkin.src = url;
-              skinCacheRef.current.set(leader.skin, leaderSkin);
-            }
-          }
-          if (leaderSkin && (!leaderSkin.complete || leaderSkin.naturalWidth <= 0)) leaderSkin = null;
-        }
-        if (leaderSkin) {
+        // The monument is purely decorative. Avoid its image clipping, shadow
+        // and text work when a wide desktop FOV still does not show it.
+        const monumentVisible =
+          cx + radius >= viewLeft &&
+          cx - radius <= viewRight &&
+          cy + radius >= viewTop &&
+          cy - radius <= viewBottom;
+        if (monumentVisible) {
+          ctx.save();
+          ctx.globalAlpha = 0.22;
           ctx.beginPath();
           ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-          ctx.clip();
-          ctx.drawImage(leaderSkin, cx - radius, cy - radius, radius * 2, radius * 2);
+          ctx.fillStyle = '#facc15';
+          ctx.fill();
+          let leaderSkin: HTMLImageElement | null = null;
+          if (!prefsRef.current.disableSkins && leader.skin) {
+            leaderSkin = skinCacheRef.current.get(leader.skin) ?? null;
+            if (!leaderSkin) {
+              const url = resolveSkinUrl(leader.skin);
+              if (url) {
+                leaderSkin = new Image();
+                leaderSkin.decoding = 'async';
+                leaderSkin.src = url;
+                skinCacheRef.current.set(leader.skin, leaderSkin);
+              }
+            }
+            if (leaderSkin && (!leaderSkin.complete || leaderSkin.naturalWidth <= 0)) leaderSkin = null;
+          }
+          if (leaderSkin) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+            ctx.clip();
+            ctx.drawImage(leaderSkin, cx - radius, cy - radius, radius * 2, radius * 2);
+          }
+          ctx.restore();
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(250, 204, 21, 0.95)';
+          ctx.lineWidth = Math.max(4, radius * 0.09);
+          ctx.shadowColor = 'rgba(0,0,0,0.75)';
+          ctx.shadowBlur = 10;
+          ctx.stroke();
+          ctx.restore();
+          ctx.save();
+          ctx.font = `bold ${Math.max(16, radius * 0.28)}px Arial, Helvetica, sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = 'rgba(255,255,255,0.65)';
+          ctx.fillText(`👑 ${leader.name}`, cx, cy + radius + Math.max(24, radius * 0.35));
+          ctx.restore();
         }
-        ctx.restore();
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(250, 204, 21, 0.95)';
-        ctx.lineWidth = Math.max(4, radius * 0.09);
-        ctx.shadowColor = 'rgba(0,0,0,0.75)';
-        ctx.shadowBlur = 10;
-        ctx.stroke();
-        ctx.restore();
-        ctx.save();
-        ctx.font = `bold ${Math.max(16, radius * 0.28)}px Arial, Helvetica, sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = 'rgba(255,255,255,0.65)';
-        ctx.fillText(`👑 ${leader.name}`, cx, cy + radius + Math.max(24, radius * 0.35));
-        ctx.restore();
       }
 
       const viewerCenter =
@@ -561,7 +576,16 @@ export function GameCanvas({
       const pad = 50;
       // Use the entities' normal world radii instead of cosmetic screen-space
       // dots, so food density and scale match the classic renderer.
-      for (const food of gameState.food) {
+      // A desktop player can see substantially more of the world. Drawing
+      // every tiny pellet then dominates the frame even after FOV culling.
+      // Sample only dense lists; physics and the server-provided game state
+      // remain untouched, and ordinary-density views still draw every pellet.
+      const foodDrawStride =
+        !touchControls && gameState.food.length > 1_600
+          ? Math.ceil(gameState.food.length / 1_600)
+          : 1;
+      for (let foodIndex = 0; foodIndex < gameState.food.length; foodIndex += foodDrawStride) {
+        const food = gameState.food[foodIndex];
         if (!entityInView(food.x, food.y, food.radius)) continue;
         if (
           food.x < viewLeft - pad ||
@@ -579,7 +603,12 @@ export function GameCanvas({
 
       // W uses its normal game radius too; snapshot selection already limits
       // this to real nearby ejects rather than cosmetic filler.
-      for (const mass of gameState.ejectedMass) {
+      const ejectDrawStride =
+        !touchControls && gameState.ejectedMass.length > 320
+          ? Math.ceil(gameState.ejectedMass.length / 320)
+          : 1;
+      for (let massIndex = 0; massIndex < gameState.ejectedMass.length; massIndex += ejectDrawStride) {
+        const mass = gameState.ejectedMass[massIndex];
         if (!entityInView(mass.x, mass.y, mass.radius)) continue;
         if (
           mass.x < viewLeft - pad ||
@@ -746,7 +775,9 @@ export function GameCanvas({
         return getHash(idA) - getHash(idB);
       });
 
-      const heavyScene = visibleCellCount > 40;
+      const heavyScene =
+        visibleCellCount > 40 ||
+        (!touchControls && (gameState.food.length > 1_600 || gameState.ejectedMass.length > 320));
       // Skins stay on whenever enabled — never thrash with cell-count thresholds.
       const allowSkins = !prefs.disableSkins;
       const getSkinImage = (skinId: string | undefined, isLocalOwned: boolean): HTMLImageElement | null => {
@@ -814,11 +845,13 @@ export function GameCanvas({
           ctx.restore();
         }
 
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.strokeStyle = isCurrentPlayer ? '#ffffff' : 'rgba(0,0,0,0.3)';
-        ctx.lineWidth = isCurrentPlayer ? 3 : 1.5;
-        ctx.stroke();
+        // A second arc/path per remote cell is expensive during a desktop
+        // crowd. The fill remains sufficient for tiny remote cells.
+        if (!heavyScene || isCurrentPlayer || r >= 18) {
+          ctx.strokeStyle = isCurrentPlayer ? '#ffffff' : 'rgba(0,0,0,0.3)';
+          ctx.lineWidth = isCurrentPlayer ? 3 : 1.5;
+          ctx.stroke();
+        }
 
         // Nickname centered in cell; mass sits under the name (not shared center)
         const textMinR = 8;
@@ -1281,7 +1314,7 @@ export function GameCanvas({
         }}
         className={`block touch-none ${prefs.systemCursor ? 'cursor-default' : 'cursor-crosshair'}`}
       />
-      {touchControls && gameplayKeysEnabled && !inputBlocked && (
+      {touchControls && ((gameplayKeysEnabled && !inputBlocked) || isSpectating) && (
         <div className="absolute inset-0 z-30 pointer-events-none">
           {!isSpectating && <div
             className="absolute rounded-full border-2 border-white/35 bg-black/35 shadow-lg pointer-events-auto touch-none"
@@ -1326,7 +1359,25 @@ export function GameCanvas({
             ['chat', 'ЧАТ', 'bg-slate-700/90', () => onToggleMobileChat?.()],
           ] as const).map(([id, label, color, action]) => {
             const control = prefs.mobileControls[id];
-            return <button key={id} type="button" onPointerDown={(e) => { e.preventDefault(); action(); }} className={`absolute rounded-full border border-white/40 ${color} text-xs font-bold text-white shadow-lg pointer-events-auto touch-none active:scale-95`} style={{ width: control.size, height: control.size, left: `${control.x}%`, top: `${control.y}%`, transform: 'translate(-50%, -50%)' }}>{label}</button>;
+            const stopMobileEject = () => ejectHeldKeysRef.current.delete('TouchEject');
+            return <button
+              key={id}
+              type="button"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                if (id === 'eject') {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  ejectHeldKeysRef.current.add('TouchEject');
+                  lastEjectAtRef.current = performance.now();
+                }
+                action();
+              }}
+              onPointerUp={id === 'eject' ? stopMobileEject : undefined}
+              onPointerCancel={id === 'eject' ? stopMobileEject : undefined}
+              onLostPointerCapture={id === 'eject' ? stopMobileEject : undefined}
+              className={`absolute rounded-full border border-white/40 ${color} text-xs font-bold text-white shadow-lg pointer-events-auto touch-none active:scale-95`}
+              style={{ width: control.size, height: control.size, left: `${control.x}%`, top: `${control.y}%`, transform: 'translate(-50%, -50%)' }}
+            >{label}</button>;
           })}
           <button type="button" onPointerDown={(e) => { e.preventDefault(); onToggleMobileMenu?.(); }} className="absolute right-3 top-3 rounded-full border border-white/40 bg-slate-800/90 px-3 py-2 text-xs font-bold text-white shadow-lg pointer-events-auto touch-none active:scale-95">МЕНЮ</button>
         </div>

@@ -149,16 +149,49 @@ sudo certbot --nginx -d YOUR_DOMAIN
 
 Certbot спросит email и согласие с ToS — это ручной шаг. После успеха откройте сайт по **https://**.
 
-Убедитесь, что в HTTPS-сервере есть блоки `location /ws` и `location /api/`
-(certbot обычно копирует locations; если пропали — скопируйте из `deploy/nginx.conf`).
-`/api/` обязателен для загрузки и удаления скинов: он проксирует `POST`/`DELETE`
-`/api/skins` в Node, а не отдаёт запрос статическому `index.html`. После изменения:
+### Исправление HTTP 405 при загрузке скина
+
+`nginx -t` и reload проверяют только синтаксис. Ошибка 405 обычно означает, что
+активный HTTPS-сайт отдаёт `/api/skins` как статику, а не проксирует запрос в
+Node. Проверьте именно активную конфигурацию:
 
 ```bash
-sudo nginx -t && sudo systemctl reload nginx
-curl -i http://127.0.0.1:3001/api/skins
-curl -i https://YOUR_DOMAIN/api/skins
+ls -la /etc/nginx/sites-enabled/
+sudo nginx -T | less
 ```
+
+Откройте файл, на который указывает нужная ссылка из `sites-enabled` (а также
+его HTTPS-блок `server { listen 443 ssl ... }`). Внутри этого `server` должен
+быть блок ниже. Порт берите из `PORT=` в `/opt/agarwa/.env`; если переменная не
+задана, в проекте `DEFAULT_SERVER_PORT` равен **3001**.
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3001; # замените 3001, только если PORT в .env другой
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 12m;
+    proxy_request_buffering off;
+}
+```
+
+Сохраните конфигурацию, затем проверьте и примените её:
+
+```bash
+cd /opt/agarwa
+grep '^PORT=' .env || echo 'PORT не задан: используется 3001'
+sudo nginx -t && sudo systemctl reload nginx
+curl -i -X POST http://127.0.0.1:3001/api/skins
+curl -i -X POST https://YOUR_DOMAIN/api/skins
+```
+
+Без файла скина Node вернёт **400**, это нормальный признак, что POST дошёл до
+API. **405** на домене после этого означает, что редактируется не тот активный
+`server`-блок или в HTTPS-блоке отсутствует `location /api/`. Там же должен
+оставаться блок `location /ws` из `deploy/nginx.conf`.
 
 ---
 
