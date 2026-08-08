@@ -321,6 +321,7 @@ function startServer(attempt = 0) {
     }
   }
 
+  /** Used by room maintenance, where a reconnect-grace body is still relevant. */
   function isSessionActiveOrRecoverable(session: ClientSession): boolean {
     return (
       session.ws.readyState === WebSocket.OPEN ||
@@ -329,19 +330,31 @@ function startServer(attempt = 0) {
   }
 
   function accountLoginForDevice(deviceId: string): string | null {
-    const login = deviceId ? persistentStore.getPlayer(deviceId)?.accountLogin?.trim().toLowerCase() : '';
+    const profile = deviceId ? persistentStore.getPlayer(deviceId) : undefined;
+    const login =
+      profile?.accountLogin && persistentStore.isAccountBoundToDevice(profile.accountLogin, deviceId)
+        ? profile.accountLogin.trim().toLowerCase()
+        : '';
     return login || null;
   }
 
-  /** A live player body, including one retained during reconnect grace. */
+  /** Only an open socket that currently owns a living body can block a new join. */
   function isPlayingSession(session: ClientSession): boolean {
-    return (
-      isSessionActiveOrRecoverable(session) &&
-      session.joined &&
-      !session.spectating &&
-      !session.lobbyOnly &&
-      session.playerIds.length > 0
-    );
+    if (
+      session.ws.readyState !== WebSocket.OPEN ||
+      session.disconnectAt !== null ||
+      session.reconnectGraceUntil !== null ||
+      !session.joined ||
+      session.spectating ||
+      session.lobbyOnly ||
+      session.playerIds.length === 0
+    ) {
+      return false;
+    }
+    const ownedIds = new Set(session.playerIds);
+    return engineFor(session.room)
+      .getState()
+      .players.some((player) => ownedIds.has(player.id) && player.cells.length > 0);
   }
 
   function isPlayingElsewhere(session: ClientSession, deviceId: string, accountLogin: string | null): boolean {
@@ -2740,6 +2753,12 @@ function startServer(attempt = 0) {
               typeof msg.fingerprint === 'string' ? msg.fingerprint : undefined
             ) || (typeof msg.deviceId === 'string' ? msg.deviceId.trim().slice(0, 80) : '');
           const playDeviceId = resolvedDevice || session.deviceId;
+          // A reconnect-grace body belongs to a closed socket and is never a
+          // competing tab. Transfer it to this socket before checking live tabs.
+          if (playDeviceId) {
+            session.deviceId = playDeviceId;
+            if (reclaimOrphanedSession(session, mode)) break;
+          }
           if (
             playDeviceId &&
             isPlayingElsewhere(session, playDeviceId, accountLoginForDevice(playDeviceId))
@@ -2781,24 +2800,21 @@ function startServer(attempt = 0) {
               skinId: skin || undefined,
               fingerprint: typeof msg.fingerprint === 'string' ? msg.fingerprint : undefined,
             });
+            const accountLogin = accountLoginForDevice(resolvedDevice);
             send(ws, {
               type: 'playerProfile',
               deviceId: resolvedDevice,
               lastNick: profile.lastNick,
               skinId: profile.skinId,
               prefs: profile.prefs,
-              accountLogin: profile.accountLogin,
+              accountLogin,
               quest: toQuestPublicView(sanitizeQuestProgress(profile.quests), {
-                followerOnly: !!profile.accountLogin && !isQuestPrimary(session, profile.accountLogin),
+                followerOnly: !!accountLogin && !isQuestPrimary(session, accountLogin),
                 pendingLevelRewards: profile.pendingLevelRewards,
               }),
             });
             session.questRun = emptyQuestRunStats();
             session.questProgress = sanitizeQuestProgress(profile.quests);
-          }
-
-          if (reclaimOrphanedSession(session, mode)) {
-            break;
           }
 
           if (mode === 'soloFight') {
@@ -3150,17 +3166,16 @@ function startServer(attempt = 0) {
             prefs: msg.prefs,
             fingerprint: msg.fingerprint,
           });
+          const accountLogin = accountLoginForDevice(deviceId);
           send(ws, {
             type: 'playerProfile',
             deviceId,
             lastNick: profile.lastNick,
             skinId: profile.skinId,
             prefs: profile.prefs,
-            accountLogin: persistentStore.isAccountBoundToDevice(profile.accountLogin, deviceId)
-              ? profile.accountLogin
-              : null,
+            accountLogin,
             quest: toQuestPublicView(sanitizeQuestProgress(profile.quests), {
-              followerOnly: !!profile.accountLogin && !isQuestPrimary(session, profile.accountLogin),
+              followerOnly: !!accountLogin && !isQuestPrimary(session, accountLogin),
               pendingLevelRewards: profile.pendingLevelRewards,
             }),
           });

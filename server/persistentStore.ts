@@ -37,6 +37,8 @@ export interface AccountRecord {
   login: string;
   passwordHash: string;
   deviceId: string;
+  /** Profile retaining progression while the account is deliberately unlinked. */
+  progressDeviceId?: string;
   createdAt: number;
 }
 
@@ -737,8 +739,12 @@ export class PersistentStore {
     if (!account) return { ok: false, error: 'Аккаунт не найден' };
     const previousDeviceId = account.deviceId;
     account.deviceId = '';
+    account.progressDeviceId = previousDeviceId || undefined;
     const previous = this.data.players[previousDeviceId];
     if (previous) {
+      // Progress remains on this retained profile so a later login can migrate it
+      // to the newly linked device, but this device must no longer look logged in.
+      delete previous.accountLogin;
       delete previous.fingerprint;
       previous.updatedAt = Date.now();
     }
@@ -763,9 +769,15 @@ export class PersistentStore {
       return { ok: false, error: 'Аккаунт привязан к другому устройству' };
     }
     if (!result.account.deviceId) {
-      const oldProfile = Object.values(this.data.players).find(
-        (profile) => profile.accountLogin?.toLowerCase() === result.account.login.toLowerCase()
-      );
+      const oldProfile =
+        (result.account.progressDeviceId
+          ? this.data.players[result.account.progressDeviceId]
+          : undefined) ??
+        // Backward-compatible migration for accounts unlinked before
+        // `progressDeviceId` was recorded.
+        Object.values(this.data.players).find(
+          (profile) => profile.accountLogin?.toLowerCase() === result.account.login.toLowerCase()
+        );
       const currentProfile = this.data.players[id];
       this.data.players[id] = {
         ...(currentProfile ?? {}),
@@ -774,6 +786,7 @@ export class PersistentStore {
         updatedAt: Date.now(),
       };
       result.account.deviceId = id;
+      delete result.account.progressDeviceId;
     }
     const existing = this.data.players[id];
     if (existing?.accountLogin && existing.accountLogin.toLowerCase() !== result.account.login.toLowerCase()) {

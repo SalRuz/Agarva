@@ -451,36 +451,31 @@ export function StartScreen({
               >
                 Вход
               </button>
-              <button
-                type="button"
-                onClick={() => setShowLevelRewards(true)}
-                className="mt-2 w-full py-1.5 rounded-lg text-[10px] font-semibold border bg-amber-500/15 border-amber-300/30 text-amber-100 hover:bg-amber-500/25"
-              >
-                Просмотр награждений за уровни
-              </button>
             </div>
           )}
-          <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2 text-center">
-            <div className="text-white text-xs font-semibold">Уровень {questLevel}</div>
-            <div className="text-amber-200/90 text-[11px] mt-0.5">Агарвики: {questAgarviki}</div>
-          </div>
           {accountLogin ? (
-            <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2">
-              <div className="text-[10px] text-slate-300 uppercase tracking-wide mb-1">Задание</div>
-              <div className="text-white text-[11px] font-medium leading-snug">{questTitle}</div>
-              <div className="text-sky-200 text-[11px] mt-1 leading-snug">{questProgressText}</div>
-              <button
-                type="button"
-                onClick={() => onToggleShowQuestHud?.(!showQuestHud)}
-                className={`mt-2 w-full py-1.5 rounded-lg text-[10px] font-semibold border transition ${
-                  showQuestHud
-                    ? 'bg-emerald-600/80 border-emerald-300/40 text-white'
-                    : 'bg-white/10 border-white/15 text-slate-200 hover:bg-white/15'
-                }`}
-              >
-                {showQuestHud ? 'Задание в игре: вкл' : 'Отображать задание'}
-              </button>
-            </div>
+            <>
+              <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2 text-center">
+                <div className="text-white text-xs font-semibold">Уровень {questLevel}</div>
+                <div className="text-amber-200/90 text-[11px] mt-0.5">Агарвики: {questAgarviki}</div>
+              </div>
+              <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2">
+                <div className="text-[10px] text-slate-300 uppercase tracking-wide mb-1">Задание</div>
+                <div className="text-white text-[11px] font-medium leading-snug">{questTitle}</div>
+                <div className="text-sky-200 text-[11px] mt-1 leading-snug">{questProgressText}</div>
+                <button
+                  type="button"
+                  onClick={() => onToggleShowQuestHud?.(!showQuestHud)}
+                  className={`mt-2 w-full py-1.5 rounded-lg text-[10px] font-semibold border transition ${
+                    showQuestHud
+                      ? 'bg-emerald-600/80 border-emerald-300/40 text-white'
+                      : 'bg-white/10 border-white/15 text-slate-200 hover:bg-white/15'
+                  }`}
+                >
+                  {showQuestHud ? 'Задание в игре: вкл' : 'Отображать задание'}
+                </button>
+              </div>
+            </>
           ) : (
             <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2 text-[10px] text-slate-400 leading-snug">
               Войдите в аккаунт, чтобы получать задания, опыт и Агарвики.

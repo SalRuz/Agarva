@@ -229,6 +229,19 @@ export function App() {
   /** True while the main menu deliberately keeps a live MP spectator connection. */
   const menuOverLiveRef = useRef(false);
   const soloFightHudKeyRef = useRef('');
+  const clearUnboundAccountState = useCallback(() => {
+    setAccountLogin(null);
+    setQuestView(null);
+    setLevelRewardQueue([]);
+    acknowledgedLevelRewardsRef.current.clear();
+    playStartLevelRef.current = null;
+    setShowSkinPicker(false);
+    try {
+      localStorage.removeItem('agarvaAccountLogin');
+    } catch {
+      /* ignore unavailable storage */
+    }
+  }, []);
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
@@ -347,18 +360,19 @@ export function App() {
           selectedSkinIdRef.current = skinId;
         }
         if ('accountLogin' in msg) {
-          setAccountLogin(msg.accountLogin || null);
-          try {
-            if (msg.accountLogin) localStorage.setItem('agarvaAccountLogin', msg.accountLogin);
-            else localStorage.removeItem('agarvaAccountLogin');
-          } catch {}
+          if (msg.accountLogin) {
+            setAccountLogin(msg.accountLogin);
+            try { localStorage.setItem('agarvaAccountLogin', msg.accountLogin); } catch {}
+          } else {
+            clearUnboundAccountState();
+          }
         }
         if (msg.prefs) {
           const prefs = sanitizePlayerPrefs(msg.prefs);
           setPlayerPrefs(prefs);
           savePlayerPrefs(prefs);
         }
-        if (msg.quest) {
+        if (msg.accountLogin && msg.quest) {
           setQuestView(msg.quest as QuestPublicView);
           setQuestUpdatedAt(Date.now());
           setQuestClock(Date.now());
@@ -370,7 +384,7 @@ export function App() {
       closed = true;
       try { if (ws) ws.close(); } catch {}
     };
-  }, []);
+  }, [clearUnboundAccountState]);
 
   // A game socket stays alive as a spectator below the menu. Request a fresh
   // profile whenever the actual main menu is entered, so rewards earned just
@@ -406,10 +420,18 @@ export function App() {
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(String(ev.data));
-        if (msg.type === 'playerProfile' && msg.quest) {
-          setQuestView(msg.quest as QuestPublicView);
-          setQuestUpdatedAt(Date.now());
-          setQuestClock(Date.now());
+        if (msg.type === 'playerProfile') {
+          if (msg.accountLogin) {
+            setAccountLogin(msg.accountLogin);
+            try { localStorage.setItem('agarvaAccountLogin', msg.accountLogin); } catch {}
+            if (msg.quest) {
+              setQuestView(msg.quest as QuestPublicView);
+              setQuestUpdatedAt(Date.now());
+              setQuestClock(Date.now());
+            }
+          } else {
+            clearUnboundAccountState();
+          }
         }
       } catch {
         /* ignore malformed profile response */
@@ -420,7 +442,7 @@ export function App() {
       closed = true;
       try { ws?.close(); } catch {}
     };
-  }, [mode]);
+  }, [mode, clearUnboundAccountState]);
 
   const startMenuEngine = useCallback(() => {
     const engine = new GameEngine({
@@ -756,15 +778,14 @@ export function App() {
           selectedSkinIdRef.current = skinId;
         }
         if ('accountLogin' in profile) {
-          setAccountLogin(profile.accountLogin || null);
-          try {
-            if (profile.accountLogin) localStorage.setItem('agarvaAccountLogin', profile.accountLogin);
-            else localStorage.removeItem('agarvaAccountLogin');
-          } catch {
-            /* ignore */
+          if (profile.accountLogin) {
+            setAccountLogin(profile.accountLogin);
+            try { localStorage.setItem('agarvaAccountLogin', profile.accountLogin); } catch {}
+          } else {
+            clearUnboundAccountState();
           }
         }
-        if (profile.quest) {
+        if (profile.accountLogin && profile.quest) {
           setQuestView(profile.quest);
           setQuestUpdatedAt(Date.now());
           setQuestClock(Date.now());
@@ -898,7 +919,7 @@ export function App() {
         }
       },
     }),
-    []
+    [clearUnboundAccountState]
   );
 
   const handleStartMultiplayer = useCallback(
@@ -1874,13 +1895,13 @@ export function App() {
           passwordResetNotice={passwordResetNotice}
           passwordResetBusy={passwordResetBusy}
           passwordResetCodeSent={passwordResetCodeSent}
-          questLevel={questView?.level ?? 1}
-          questXpIntoLevel={questView?.xpIntoLevel ?? 0}
-          questXpPerLevel={questView?.xpPerLevel ?? 100}
-          questAgarviki={questView?.agarviki ?? 0}
-          questTitle={questView?.title ?? 'Задание загружается…'}
+          questLevel={accountLogin ? questView?.level ?? 1 : 1}
+          questXpIntoLevel={accountLogin ? questView?.xpIntoLevel ?? 0 : 0}
+          questXpPerLevel={accountLogin ? questView?.xpPerLevel ?? 100 : 100}
+          questAgarviki={accountLogin ? questView?.agarviki ?? 0 : 0}
+          questTitle={accountLogin ? questView?.title ?? 'Задание загружается…' : undefined}
           questProgressText={
-            questProgressText ?? 'Сыграйте, чтобы прогресс пошёл'
+            accountLogin ? questProgressText ?? 'Сыграйте, чтобы прогресс пошёл' : undefined
           }
           showQuestHud={playerPrefs.showQuestHud}
           onToggleShowQuestHud={(next) => {
@@ -1888,7 +1909,7 @@ export function App() {
             setPlayerPrefs(prefs);
             savePlayerPrefs(prefs);
           }}
-          claimedLevelRewards={questView?.claimedLevelRewards ?? []}
+          claimedLevelRewards={accountLogin ? questView?.claimedLevelRewards ?? [] : []}
           levelSkinRewards={levelSkinRewards}
           telegramChannelUrl={telegramChannelUrl}
           onRegisterAccount={(login, password) => {
@@ -2138,14 +2159,14 @@ export function App() {
       <SkinPicker
         open={showSkinPicker}
         selectedId={selectedSkinId}
-        unlockedSkinIds={questView?.unlockedSkinIds ?? []}
-        agarviki={questView?.agarviki ?? 0}
-        onBuy={buyShopSkin}
+        unlockedSkinIds={accountLogin ? questView?.unlockedSkinIds ?? [] : []}
+        agarviki={accountLogin ? questView?.agarviki ?? 0 : 0}
+        onBuy={accountLogin ? buyShopSkin : undefined}
         onSelect={handleSelectSkin}
         onClose={() => setShowSkinPicker(false)}
       />
 
-      {mode === 'menu' && levelRewardQueue.length > 0 && (() => {
+      {mode === 'menu' && accountLogin && levelRewardQueue.length > 0 && (() => {
         const level = levelRewardQueue[0];
         const skins = levelSkinRewards[level] ?? [];
         return (
