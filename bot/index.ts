@@ -3,12 +3,13 @@ import { createHash } from 'node:crypto';
 import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import sharp from 'sharp';
 import type { BotLogBuffer } from '../server/botLogs';
 
 type Mode = 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
 type FightMode = Exclude<Mode, 'classic'>;
 type AuthStep = { step: 'login' } | { step: 'password'; login: string };
-type SkinOrder = { chatId: string; login: string; status: string; dataBase64?: string; mime?: 'image/png' | 'image/jpeg' | 'image/webp'; createdAt: number };
+type SkinOrder = { chatId: string; login: string; status: string; dataBase64?: string; mime?: 'image/png' | 'image/jpeg' | 'image/webp'; paymentMessage?: string; createdAt: number };
 type GameDb = {
   accounts?: Record<string, { login: string; passwordHash: string }>;
   tgAccounts?: Record<string, string>;
@@ -46,6 +47,8 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
   const selectedRoom = new Map<number, Mode>();
   const authFlow = new Map<number, AuthStep>();
   const skinFlow = new Map<number, 'confirm' | 'photo'>();
+  /** Developer enters payment details after approving an individual order. */
+  const paymentMessageFlow = new Map<number, string>();
   const chatCursor = new Map<Mode, number>();
   let dbCache: GameDb | null = null;
   const isDev = (chatId: number) => String(chatId) === process.env.TELEGRAM_DEV_ID?.trim();
@@ -109,6 +112,20 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
       `Устройство: ${device}`,
     ].join('\n');
   };
+  const sendPersonalSkins = async (chatId: number, login: string) => {
+    const db = dbCache ?? await loadDb();
+    const skins = Object.values(db.customSkins ?? {}).filter((skin) => skin.kind === 'personal' && skin.accountLogin.toLowerCase() === login.toLowerCase());
+    if (!skins.length) return bot.sendMessage(chatId, 'Личных кастомных скинов пока нет.');
+    await bot.sendMessage(chatId, 'Ваши личные скины:');
+    for (const skin of skins) {
+      const preview = await sharp(Buffer.from(skin.dataBase64, 'base64'))
+        .resize(512, 512, { fit: 'cover' })
+        .composite([{ input: Buffer.from('<svg width="512" height="512"><circle cx="256" cy="256" r="256" fill="white"/></svg>'), blend: 'dest-in' }])
+        .png()
+        .toBuffer();
+      await bot.sendPhoto(chatId, preview, { caption: `◯ ${skin.name}` });
+    }
+  };
   const sendDbFile = async (chatId: number) => {
     if (!isDev(chatId)) return;
     const { json } = await api<{ json: string }>('/api/bot/db');
@@ -131,18 +148,9 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
   };
   const orderFor = (db: GameDb, chatId: number, status: string) =>
     Object.entries(db.customSkinOrders ?? {}).find(([, order]) => order.chatId === String(chatId) && order.status === status);
-  const finishPersonalSkin = async (db: GameDb, orderId: string, order: SkinOrder) => {
-    if (!order.dataBase64 || !order.mime) throw new Error('Изображение скина не найдено');
-    const ext = order.mime === 'image/png' ? 'png' : order.mime === 'image/jpeg' ? 'jpg' : 'webp';
-    const id = `personal-${orderId}`;
-    db.customSkins ??= {};
-    db.customSkins[id] = { id, name: `Кастомный скин ${order.login}`, fileName: `${id}.${ext}`, mime: order.mime, dataBase64: order.dataBase64, kind: 'personal', accountLogin: order.login, createdAt: Date.now() };
-    const player = Object.values(db.players ?? {}).find((item) => item.accountLogin?.toLowerCase() === order.login.toLowerCase());
-    if (!player) throw new Error('Игровой профиль не найден');
-    player.quests ??= {}; player.quests.unlockedSkinIds ??= [];
-    if (!player.quests.unlockedSkinIds.includes(id)) player.quests.unlockedSkinIds.push(id);
-    order.status = 'completed';
-    await saveDb(db);
+  const finishPersonalSkin = async (_db: GameDb, orderId: string, _order: SkinOrder) => {
+    await api('/api/bot/complete-skin-order', { method: 'POST', body: JSON.stringify({ orderId }) });
+    dbCache = await loadDb();
   };
   const pollGameChat = async () => {
     for (const room of new Set(selectedRoom.values())) {
@@ -184,6 +192,11 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     })().catch((error) => sendError(msg.chat.id, error));
   });
   bot.on('photo', (msg) => {
+    const awaitingProof = dbCache && orderFor(dbCache, msg.chat.id, 'approved');
+    if (awaitingProof) {
+      void bot.sendMessage(msg.chat.id, 'Чек нужно прислать как файл/документ, не как сжатое фото. Нажмите скрепку → «Файл» и отправьте изображение документом.');
+      return;
+    }
     if (skinFlow.get(msg.chat.id) !== 'photo') return;
     void (async () => {
       const login = await loggedInLogin(msg.chat.id);
@@ -193,7 +206,13 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
       const data = Buffer.from(await (await fetch(await bot.getFileLink(photo.file_id))).arrayBuffer());
       const mime = imageMime(data);
       if (!mime) throw new Error('Поддерживаются PNG, JPG и WEBP');
-      const db = await loadDb(), id = `order-${Date.now()}-${msg.chat.id}`;
+      const db = await loadDb();
+      const moderationCount = Object.values(db.customSkinOrders ?? {}).filter((order) => ['moderation', 'pending', 'awaiting_review'].includes(order.status)).length;
+      if (moderationCount >= 10) {
+        skinFlow.delete(msg.chat.id);
+        return void bot.sendMessage(msg.chat.id, 'Очередь модерации переполнена (10 заявок). Попробуйте позже.');
+      }
+      const id = `order-${Date.now()}-${msg.chat.id}`;
       db.customSkinOrders ??= {};
       db.customSkinOrders[id] = { chatId: String(msg.chat.id), login, status: 'moderation', dataBase64: data.toString('base64'), mime, createdAt: Date.now() };
       await saveDb(db); skinFlow.delete(msg.chat.id);
@@ -204,14 +223,24 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     })().catch((error) => sendError(msg.chat.id, error));
   });
   bot.on('callback_query', (query) => {
+    if (query.data === 'profile:skins') {
+      void (async () => {
+        const login = await loggedInLogin(query.message!.chat.id);
+        if (!login) throw new Error('Сначала войдите в аккаунт.');
+        await sendPersonalSkins(query.message!.chat.id, login);
+        await bot.answerCallbackQuery(query.id);
+      })().catch((error) => sendError(query.message?.chat.id ?? 0, error));
+      return;
+    }
     if (!isDev(query.message?.chat.id ?? 0) || !query.data?.startsWith('skin:')) return;
     void (async () => {
       const [, action, orderId] = query.data!.split(':');
       const db = await loadDb(), order = db.customSkinOrders?.[orderId];
       if (!order) throw new Error('Заявка не найдена');
       if (action === 'approve') {
-        order.status = 'approved'; await saveDb(db);
-        await bot.sendMessage(Number(order.chatId), `Скин одобрен. Стоимость — 200 рублей.\nРеквизиты: ${process.env.SKIN_PAYMENT_DETAILS?.trim() || 'укажите SKIN_PAYMENT_DETAILS в настройках сервера'}\nПришлите скриншот или документ с оплатой.`);
+        order.status = 'awaiting_payment_message'; await saveDb(db);
+        paymentMessageFlow.set(query.message!.chat.id, orderId);
+        await bot.sendMessage(query.message!.chat.id, `Скин ${order.login} одобрен. Напишите одним сообщением реквизиты / инструкции для покупателя.`);
       } else if (action === 'paid') {
         await finishPersonalSkin(db, orderId, order);
         await bot.sendMessage(Number(order.chatId), 'Оплата подтверждена. Скин готов и добавлен в личные скины игры.');
@@ -226,6 +255,17 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     if (!msg.text || msg.text.startsWith('/')) return;
     void (async () => {
       const chatId = msg.chat.id, text = msg.text!.trim(), flow = authFlow.get(chatId);
+      const paymentOrderId = paymentMessageFlow.get(chatId);
+      if (paymentOrderId && isDev(chatId)) {
+        const db = await loadDb(), order = db.customSkinOrders?.[paymentOrderId];
+        if (!order || order.status !== 'awaiting_payment_message') throw new Error('Заявка ожидает другой этап или уже закрыта');
+        order.paymentMessage = text.slice(0, 3500);
+        order.status = 'approved';
+        await saveDb(db);
+        paymentMessageFlow.delete(chatId);
+        await bot.sendMessage(Number(order.chatId), `Скин одобрен. Стоимость — 200 рублей.\n\n${order.paymentMessage}\n\nПосле оплаты пришлите чек только как файл/документ (не сжатое фото).`);
+        return void bot.sendMessage(chatId, 'Сообщение с реквизитами отправлено покупателю.');
+      }
       if (skinFlow.get(chatId) === 'confirm') {
         if (/^(да|yes)$/iu.test(text)) { skinFlow.set(chatId, 'photo'); return void bot.sendMessage(chatId, 'Отправьте фото будущего скина (PNG, JPG или WEBP).'); }
         skinFlow.delete(chatId); return void bot.sendMessage(chatId, 'Покупка кастомного скина отменена.');
@@ -245,10 +285,15 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
       if (text === 'Вход в аккаунт') { if (await loggedInLogin(chatId)) return void bot.sendMessage(chatId, 'Вы уже вошли в аккаунт.'); authFlow.set(chatId, { step: 'login' }); return void bot.sendMessage(chatId, 'Введите логин аккаунта:'); }
       if (text === 'Профиль') {
         const login = await loggedInLogin(chatId);
-        return void bot.sendMessage(chatId, login ? await profileText(login) : 'Сначала войдите в аккаунт.');
+        if (!login) return void bot.sendMessage(chatId, 'Сначала войдите в аккаунт.');
+        await bot.sendMessage(chatId, await profileText(login), { reply_markup: { inline_keyboard: [[{ text: 'Мои личные скины', callback_data: 'profile:skins' }]] } });
+        return;
       }
       if (text === 'Купить кастомный скин') {
         if (!await loggedInLogin(chatId)) return void bot.sendMessage(chatId, 'Сначала войдите в аккаунт игры.');
+        const db = await loadDb();
+        const moderationCount = Object.values(db.customSkinOrders ?? {}).filter((order) => ['moderation', 'pending', 'awaiting_review'].includes(order.status)).length;
+        if (moderationCount >= 10) return void bot.sendMessage(chatId, 'Очередь модерации переполнена (10 заявок). Попробуйте позже.');
         skinFlow.set(chatId, 'confirm');
         return void bot.sendMessage(chatId, 'Кастомный скин стоит 200 рублей. Продолжить? Ответьте «да» или «нет».');
       }

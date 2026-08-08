@@ -288,6 +288,8 @@ export class MultiplayerClient {
   private nextPingId = 1;
   /** Render one snapshot behind latest data; leaves enough history for smooth motion. */
   private interpDelayMs = 90;
+  /** Touch networks benefit from a slightly deeper visual interpolation buffer. */
+  private readonly touchDevice = typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0;
   private config: GameplayConfig = defaultGameplayConfig;
   private lastInputSentAt = 0;
   private lastInputMx = Number.NaN;
@@ -727,7 +729,9 @@ export class MultiplayerClient {
         if (this.snapCurr) {
           const gap = performance.now() - this.snapCurr.localT;
           if (gap > 40 && gap < 180) {
-            this.interpDelayMs = Math.min(120, Math.max(75, gap * 0.9));
+            this.interpDelayMs = this.touchDevice
+              ? Math.min(170, Math.max(110, gap * 1.15))
+              : Math.min(120, Math.max(75, gap * 0.9));
           }
         }
         if (msg.leaderboard) this.lastLeaderboard = msg.leaderboard;

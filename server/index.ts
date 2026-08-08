@@ -1272,6 +1272,20 @@ function startServer(attempt = 0) {
         writeBotApi(res, 200, { ok: true });
         return;
       }
+      if (req.method === 'POST' && url.pathname === '/api/bot/complete-skin-order') {
+        const orderId = String((body as { orderId?: unknown }).orderId ?? '').trim();
+        if (!orderId) {
+          writeBotApi(res, 400, { ok: false, error: 'Нет orderId' });
+          return;
+        }
+        const result = persistentStore.completePersonalSkinOrder(orderId);
+        if (!result.ok) {
+          writeBotApi(res, 400, result);
+          return;
+        }
+        writeBotApi(res, 200, result);
+        return;
+      }
       if (req.method === 'POST' && url.pathname === '/api/bot/db/merge') {
         const json = typeof (body as { json?: unknown }).json === 'string' ? (body as { json: string }).json : '';
         const result = persistentStore.mergeBotSnapshot(json);

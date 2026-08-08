@@ -74,6 +74,8 @@ interface GameCanvasProps {
   /** Clicking the world dismisses chat compose mode. */
   onWorldPointerDown?: () => void;
   onToggleMobileChat?: () => void;
+  /** Touch-only equivalent of the Escape key. */
+  onToggleMobileMenu?: () => void;
   centerLeader?: { name: string; skin?: string; score: number } | null;
 }
 
@@ -113,6 +115,7 @@ export function GameCanvas({
   onSendCoords,
   onWorldPointerDown,
   onToggleMobileChat,
+  onToggleMobileMenu,
   centerLeader = null,
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -446,7 +449,7 @@ export function GameCanvas({
       }
 
       // Smooth camera — snappier while spectating so mouse look feels immediate
-      const follow = spectating ? 0.45 : 0.18;
+      const follow = spectating ? 0.45 : touchControls ? 0.08 : 0.18;
       cameraRef.current.x += (targetX - cameraRef.current.x) * follow;
       cameraRef.current.y += (targetY - cameraRef.current.y) * follow;
       cameraRef.current.scale += (cameraRef.current.targetScale - cameraRef.current.scale) * 0.05;
@@ -663,8 +666,8 @@ export function GameCanvas({
             isBot: !!player.isBot,
             lastSeen: nowPerf,
           };
-          const posLerp = sessionKindRef.current === 'multiplayer' ? 0.35 : 0.28;
-          const radiusLerp = sessionKindRef.current === 'multiplayer' ? 0.2 : 0.16;
+          const posLerp = sessionKindRef.current === 'multiplayer' ? (touchControls ? 0.22 : 0.35) : 0.28;
+          const radiusLerp = sessionKindRef.current === 'multiplayer' ? (touchControls ? 0.14 : 0.2) : 0.16;
           visual.x += (cell.x - visual.x) * posLerp;
           visual.y += (cell.y - visual.y) * posLerp;
           visual.r += (targetR - visual.r) * radiusLerp;
@@ -852,15 +855,12 @@ export function GameCanvas({
           }
         }
       }
-      // A visible target makes touch steering predictable: it is only an aim
-      // marker and never changes the server-side movement physics.
+      // The touch stick moves the same screen cursor as a mouse. The server
+      // receives the resulting world coordinate, without any mobile physics.
       if (joystickRef.current.active && currentPlayer?.cells.length) {
         const center = getPlayerCenter(currentPlayer);
-        const joy = joystickRef.current;
-        const length = Math.hypot(joy.dx, joy.dy) || 1;
-        const aimDistance = 260;
-        const ax = center.x + (joy.dx / length) * aimDistance;
-        const ay = center.y + (joy.dy / length) * aimDistance;
+        const ax = mouseWorldRef.current.x;
+        const ay = mouseWorldRef.current.y;
         ctx.save();
         ctx.strokeStyle = 'rgba(255,255,255,0.9)';
         ctx.fillStyle = 'rgba(56,189,248,0.35)';
@@ -868,7 +868,7 @@ export function GameCanvas({
         ctx.setLineDash([8, 8]);
         ctx.beginPath(); ctx.moveTo(center.x, center.y); ctx.lineTo(ax, ay); ctx.stroke();
         ctx.setLineDash([]);
-        ctx.beginPath(); ctx.arc(ax, ay, 16, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(ax, ay, 16 / Math.max(cameraRef.current.scale, 0.001), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
         ctx.restore();
       }
 
@@ -1276,9 +1276,9 @@ export function GameCanvas({
         }}
         className={`block touch-none ${prefs.systemCursor ? 'cursor-default' : 'cursor-crosshair'}`}
       />
-      {touchControls && gameplayKeysEnabled && !isSpectating && !inputBlocked && (
+      {touchControls && gameplayKeysEnabled && !inputBlocked && (
         <div className="absolute inset-0 z-30 pointer-events-none">
-          <div
+          {!isSpectating && <div
             className="absolute rounded-full border-2 border-white/35 bg-black/35 shadow-lg pointer-events-auto touch-none"
             aria-label="Сенсорный джойстик"
             style={{ width: prefs.mobileControls.joystick.size, height: prefs.mobileControls.joystick.size, left: `${prefs.mobileControls.joystick.x}%`, top: `${prefs.mobileControls.joystick.y}%`, transform: 'translate(-50%, -50%)' }}
@@ -1289,24 +1289,32 @@ export function GameCanvas({
               const dx = Math.max(-max, Math.min(max, e.clientX - (rect.left + rect.width / 2)));
               const dy = Math.max(-max, Math.min(max, e.clientY - (rect.top + rect.height / 2)));
               joystickRef.current = { dx, dy, active: true }; setJoystick({ dx, dy, active: true });
-              const player = currentPlayerRef.current;
-              if (player?.cells.length) {
-                const center = getPlayerCenter(player), length = Math.hypot(dx, dy);
-                if (length > 2) onMouseMoveRef.current(center.x + dx / length * 3500, center.y + dy / length * 3500);
-              }
+              const canvas = canvasRef.current;
+              if (!canvas) return;
+              const length = Math.hypot(dx, dy);
+              const range = Math.max(1, rect.width * .36);
+              // Cursor spans the full canvas (not a small circle around center).
+              mouseScreenRef.current = {
+                x: canvas.width / 2 + (dx / range) * (canvas.width * 0.48),
+                y: canvas.height / 2 + (dy / range) * (canvas.height * 0.48),
+                valid: length > 2,
+              };
             }}
             onPointerUp={() => { joystickRef.current = { dx: 0, dy: 0, active: false }; setJoystick(joystickRef.current); }}
           >
             <div className="absolute left-1/2 top-1/2 rounded-full border border-white/60 bg-sky-400/80 shadow" style={{ width: '42%', height: '42%', transform: `translate(calc(-50% + ${joystick.dx}px), calc(-50% + ${joystick.dy}px))` }} />
-          </div>
-          {([
+          </div>}
+          {(!isSpectating ? [
             ['split', 'ДЕЛ', 'bg-blue-600/85', () => onSplit()],
             ['eject', 'W', 'bg-emerald-600/85', () => onEject()],
+            ['chat', 'ЧАТ', 'bg-slate-700/90', () => onToggleMobileChat?.()],
+          ] as const : [
             ['chat', 'ЧАТ', 'bg-slate-700/90', () => onToggleMobileChat?.()],
           ] as const).map(([id, label, color, action]) => {
             const control = prefs.mobileControls[id];
             return <button key={id} type="button" onPointerDown={(e) => { e.preventDefault(); action(); }} className={`absolute rounded-full border border-white/40 ${color} text-xs font-bold text-white shadow-lg pointer-events-auto touch-none active:scale-95`} style={{ width: control.size, height: control.size, left: `${control.x}%`, top: `${control.y}%`, transform: 'translate(-50%, -50%)' }}>{label}</button>;
           })}
+          <button type="button" onPointerDown={(e) => { e.preventDefault(); onToggleMobileMenu?.(); }} className="absolute right-3 top-3 rounded-full border border-white/40 bg-slate-800/90 px-3 py-2 text-xs font-bold text-white shadow-lg pointer-events-auto touch-none active:scale-95">МЕНЮ</button>
         </div>
       )}
       {frozen && !isSpectating && (

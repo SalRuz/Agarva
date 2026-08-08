@@ -113,13 +113,6 @@ export function SkinPicker({ open, selectedId, unlockedSkinIds, agarviki = 0, on
 
             {skins.map(renderSkin)}
           </div>
-
-          {skins.length === 0 && (
-            <div className="mt-6 rounded-2xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-amber-100 text-sm">
-              Пока нет скинов. Добавь изображения (png/jpg/webp/gif/svg) в папку{' '}
-              <code className="text-amber-200">skins/</code> рядом с проектом и перезапусти.
-            </div>
-          )}
         </div>
       </div>
     </div>

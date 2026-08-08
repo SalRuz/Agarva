@@ -89,7 +89,7 @@ export async function uploadCustomSkin(
 ): Promise<void> {
   const normalized = await normalizeSkinImage(file);
   const form = new FormData();
-  form.append('file', normalized, `${file.name.replace(/\.[^.]+$/, '') || 'skin'}.webp`);
+  form.append('file', normalized, normalized.name);
   form.append('name', name || file.name.replace(/\.[^.]+$/, ''));
   form.append('adminNick', adminName);
   form.append('adminPassword', password);
@@ -102,12 +102,22 @@ export async function uploadCustomSkin(
     // boundary, and Cyrillic credentials stay safely in the request body.
     body: form,
   });
-  const body = (await response.json().catch(() => ({}))) as { error?: string };
-  if (!response.ok) throw new Error(body.error || 'Не удалось загрузить скин');
+  const raw = await response.text();
+  let body: { error?: string } = {};
+  try {
+    body = JSON.parse(raw) as { error?: string };
+  } catch {
+    // Reverse proxies sometimes return plain text/HTML errors. Keep enough
+    // information for an admin to distinguish that from a rejected image.
+  }
+  if (!response.ok) {
+    const detail = body.error || raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+    throw new Error(detail || `Не удалось загрузить скин (HTTP ${response.status})`);
+  }
 }
 
 async function normalizeSkinImage(file: File): Promise<File> {
-  if (!file.type.startsWith('image/')) throw new Error('Выберите файл изображения');
+  if (!file.type.startsWith('image/') && file.type !== '') throw new Error('Выберите файл изображения');
   const source = await createImageBitmap(file).catch(() => null);
   if (!source) throw new Error('Не удалось прочитать изображение');
   const ratio = Math.min(1, 512 / Math.max(source.width, source.height));
@@ -116,10 +126,25 @@ async function normalizeSkinImage(file: File): Promise<File> {
   canvas.height = Math.max(1, Math.round(source.height * ratio));
   canvas.getContext('2d')?.drawImage(source, 0, 0, canvas.width, canvas.height);
   source.close();
-  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/webp', 0.86));
+  const toBlob = (type: string, quality?: number) =>
+    new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, type, quality));
+  // Safari and some Chromium builds return null for WebP — fall back to JPEG/PNG.
+  let blob = await toBlob('image/webp', 0.86);
+  let mime = 'image/webp';
+  let ext = 'webp';
+  if (!blob) {
+    blob = await toBlob('image/jpeg', 0.9);
+    mime = 'image/jpeg';
+    ext = 'jpg';
+  }
+  if (!blob) {
+    blob = await toBlob('image/png');
+    mime = 'image/png';
+    ext = 'png';
+  }
   if (!blob) throw new Error('Не удалось подготовить изображение');
   if (blob.size > CUSTOM_SKIN_MAX_BYTES) throw new Error('Изображение слишком большое после сжатия');
-  return new File([blob], 'skin.webp', { type: 'image/webp' });
+  return new File([blob], `skin.${ext}`, { type: mime });
 }
 
 export async function deleteCustomSkin(skin: SkinInfo, adminName: string, password: string): Promise<void> {

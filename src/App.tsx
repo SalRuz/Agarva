@@ -1837,7 +1837,12 @@ export function App() {
           }
         }}
         onToggleMobileChat={() => {
-          if (sessionKindRef.current === 'multiplayer') setChatOpen((open) => !open);
+          if (sessionKindRef.current === 'multiplayer') setChatOpen(true);
+        }}
+        onToggleMobileMenu={() => {
+          setShowEscapeMenu(true);
+          setChatOpen(false);
+          setChatFocused(false);
         }}
         centerLeader={centerLeader}
       />

@@ -72,7 +72,7 @@ export interface PersistedData {
   /** telegram chatId → login */
   tgAccounts: Record<string, string>;
   customSkins: Record<string, CustomSkinRecord>;
-  customSkinOrders: Record<string, { chatId: string; login: string; status: string; dataBase64?: string; mime?: CustomSkinRecord['mime']; createdAt: number }>;
+  customSkinOrders: Record<string, { chatId: string; login: string; status: string; dataBase64?: string; mime?: CustomSkinRecord['mime']; paymentMessage?: string; createdAt: number }>;
   telegramChannelUrl?: string;
 }
 
@@ -386,10 +386,22 @@ export class PersistentStore {
       // Preserve all current XP, quest state, preferences, and account binding.
       for (const source of Object.values(snapshot.players ?? {})) {
         if (!source?.accountLogin) continue;
-        const target = Object.values(this.data.players).find(
+        let target = Object.values(this.data.players).find(
           (profile) => profile.accountLogin?.toLowerCase() === source.accountLogin?.toLowerCase()
         );
-        if (!target) continue;
+        // A linked Telegram account can be temporarily absent from `players`
+        // (for example after a device migration). Restore the profile on its
+        // account-bound device instead of silently losing a paid skin unlock.
+        if (!target) {
+          const account = this.getAccount(source.accountLogin);
+          if (!account?.deviceId) continue;
+          target = this.data.players[account.deviceId] ?? {
+            lastNick: account.login,
+            accountLogin: account.login,
+            updatedAt: Date.now(),
+          };
+          this.data.players[account.deviceId] = target;
+        }
         const unlocks = sanitizeQuestProgress(source.quests).unlockedSkinIds;
         if (!unlocks.length) continue;
         const quests = sanitizeQuestProgress(target.quests);
@@ -443,6 +455,49 @@ export class PersistentStore {
   addCustomSkin(skin: CustomSkinRecord) {
     this.data.customSkins[skin.id] = skin;
     this.save();
+  }
+
+  /**
+   * Finalize a Telegram-moderated personal skin on the authoritative store.
+   * Prefer this over bot-side merge so unlocks never depend on a stale cache.
+   */
+  completePersonalSkinOrder(orderId: string): { ok: true; skinId: string } | { ok: false; error: string } {
+    const order = this.data.customSkinOrders[orderId];
+    if (!order) return { ok: false, error: 'Заявка не найдена' };
+    if (!order.dataBase64 || !order.mime) return { ok: false, error: 'Изображение скина не найдено' };
+    const login = order.login.trim();
+    const account = this.data.accounts[login.toLowerCase()];
+    if (!account) return { ok: false, error: 'Аккаунт покупателя не найден' };
+    let profile =
+      (account.deviceId && this.data.players[account.deviceId]) ||
+      Object.values(this.data.players).find((p) => p.accountLogin?.toLowerCase() === login.toLowerCase());
+    if (!profile) {
+      // Recreate a bound profile shell so the unlock is not lost if the device
+      // was wiped/unlinked after the order was placed.
+      const deviceId = account.deviceId || `tg-${login.toLowerCase()}`;
+      account.deviceId = deviceId;
+      profile = this.upsertPlayer(deviceId, { accountLogin: account.login, lastNick: account.login });
+    }
+    const ext = order.mime === 'image/png' ? 'png' : order.mime === 'image/jpeg' ? 'jpg' : 'webp';
+    const skinId = `personal-${orderId}`;
+    this.data.customSkins[skinId] = {
+      id: skinId,
+      name: `Кастомный скин ${account.login}`,
+      fileName: `${skinId}.${ext}`,
+      mime: order.mime,
+      dataBase64: order.dataBase64,
+      kind: 'personal',
+      accountLogin: account.login,
+      createdAt: Date.now(),
+    };
+    const quests = sanitizeQuestProgress(profile.quests ?? createDefaultQuestProgress());
+    if (!quests.unlockedSkinIds.includes(skinId)) quests.unlockedSkinIds.push(skinId);
+    profile.quests = quests;
+    profile.accountLogin = account.login;
+    profile.updatedAt = Date.now();
+    order.status = 'completed';
+    this.save();
+    return { ok: true, skinId };
   }
 
   removeCustomSkin(id: string): CustomSkinRecord | undefined {
