@@ -548,7 +548,7 @@ export function GameCanvas({
           ctx.save();
           ctx.beginPath();
           ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-          ctx.strokeStyle = 'rgba(250, 204, 21, 0.95)';
+          ctx.strokeStyle = 'rgba(250, 204, 21, 0.7)';
           ctx.lineWidth = Math.max(4, radius * 0.09);
           ctx.shadowColor = 'rgba(0,0,0,0.75)';
           ctx.shadowBlur = 10;
@@ -558,8 +558,12 @@ export function GameCanvas({
           ctx.font = `bold ${Math.max(16, radius * 0.28)}px Arial, Helvetica, sans-serif`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          ctx.fillStyle = 'rgba(255,255,255,0.65)';
-          ctx.fillText(`👑 ${leader.name}`, cx, cy + radius + Math.max(24, radius * 0.35));
+          ctx.lineJoin = 'round';
+          ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+          ctx.lineWidth = Math.max(1, radius * 0.025);
+          ctx.strokeText(leader.name, cx, cy);
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.fillText(leader.name, cx, cy);
           ctx.restore();
         }
       }
@@ -1055,8 +1059,12 @@ export function GameCanvas({
   }, []);
 
   const handleTouchStart = useCallback((event: React.TouchEvent<HTMLCanvasElement>) => {
-    if (inputBlockedRef.current || isSpectatingRef.current) return;
+    if (inputBlockedRef.current) return;
     if (event.touches.length === 1) {
+      if (isSpectatingRef.current) {
+        touchStartRef.current = null;
+        return;
+      }
       const touch = event.touches[0];
       touchStartRef.current = { x: touch.clientX, y: touch.clientY };
       pinchDistanceRef.current = null;
@@ -1068,7 +1076,7 @@ export function GameCanvas({
   }, []);
 
   const handleTouchMove = useCallback((event: React.TouchEvent<HTMLCanvasElement>) => {
-    if (inputBlockedRef.current || isSpectatingRef.current) return;
+    if (inputBlockedRef.current) return;
     event.preventDefault();
     if (event.touches.length === 2) {
       const [a, b] = [event.touches[0], event.touches[1]];
@@ -1076,11 +1084,15 @@ export function GameCanvas({
       const previous = pinchDistanceRef.current;
       if (previous && previous > 0) {
         const factor = Math.max(0.85, Math.min(1.15, distance / previous));
-        cameraRef.current.userZoom = Math.max(0.4, Math.min(2.2, cameraRef.current.userZoom * factor));
+        const cfg = configRef.current;
+        const minZoom = isSpectatingRef.current ? cfg.spectateMinZoom : 0.4;
+        const maxZoom = isSpectatingRef.current ? cfg.spectateMaxZoom : 2.2;
+        cameraRef.current.userZoom = Math.max(minZoom, Math.min(maxZoom, cameraRef.current.userZoom * factor));
       }
       pinchDistanceRef.current = distance;
       return;
     }
+    if (isSpectatingRef.current) return;
     const start = touchStartRef.current;
     const touch = event.touches[0];
     const player = currentPlayerRef.current;

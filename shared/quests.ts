@@ -56,8 +56,8 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
     step: 1000,
     unit: 'mass',
     requiresFreshStart: true,
-    condition: 'Старт с нуля (с новой жизни)',
-    hint: 'Старт с нуля (с новой жизни)',
+    condition: 'Только в режиме «Классик». Старт с нуля (с новой жизни)',
+    hint: 'Только в режиме «Классик». Старт с нуля (с новой жизни)',
   },
   survive: {
     id: 'survive',
@@ -65,8 +65,8 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
     base: 20,
     step: 1,
     unit: 'minutes',
-    condition: 'Просто продержитесь в игре',
-    hint: 'Просто продержитесь в игре',
+    condition: 'Только в режиме «Классик». Просто продержитесь в игре',
+    hint: 'Только в режиме «Классик». Просто продержитесь в игре',
   },
   top: {
     id: 'top',
@@ -75,8 +75,8 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
     step: 1,
     unit: 'minutes',
     requiresFreshStart: true,
-    condition: 'Топ-10; при вылете или смерти — заново',
-    hint: 'Топ-10; при вылете или смерти — заново',
+    condition: 'Только в режиме «Классик». Топ-10; при вылете или смерти — заново',
+    hint: 'Только в режиме «Классик». Топ-10; при вылете или смерти — заново',
   },
   kills: {
     id: 'kills',
@@ -84,7 +84,7 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
     base: 3,
     step: 1,
     unit: 'count',
-    condition: 'Поглощайте игроков',
+    condition: 'Только в режиме «Классик». Поглощайте игроков',
   },
   viruses: {
     id: 'viruses',
@@ -92,7 +92,7 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
     base: 30,
     step: 2,
     unit: 'count',
-    condition: 'Поглощайте колючки',
+    condition: 'Только в режиме «Классик». Поглощайте колючки',
   },
   splits: {
     id: 'splits',
@@ -100,17 +100,17 @@ export const QUEST_DEFS: Record<QuestTaskId, QuestTaskDef> = {
     base: 30,
     step: 10,
     unit: 'count',
-    condition: 'Нажимайте пробел, когда можно сплититься',
+    condition: 'Только в режиме «Классик». Нажимайте пробел, когда можно сплититься',
   },
   massNoVirus: {
     id: 'massNoVirus',
     title: 'Набрать массу без касания колючек',
-    base: 5000,
+    base: 2500,
     step: 1000,
     unit: 'mass',
     requiresFreshStart: true,
-    condition: 'Старт с нуля (с новой жизни), не касаясь колючек',
-    hint: 'Старт с нуля (с новой жизни), не касаясь колючек',
+    condition: 'Только в режиме «Классик». Старт с нуля (с новой жизни), не касаясь колючек',
+    hint: 'Только в режиме «Классик». Старт с нуля (с новой жизни), не касаясь колючек',
   },
 };
 

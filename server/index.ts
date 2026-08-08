@@ -310,7 +310,7 @@ function startServer(attempt = 0) {
   const botOutbox: BotOutboxMessage[] = [];
   let nextBotOutboxId = 1;
   const passwordResetCodes = new Map<string, PasswordResetCode>();
-  let lastClassicRecordAnnouncement = 0;
+  let lastClassicRecordCheckAt = 0;
 
   function removePendingFightJoin(session: ClientSession) {
     for (let i = pendingSoloFightJoins.length - 1; i >= 0; i--) {
@@ -326,6 +326,31 @@ function startServer(attempt = 0) {
       session.ws.readyState === WebSocket.OPEN ||
       (session.reconnectGraceUntil !== null && session.reconnectGraceUntil > Date.now())
     );
+  }
+
+  function accountLoginForDevice(deviceId: string): string | null {
+    const login = deviceId ? persistentStore.getPlayer(deviceId)?.accountLogin?.trim().toLowerCase() : '';
+    return login || null;
+  }
+
+  /** A live player body, including one retained during reconnect grace. */
+  function isPlayingSession(session: ClientSession): boolean {
+    return (
+      isSessionActiveOrRecoverable(session) &&
+      session.joined &&
+      !session.spectating &&
+      !session.lobbyOnly &&
+      session.playerIds.length > 0
+    );
+  }
+
+  function isPlayingElsewhere(session: ClientSession, deviceId: string, accountLogin: string | null): boolean {
+    for (const candidate of clients.values()) {
+      if (candidate === session || !isPlayingSession(candidate)) continue;
+      if (deviceId && candidate.deviceId === deviceId) return true;
+      if (accountLogin && accountLoginForDevice(candidate.deviceId) === accountLogin) return true;
+    }
+    return false;
   }
 
   function engineFor(room: RoomMode): GameEngine {
@@ -1291,7 +1316,11 @@ function startServer(attempt = 0) {
           writeBotApi(res, 400, { error: 'Empty chat message' });
           return;
         }
-        broadcastToRoom(room, { type: 'chat', name, text, t: Date.now(), color: '#27a9ff', fromTg: true });
+        const t = Date.now();
+        broadcastToRoom(room, { type: 'chat', name, text, t, color: '#27a9ff', fromTg: true });
+        // Telegram-originated lines need the same retained relay queue as
+        // game-originated chat, otherwise only WebSocket clients see them.
+        queueGameChat(room, name, text, t);
         writeBotApi(res, 200, { ok: true });
         return;
       }
@@ -2200,7 +2229,10 @@ function startServer(attempt = 0) {
       processWeeklyTops();
       // Classic records are tied to the stable device profile, not a transient
       // websocket name. Guests may play normally but never enter prize records.
-      if (hasClassicSession) {
+      const now = Date.now();
+      const recordCheckIntervalMs = classicConfig.classicRecordCheckIntervalSec * 1_000;
+      if (hasClassicSession && now - lastClassicRecordCheckAt >= recordCheckIntervalMs) {
+        lastClassicRecordCheckAt = now;
         const state = classicEngine.getState();
         for (const session of clients.values()) {
           if (session.room !== 'classic' || !session.joined || !session.deviceId) continue;
@@ -2211,8 +2243,7 @@ function startServer(attempt = 0) {
             return sum + (player?.cells.length ? getTotalMass(player) : 0);
           }, 0);
           const result = persistentStore.recordClassicMass(session.deviceId, session.lastName, score, session.lastSkin);
-          if (result.global && score >= lastClassicRecordAnnouncement + 100) {
-            lastClassicRecordAnnouncement = Math.floor(score);
+          if (result.global) {
             broadcastGameChat('classic', '🏆 Система', `Игрок ${session.lastName} установил рекорд классика: ${Math.floor(score)} массы!`, '#facc15');
           }
         }
@@ -2246,16 +2277,12 @@ function startServer(attempt = 0) {
         }
         return false;
       };
-      for (const ev of [
-        ...(hasClassicSession ? classicEngine.consumeQuestEvents() : []),
-        ...(sfState.phase !== 'waiting' && sfDuelists.length > 0 ? soloFightEngine.consumeQuestEvents() : []),
-        ...(teamStates.duoFight.phase !== 'waiting' && teamFighters.duoFight.length > 0
-          ? duoFightEngine.consumeQuestEvents()
-          : []),
-        ...(teamStates.trioFight.phase !== 'waiting' && teamFighters.trioFight.length > 0
-          ? trioFightEngine.consumeQuestEvents()
-          : []),
-      ]) {
+      const classicQuestEvents = hasClassicSession ? classicEngine.consumeQuestEvents() : [];
+      // Drain events from fight engines without allowing them to affect quests.
+      if (sfState.phase !== 'waiting' && sfDuelists.length > 0) soloFightEngine.consumeQuestEvents();
+      if (teamStates.duoFight.phase !== 'waiting' && teamFighters.duoFight.length > 0) duoFightEngine.consumeQuestEvents();
+      if (teamStates.trioFight.phase !== 'waiting' && teamFighters.trioFight.length > 0) trioFightEngine.consumeQuestEvents();
+      for (const ev of classicQuestEvents) {
         if (ev.kind === 'virus') {
           bumpQuestEvent(ev.playerId, 'virus');
           continue;
@@ -2279,39 +2306,45 @@ function startServer(attempt = 0) {
 
         const engine = engineFor(session.room);
 
-        if (session.joined && session.playerIds.length > 0 && session.deviceId) {
+        if (session.room === 'classic' && session.joined && session.playerIds.length > 0 && session.deviceId) {
           const profile = persistentStore.getPlayer(session.deviceId);
           const accountOk = !!profile?.accountLogin;
           if (accountOk && isQuestPrimary(session, profile.accountLogin)) {
             if (!session.questRun) session.questRun = emptyQuestRunStats();
             const run = session.questRun;
-            let massSum = 0;
             const state = engine.getState();
-            const owned = new Set(session.playerIds);
+            // The original body remains the quest primary while a second
+            // multibox body exists. If it dies, cleanup promotes the remaining
+            // first owned body on the next tick.
+            const primaryId = session.playerIds[0];
+            const primary = primaryId ? state.players.find((p) => p.id === primaryId) : undefined;
+            const primaryMass = primary?.cells.length ? getTotalMass(primary) : 0;
             for (const id of session.playerIds) {
-              const player = state.players.find((p) => p.id === id);
-              if (!player || player.cells.length === 0) continue;
-              massSum += getTotalMass(player);
               const ev = questEventsByPlayer.get(id);
               if (ev) {
-                run.kills += ev.kills;
-                run.viruses += ev.viruses;
+                // A virus hit by either multibox part invalidates the
+                // no-virus run, but all other quest events belong only to
+                // the primary body.
                 if (ev.viruses > 0) run.touchedVirus = true;
+                if (id === primaryId) {
+                  run.kills += ev.kills;
+                  run.viruses += ev.viruses;
+                }
               }
             }
-            const alive = massSum > 0;
+            const alive = primaryMass > 0;
             // A profile/socket can remain connected while its owner is in the
             // lobby or spectating. Time quests only advance for an active,
             // living player in a real room.
             const activelyPlaying = alive && session.joined && !session.spectating && !session.lobbyOnly;
             if (activelyPlaying) run.surviveMs += tickMs;
-            if (massSum > run.peakMass) run.peakMass = massSum;
-            if (!run.touchedVirus && massSum > run.peakMassNoVirus) run.peakMassNoVirus = massSum;
+            if (primaryMass > run.peakMass) run.peakMass = primaryMass;
+            if (!run.touchedVirus && primaryMass > run.peakMassNoVirus) run.peakMassNoVirus = primaryMass;
 
             const ranked = state.players
               .filter((p) => p.cells.length > 0)
               .sort((a, b) => b.score - a.score);
-            const rank = ranked.findIndex((p) => owned.has(p.id));
+            const rank = ranked.findIndex((p) => p.id === primaryId);
             if (activelyPlaying && rank >= 0 && rank < 10) {
               run.inTop10 = true;
               run.topMs += tickMs;
@@ -2325,7 +2358,13 @@ function startServer(attempt = 0) {
               session.questProgress = sanitizeQuestProgress(profile?.quests ?? createDefaultQuestProgress());
             }
             let quests = session.questProgress;
+            const before = quests.currentProgress;
             if (quests.currentTaskId === 'top' && !run.inTop10) {
+              quests.currentProgress = 0;
+            }
+            // A hit by either owned body invalidates a no-virus attempt,
+            // including progress that was already displayed for this life.
+            if (quests.currentTaskId === 'massNoVirus' && run.touchedVirus) {
               quests.currentProgress = 0;
             }
             const previousTimeRunning =
@@ -2335,7 +2374,6 @@ function startServer(attempt = 0) {
                   ? run.inTop10
                   : false;
             const value = questValueFromRun(quests.currentTaskId, run);
-            const before = quests.currentProgress;
             const applied = applyQuestProgressValue(quests, value, getCustomLevelSkinRewards());
             quests = applied.progress;
             session.questProgress = quests;
@@ -2696,6 +2734,19 @@ function startServer(attempt = 0) {
         }
         case 'join': {
           const mode = parseMode(msg.mode);
+          const resolvedDevice =
+            persistentStore.resolveDeviceId(
+              typeof msg.deviceId === 'string' ? msg.deviceId : undefined,
+              typeof msg.fingerprint === 'string' ? msg.fingerprint : undefined
+            ) || (typeof msg.deviceId === 'string' ? msg.deviceId.trim().slice(0, 80) : '');
+          const playDeviceId = resolvedDevice || session.deviceId;
+          if (
+            playDeviceId &&
+            isPlayingElsewhere(session, playDeviceId, accountLoginForDevice(playDeviceId))
+          ) {
+            send(ws, { type: 'error', message: 'Уже идёт игра на другой вкладке' });
+            break;
+          }
           removePendingFightJoin(session);
           if (session.room === 'soloFight' && sfDuelists.includes(session)) {
             handleSoloFightLeave(session);
@@ -2723,11 +2774,6 @@ function startServer(attempt = 0) {
           const skin = String(msg.skin || '').trim();
           session.lastSkin = skin;
 
-          const resolvedDevice =
-            persistentStore.resolveDeviceId(
-              typeof msg.deviceId === 'string' ? msg.deviceId : undefined,
-              typeof msg.fingerprint === 'string' ? msg.fingerprint : undefined
-            ) || (typeof msg.deviceId === 'string' ? msg.deviceId.trim().slice(0, 80) : '');
           if (resolvedDevice) {
             session.deviceId = resolvedDevice;
             const profile = persistentStore.upsertPlayer(resolvedDevice, {
@@ -3058,7 +3104,9 @@ function startServer(attempt = 0) {
           }
           if (isTeamFight(session.room) && teamStates[session.room].phase !== 'fighting') return;
           const created = engine().splitPlayer(id);
-          if (session.questRun && created > 0) session.questRun.splits += 1;
+          if (session.room === 'classic' && session.questRun && id === session.playerIds[0] && created > 0) {
+            session.questRun.splits += 1;
+          }
           break;
         }
         case 'eject': {

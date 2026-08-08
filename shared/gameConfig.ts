@@ -104,6 +104,8 @@ export interface GameplayConfig {
   botCountSolo: number;
   botCountMp: number;
   serverTickHz: number;
+  /** Minimum interval between Classic record checks and announcements, in seconds. */
+  classicRecordCheckIntervalSec: number;
   adminMassBoost: number;
   visualGrowLerp: number;
   visualShrinkLerp: number;
@@ -231,6 +233,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   botCountSolo: 16,
   botCountMp: 20,
   serverTickHz: 30,
+  classicRecordCheckIntervalSec: 10,
   /** Admin-only setting — kept from project defaults, not overridden by shared presets */
   adminMassBoost: ADMIN_MASS_BOOST,
   visualGrowLerp: 0.006,
@@ -350,6 +353,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.botCountSolo = Math.max(0, Math.round(out.botCountSolo));
   out.botCountMp = Math.max(0, Math.round(out.botCountMp));
   out.serverTickHz = Math.max(1, Math.round(out.serverTickHz));
+  out.classicRecordCheckIntervalSec = clampRange(Math.round(out.classicRecordCheckIntervalSec), 1, 3600);
   out.adminMassBoost = Math.max(1, out.adminMassBoost);
   out.visualGrowLerp = clamp01(out.visualGrowLerp);
   out.visualShrinkLerp = clamp01(out.visualShrinkLerp);

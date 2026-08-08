@@ -585,20 +585,7 @@ export function App() {
       }
       if (modeRef.current === 'spectating') {
         consume();
-        const state = gameStateRef.current;
-        const savedId = spectateReturnPlayerIdRef.current;
-        if (state && savedId) {
-          const back = state.players.find((p) => p.id === savedId && p.cells.length > 0);
-          if (back) {
-            playerIdRef.current = back.id;
-            currentPlayerRef.current = back;
-            setCurrentPlayer(back);
-            setMode('playing');
-            return;
-          }
-        }
-        // Always main menu (with live background if still connected) — never death overlay
-        handleBackToMenuRef.current();
+        setShowEscapeMenu(true);
         return;
       }
       // A live player may inspect another room's roster from the ESC menu.
@@ -1745,7 +1732,7 @@ export function App() {
     mpRef.current.adminGetBotLogs();
   }, []);
 
-  const showMenuOverlay = mode === 'menu' || (mode === 'playing' && showEscapeMenu);
+  const showMenuOverlay = mode === 'menu' || showEscapeMenu;
   const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
   // One always-on menu socket receives atomic occupancy for every room.
   const lobbyStats = useLobbySnapshot(showMenuOverlay);
@@ -1840,9 +1827,9 @@ export function App() {
           if (sessionKindRef.current === 'multiplayer') setChatOpen(true);
         }}
         onToggleMobileMenu={() => {
-          setShowEscapeMenu(true);
           setChatOpen(false);
           setChatFocused(false);
+          setShowEscapeMenu(true);
         }}
         centerLeader={centerLeader}
       />
@@ -1858,7 +1845,7 @@ export function App() {
           onStart={handleStartMultiplayer}
           onSpectate={handleSpectateClassic}
           spectateDisabled={mode === 'playing' && playMode === connectedPlayMode}
-          escapeOverlay={mode === 'playing' && showEscapeMenu}
+          escapeOverlay={showEscapeMenu}
           activePlayMode={sessionKind === 'multiplayer' ? connectedPlayMode : undefined}
           onResume={handleResume}
           onAdminSettings={handleOpenAdminSettings}
