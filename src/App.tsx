@@ -3,7 +3,7 @@ import { GameEngine } from './engine/GameEngine';
 import { GameCanvas } from './components/GameCanvas';
 import { Leaderboard } from './components/Leaderboard';
 import { Minimap } from './components/Minimap';
-import { StartScreen, useLobbySnapshot, type PlayRoomMode } from './components/StartScreen';
+import { StartScreen, useLobbySnapshot, useModeTops, type PlayRoomMode } from './components/StartScreen';
 import { SoloFightHud } from './components/SoloFightHud';
 import { TeamFightHud } from './components/TeamFightHud';
 import { HUD } from './components/HUD';
@@ -41,6 +41,7 @@ import {
   type PlayerPrefs,
 } from './settings/playerPrefs';
 import { getOrCreateDeviceId } from './device/deviceId';
+import { formatQuestProgressLine, LEVEL_SKIN_REWARDS, type QuestPublicView } from '../shared/quests';
 
 type GameMode = 'menu' | 'playing' | 'dead' | 'spectating';
 type SessionKind = 'solo' | 'multiplayer';
@@ -51,13 +52,15 @@ export function App() {
   /** Throttled snapshot for HUD / minimap / leaderboard (~8 Hz) — NOT every frame */
   const [hudState, setHudState] = useState<GameState | null>(null);
   const [currentPlayer, setCurrentPlayer] = useState<Player | undefined>();
-  const [leaderboard, setLeaderboard] = useState<{ name: string; score: number; isBot: boolean }[]>([]);
+  const [leaderboard, setLeaderboard] = useState<{ name: string; score: number; isBot: boolean; level?: number }[]>([]);
   const [showEscapeMenu, setShowEscapeMenu] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [ready, setReady] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatLine[]>([]);
+  const [privateChats, setPrivateChats] = useState<Record<string, ChatLine[]>>({});
+  const [openPrivateWith, setOpenPrivateWith] = useState<string | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [, setChatFocused] = useState(false);
   const [lastScore, setLastScore] = useState(0);
@@ -100,6 +103,16 @@ export function App() {
       return null;
     }
   });
+  const [questView, setQuestView] = useState<QuestPublicView | null>(null);
+  const [levelRewardQueue, setLevelRewardQueue] = useState<number[]>([]);
+  // Ignore stale profile snapshots after this browser session has dismissed a
+  // reward. The server remains the durable source of truth and is acknowledged
+  // only after the congratulations modal is actually closed.
+  const acknowledgedLevelRewardsRef = useRef<Set<number>>(new Set());
+  /** Level snapshot when the player started playing; null until first profile/play. */
+  const playStartLevelRef = useRef<number | null>(null);
+  const [questUpdatedAt, setQuestUpdatedAt] = useState(0);
+  const [questClock, setQuestClock] = useState(Date.now());
   const [registerError, setRegisterError] = useState<string | null>(null);
   const [registerBusy, setRegisterBusy] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
@@ -110,6 +123,10 @@ export function App() {
   const [passwordResetCodeSent, setPasswordResetCodeSent] = useState(false);
   const [selectedSkinId, setSelectedSkinId] = useState<string | null>(() => loadSelectedSkinId());
   const [customSkins, setCustomSkins] = useState<SkinInfo[]>([]);
+  const [skinsLoaded, setSkinsLoaded] = useState(false);
+  const [telegramChannelUrl, setTelegramChannelUrl] = useState('');
+  const [weeklyTopPrizes, setWeeklyTopPrizes] = useState<Record<PlayRoomMode, number>>({ classic: 60, soloFight: 60, duoFight: 60, trioFight: 60 });
+  const [centerLeader, setCenterLeader] = useState<{ name: string; skin?: string; score: number } | null>(null);
   const selectedSkinUrl = resolveSkinUrl(selectedSkinId);
   const [menuName, setMenuName] = useState(() => {
     try {
@@ -119,6 +136,60 @@ export function App() {
     }
   });
   const [menuPassword, setMenuPassword] = useState('');
+
+  const questTimerActive =
+    mode === 'playing' &&
+    sessionKind === 'multiplayer' &&
+    questView?.unit === 'minutes' &&
+    questView.timeRunning === true;
+  useEffect(() => {
+    if (!questTimerActive) return;
+    const timer = window.setInterval(() => setQuestClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [questTimerActive, questView?.taskId, questView?.remainingMs, questUpdatedAt]);
+
+  const questProgressText = questView
+    ? formatQuestProgressLine(
+        questView,
+        questTimerActive ? Math.max(0, questClock - questUpdatedAt) : 0
+      ).replace(`${questView.title}: `, '')
+    : undefined;
+  const enqueueLevelRewards = useCallback((levels: number[]) => {
+    const unacknowledged = levels.filter(
+      (level) => Number.isFinite(level) && level > 0 && !acknowledgedLevelRewardsRef.current.has(level)
+    );
+    if (!unacknowledged.length) return;
+    setLevelRewardQueue((queue) => [...new Set([...queue, ...unacknowledged])].sort((a, b) => a - b));
+  }, []);
+
+  // Baseline level from first profile so we never congratulate old levels on reload.
+  useEffect(() => {
+    if (questView && playStartLevelRef.current === null) {
+      playStartLevelRef.current = questView.level;
+    }
+  }, [questView]);
+
+  // Keep a live queue while playing (modal still only renders on main menu).
+  useEffect(() => {
+    enqueueLevelRewards(questView?.pendingLevelRewards ?? []);
+  }, [questView?.pendingLevelRewards, enqueueLevelRewards]);
+
+  // When entering the actual main menu, rebuild the queue from server pending
+  // and from levels gained during the last play session (covers missed pushes).
+  useEffect(() => {
+    if (mode !== 'menu' || !questView) return;
+    const pending = questView.pendingLevelRewards ?? [];
+    const gained: number[] = [];
+    const currentLevel = questView.level ?? 0;
+    const startLevel = playStartLevelRef.current;
+    if (startLevel !== null) {
+      for (let level = startLevel + 1; level <= currentLevel; level++) {
+        gained.push(level);
+      }
+      playStartLevelRef.current = currentLevel;
+    }
+    enqueueLevelRewards([...pending, ...gained]);
+  }, [mode, questView, enqueueLevelRewards]);
   const [frozen, setFrozen] = useState(false);
   const [isTouchDevice] = useState(
     () => typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)
@@ -158,16 +229,6 @@ export function App() {
   /** True while the main menu deliberately keeps a live MP spectator connection. */
   const menuOverLiveRef = useRef(false);
   const soloFightHudKeyRef = useRef('');
-  const preferFullscreenRef = useRef(
-    (() => {
-      try {
-        return localStorage.getItem('agarvaPreferFullscreen') === '1';
-      } catch {
-        return false;
-      }
-    })()
-  );
-
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
@@ -203,11 +264,39 @@ export function App() {
   const refreshCustomSkins = useCallback(async () => {
     const skins = await loadCustomSkins();
     setCustomSkins(skins);
+    setSkinsLoaded(true);
   }, []);
 
   useEffect(() => {
     void refreshCustomSkins();
   }, [refreshCustomSkins]);
+
+  useEffect(() => {
+    if (mode === 'menu') void refreshCustomSkins();
+  }, [mode, refreshCustomSkins]);
+
+  // Do not retain a local id for an admin/personal skin which no longer exists
+  // after a database restore or wipe.
+  useEffect(() => {
+    if (!skinsLoaded || !selectedSkinId || resolveSkinUrl(selectedSkinId)) return;
+    setSelectedSkinId(null);
+    selectedSkinIdRef.current = null;
+    saveSelectedSkinId(null);
+  }, [customSkins, selectedSkinId, skinsLoaded]);
+
+  useEffect(() => {
+    const wsUrl = new URL(resolveServerUrl());
+    wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+    wsUrl.pathname = '/api/public-config';
+    wsUrl.search = '';
+    void fetch(wsUrl.toString(), { cache: 'no-store' })
+      .then((response) => response.json())
+      .then((body: { telegramChannelUrl?: string; weeklyTopPrizes?: Record<PlayRoomMode, number> }) => {
+        setTelegramChannelUrl(body.telegramChannelUrl ?? '');
+        if (body.weeklyTopPrizes) setWeeklyTopPrizes((current) => ({ ...current, ...body.weeklyTopPrizes }));
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     try {
@@ -251,19 +340,28 @@ export function App() {
           setMenuName(msg.lastNick);
           playerNameRef.current = msg.lastNick;
         }
-        if (msg.skinId) {
-          setSelectedSkinId(msg.skinId);
-          saveSelectedSkinId(msg.skinId);
-          selectedSkinIdRef.current = msg.skinId;
+        if ('skinId' in msg) {
+          const skinId = msg.skinId || null;
+          setSelectedSkinId(skinId);
+          saveSelectedSkinId(skinId);
+          selectedSkinIdRef.current = skinId;
         }
-        if (msg.accountLogin) {
-          setAccountLogin(msg.accountLogin);
-          try { localStorage.setItem('agarvaAccountLogin', msg.accountLogin); } catch {}
+        if ('accountLogin' in msg) {
+          setAccountLogin(msg.accountLogin || null);
+          try {
+            if (msg.accountLogin) localStorage.setItem('agarvaAccountLogin', msg.accountLogin);
+            else localStorage.removeItem('agarvaAccountLogin');
+          } catch {}
         }
         if (msg.prefs) {
           const prefs = sanitizePlayerPrefs(msg.prefs);
           setPlayerPrefs(prefs);
           savePlayerPrefs(prefs);
+        }
+        if (msg.quest) {
+          setQuestView(msg.quest as QuestPublicView);
+          setQuestUpdatedAt(Date.now());
+          setQuestClock(Date.now());
         }
       } catch {}
       try { ws.close(); } catch {}
@@ -273,6 +371,56 @@ export function App() {
       try { if (ws) ws.close(); } catch {}
     };
   }, []);
+
+  // A game socket stays alive as a spectator below the menu. Request a fresh
+  // profile whenever the actual main menu is entered, so rewards earned just
+  // before that transition are not dependent on a previously delivered quest
+  // update. The standalone menu socket covers the same case without a game
+  // connection (including reopening the app directly into StartScreen).
+  useEffect(() => {
+    if (mode !== 'menu' || !deviceIdRef.current) return;
+    const payload = {
+      deviceId: deviceIdRef.current,
+      fingerprint: fingerprintRef.current,
+      lastNick: playerNameRef.current || undefined,
+      skinId: selectedSkinIdRef.current,
+    };
+    if (
+      sessionKindRef.current === 'multiplayer' &&
+      mpRef.current?.isConnected()
+    ) {
+      mpRef.current.syncProfile(payload);
+      return;
+    }
+
+    let closed = false;
+    let ws: WebSocket | null = null;
+    try {
+      ws = new WebSocket(resolveServerUrl());
+    } catch {
+      return;
+    }
+    ws.onopen = () => {
+      if (!closed) ws?.send(JSON.stringify({ type: 'syncProfile', ...payload }));
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(String(ev.data));
+        if (msg.type === 'playerProfile' && msg.quest) {
+          setQuestView(msg.quest as QuestPublicView);
+          setQuestUpdatedAt(Date.now());
+          setQuestClock(Date.now());
+        }
+      } catch {
+        /* ignore malformed profile response */
+      }
+      try { ws?.close(); } catch {}
+    };
+    return () => {
+      closed = true;
+      try { ws?.close(); } catch {}
+    };
+  }, [mode]);
 
   const startMenuEngine = useCallback(() => {
     const engine = new GameEngine({
@@ -390,12 +538,6 @@ export function App() {
     };
     const fullscreenDocument = document as Document & { webkitFullscreenElement?: Element | null };
     const entering = !(document.fullscreenElement || fullscreenDocument.webkitFullscreenElement);
-    preferFullscreenRef.current = entering;
-    try {
-      localStorage.setItem('agarvaPreferFullscreen', entering ? '1' : '0');
-    } catch {
-      /* preference remains available for this session */
-    }
     try {
       if (entering) {
         if (root.requestFullscreen) await root.requestFullscreen();
@@ -409,74 +551,30 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const keepEscapeForGame = (event: KeyboardEvent) => {
-      if (event.code !== 'Escape' || !preferFullscreenRef.current) return;
-      const target = event.target as HTMLElement | null;
-      if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable) return;
-      const opensGameMenu =
-        modeRef.current === 'playing' ||
-        modeRef.current === 'spectating' ||
-        (modeRef.current === 'menu' && menuOverLiveRef.current);
-      if (!opensGameMenu) return;
-      // Intercept Escape before the browser's fullscreen shortcut. The normal
-      // Escape handler below still opens/closes the in-game menu.
-      event.preventDefault();
-    };
-    const restorePreferredFullscreen = () => {
-      const fullscreenDocument = document as Document & { webkitFullscreenElement?: Element | null };
-      if (
-        !preferFullscreenRef.current ||
-        document.fullscreenElement ||
-        fullscreenDocument.webkitFullscreenElement
-      ) {
-        return;
-      }
-      const root = document.documentElement as HTMLElement & {
-        webkitRequestFullscreen?: () => Promise<void> | void;
-      };
-      // Browsers that reserve Escape may leave fullscreen before keydown can
-      // cancel it. Re-enter on the state change while the user gesture is fresh.
-      requestAnimationFrame(() => {
-        if (
-          !preferFullscreenRef.current ||
-          document.fullscreenElement ||
-          fullscreenDocument.webkitFullscreenElement
-        ) {
-          return;
-        }
-        Promise.resolve(root.requestFullscreen?.() ?? root.webkitRequestFullscreen?.()).catch(() => {});
-      });
-    };
-    window.addEventListener('keydown', keepEscapeForGame, true);
-    document.addEventListener('fullscreenchange', restorePreferredFullscreen);
-    document.addEventListener('webkitfullscreenchange', restorePreferredFullscreen);
-    return () => {
-      window.removeEventListener('keydown', keepEscapeForGame, true);
-      document.removeEventListener('fullscreenchange', restorePreferredFullscreen);
-      document.removeEventListener('webkitfullscreenchange', restorePreferredFullscreen);
-    };
-  }, []);
-
-  useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
       if (e.code !== 'Escape') return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (chatOpenRef.current) {
+      const consume = () => {
         e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+      };
+      if (chatOpenRef.current) {
+        consume();
         setChatOpen(false);
         setChatFocused(false);
         return;
       }
       if (showAdminSettings || showSkinPicker || showPlayerSettings) {
         if (e.code === 'Escape' && showSkinPicker) {
-          e.preventDefault();
+          consume();
           setShowSkinPicker(false);
         }
         return;
       }
       if (modeRef.current === 'playing') {
-        e.preventDefault();
+        consume();
         setShowEscapeMenu((prev) => {
           if (!prev) {
             setMenuName(playerNameRef.current || menuName);
@@ -486,7 +584,7 @@ export function App() {
         return;
       }
       if (modeRef.current === 'spectating') {
-        e.preventDefault();
+        consume();
         const state = gameStateRef.current;
         const savedId = spectateReturnPlayerIdRef.current;
         if (state && savedId) {
@@ -507,12 +605,14 @@ export function App() {
       // Escape from that preview restores the actual room instead of trapping
       // the overlay on the preview selection.
       if (modeRef.current === 'menu' && menuOverLiveRef.current) {
-        e.preventDefault();
+        consume();
         setPlayMode(connectedPlayMode);
       }
     };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
+    // Capture the key before browser/game canvas handlers. Once the game consumes
+    // Escape, it must not also reach the browser fullscreen shortcut.
+    window.addEventListener('keydown', handleEsc, true);
+    return () => window.removeEventListener('keydown', handleEsc, true);
   }, [showAdminSettings, showSkinPicker, showPlayerSettings, menuName, connectedPlayMode]);
 
   // Enter toggles chat in multiplayer (playing, dead, or spectating)
@@ -597,8 +697,14 @@ export function App() {
       onChat: (msg: ChatLine) => {
         setChatMessages((prev) => [
           ...prev.slice(-79),
-          { name: msg.name, text: msg.text, t: msg.t, color: msg.color, fromTg: msg.fromTg },
+          { name: msg.name, text: msg.text, t: msg.t, color: msg.color, fromTg: msg.fromTg, level: msg.level, hideLevel: msg.hideLevel },
         ]);
+      },
+      onPrivateChat: (msg: ChatLine) => {
+        setPrivateChats((prev) => ({
+          ...prev,
+          [msg.name]: [...(prev[msg.name] ?? []).slice(-79), { name: msg.name, text: msg.text, t: msg.t, color: msg.color, level: msg.level, hideLevel: msg.hideLevel }],
+        }));
       },
       onSettings: (settings: GameplayConfig) => {
         const clean = sanitizeGameplayConfig(settings);
@@ -641,7 +747,8 @@ export function App() {
         lastNick?: string;
         skinId?: string;
         prefs?: Record<string, unknown>;
-        accountLogin?: string;
+        accountLogin?: string | null;
+        quest?: QuestPublicView;
       }) => {
         if (profile.deviceId) {
           deviceIdRef.current = profile.deviceId;
@@ -655,18 +762,25 @@ export function App() {
           setMenuName(profile.lastNick);
           playerNameRef.current = profile.lastNick;
         }
-        if (profile.skinId) {
-          setSelectedSkinId(profile.skinId);
-          saveSelectedSkinId(profile.skinId);
-          selectedSkinIdRef.current = profile.skinId;
+        if ('skinId' in profile) {
+          const skinId = profile.skinId || null;
+          setSelectedSkinId(skinId);
+          saveSelectedSkinId(skinId);
+          selectedSkinIdRef.current = skinId;
         }
-        if (profile.accountLogin) {
-          setAccountLogin(profile.accountLogin);
+        if ('accountLogin' in profile) {
+          setAccountLogin(profile.accountLogin || null);
           try {
-            localStorage.setItem('agarvaAccountLogin', profile.accountLogin);
+            if (profile.accountLogin) localStorage.setItem('agarvaAccountLogin', profile.accountLogin);
+            else localStorage.removeItem('agarvaAccountLogin');
           } catch {
             /* ignore */
           }
+        }
+        if (profile.quest) {
+          setQuestView(profile.quest);
+          setQuestUpdatedAt(Date.now());
+          setQuestClock(Date.now());
         }
         if (profile.prefs) {
           const prefs = sanitizePlayerPrefs(profile.prefs as Partial<PlayerPrefs>);
@@ -736,7 +850,7 @@ export function App() {
       onAdminBotLogs: (text: string) => {
         setTelegramBotLogs(text);
       },
-      onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[], ownedIds?: string[]) => {
+      onState: (state: GameState, you: Player | undefined, lb: { name: string; score: number; isBot: boolean }[], ownedIds?: string[], leader?: { name: string; skin?: string; score: number }) => {
         gameStateRef.current = state;
         if (ownedIds && ownedIds.length > 0) {
           ownedIdsRef.current = ownedIds;
@@ -769,6 +883,7 @@ export function App() {
           currentPlayerRef.current = undefined;
         }
         setLeaderboard(lb);
+        setCenterLeader(leader ?? null);
       },
       onDied: () => {
         if (lastAliveCenterRef.current) {
@@ -803,6 +918,7 @@ export function App() {
     (name: string, serverUrl: string, password?: string, mode: PlayRoomMode = 'classic', team?: 'blue' | 'red') => {
       setConnectionError(null);
       setIsConnecting(true);
+      playStartLevelRef.current = questView?.level ?? playStartLevelRef.current ?? 0;
       const liveClient = mpRef.current;
       if (
         liveClient &&
@@ -867,10 +983,33 @@ export function App() {
       setIsConnecting(true);
       const liveClient = mpRef.current;
       if (liveClient && sessionKindRef.current === 'multiplayer') {
-        // Use the existing socket so the server releases the old room (and
-        // any fight slot) before making this session a spectator in the new one.
+        // Same room after menu return: still re-enter spectate UI (old early-return
+        // left the main menu stuck on screen).
         if (liveClient.getRoomMode() === mode) {
+          menuOverLiveRef.current = false;
           setIsConnecting(false);
+          setShowEscapeMenu(false);
+          setPlayMode(mode);
+          setConnectedPlayMode(mode);
+          setLiveRoomSpectators(0);
+          playerIdRef.current = null;
+          ownedIdsRef.current = [];
+          currentPlayerRef.current = undefined;
+          setCurrentPlayer(undefined);
+          setFrozen(false);
+          setMode('spectating');
+          spectateReturnModeRef.current = 'menu';
+          spectateReturnPlayerIdRef.current = null;
+          const ww = mode === 'soloFight' ? defaultSoloFightConfig.worldWidth : gameConfig.worldWidth;
+          const wh = mode === 'soloFight' ? defaultSoloFightConfig.worldHeight : gameConfig.worldHeight;
+          if (!spectateTargetRef.current) {
+            spectateTargetRef.current = lastAliveCenterRef.current
+              ? { ...lastAliveCenterRef.current }
+              : { x: ww / 2, y: wh / 2 };
+          }
+          liveClient.enterSpectate();
+          const st = spectateTargetRef.current;
+          if (st) liveClient.sendInput(st.x, st.y);
           return;
         }
         menuOverLiveRef.current = false;
@@ -885,6 +1024,7 @@ export function App() {
         currentPlayerRef.current = undefined;
         setCurrentPlayer(undefined);
         setFrozen(false);
+        setMode('spectating');
         liveClient.setRoomMode(mode);
         liveClient.setRoomTeam(undefined);
         liveClient.enterSpectate();
@@ -901,6 +1041,9 @@ export function App() {
       setLiveRoomSpectators(0);
       setSessionKind('multiplayer');
       sessionKindRef.current = 'multiplayer';
+      // Hide the main menu before the first welcome frame. The server will
+      // acknowledge this fresh spectator join with welcome + initial state.
+      setMode('spectating');
       serverUrlRef.current = resolveServerUrl();
       spectateReturnModeRef.current = 'menu';
       spectateReturnPlayerIdRef.current = null;
@@ -926,7 +1069,7 @@ export function App() {
       mpRenderRef.current = () => client.getRenderState();
       client.connect(serverUrlRef.current, { spectate: true, mode });
     },
-    [disconnectMultiplayer, attachMpCallbacks, gameConfig.worldWidth, gameConfig.worldHeight, menuName, playMode]
+    [disconnectMultiplayer, attachMpCallbacks, gameConfig.worldWidth, gameConfig.worldHeight, menuName, playMode, questView?.level]
   );
 
   const handleMouseMove = useCallback((x: number, y: number) => {
@@ -986,6 +1129,14 @@ export function App() {
     if (!engineRef.current || !playerIdRef.current) return;
     engineRef.current.addMass(playerIdRef.current, gameConfig.adminMassBoost);
   }, [gameConfig.adminMassBoost]);
+
+  const handleSkipQuest = useCallback(() => {
+    if (showEscapeMenuRef.current || chatOpenRef.current) return;
+    if (!isAdminRef.current) return;
+    if (sessionKindRef.current === 'multiplayer') {
+      mpRef.current?.adminSkipQuest();
+    }
+  }, []);
 
   const handleSpawnVirus = useCallback((x: number, y: number) => {
     if (showEscapeMenuRef.current || chatOpenRef.current) return;
@@ -1359,9 +1510,56 @@ export function App() {
     }
   }, [playerPrefs]);
 
+  const acknowledgeLevelReward = useCallback((level: number) => {
+    acknowledgedLevelRewardsRef.current.add(level);
+    playStartLevelRef.current = Math.max(playStartLevelRef.current ?? 0, level);
+    setLevelRewardQueue((queue) => queue.filter((item) => item !== level));
+    setQuestView((view) =>
+      view
+        ? {
+            ...view,
+            pendingLevelRewards: (view.pendingLevelRewards ?? []).filter((item) => item !== level),
+          }
+        : view
+    );
+    const wsUrl = new URL(resolveServerUrl());
+    wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+    wsUrl.pathname = '/api/level-rewards/ack';
+    wsUrl.search = '';
+    void fetch(wsUrl.toString(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deviceId: deviceIdRef.current, level }),
+    });
+  }, []);
+
+  const buyShopSkin = useCallback(async (skin: SkinInfo) => {
+    const wsUrl = new URL(resolveServerUrl());
+    wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+    wsUrl.pathname = '/api/shop/buy';
+    wsUrl.search = '';
+    const response = await fetch(wsUrl.toString(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deviceId: deviceIdRef.current, skinId: skin.id }),
+    });
+    const body = await response.json() as { error?: string; quest?: QuestPublicView };
+    if (!response.ok) throw new Error(body.error || 'Не удалось купить скин');
+    if (body.quest) setQuestView(body.quest);
+    await refreshCustomSkins();
+  }, [refreshCustomSkins]);
+
   const handleMentionNick = useCallback((name: string) => {
     if (sessionKindRef.current !== 'multiplayer') return;
     setChatMention(`${name}: `);
+    setChatOpen(true);
+  }, []);
+
+  const handleOpenPrivateChat = useCallback((name: string) => {
+    if (sessionKindRef.current !== 'multiplayer') return;
+    if (name.trim().toLocaleLowerCase() === playerNameRef.current.trim().toLocaleLowerCase()) return;
+    setPrivateChats((prev) => prev[name] ? prev : { ...prev, [name]: [] });
+    setOpenPrivateWith(name);
     setChatOpen(true);
   }, []);
 
@@ -1502,13 +1700,40 @@ export function App() {
     }
   }, [menuName, menuPassword]);
 
-  const handleWipeDatabase = useCallback(() => {
+  const handleWipeDatabase = useCallback(async () => {
+    setAdminSettingsError(null);
+    try {
+      const wsUrl = new URL(resolveServerUrl());
+      wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+      wsUrl.pathname = '/api/admin/wipe';
+      wsUrl.search = '';
+      const response = await fetch(wsUrl.toString(), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          adminNick: adminSettingsNameRef.current || menuName,
+          adminPassword: adminPasswordRef.current || menuPassword,
+          confirmation: 'confirm',
+        }),
+      });
+      const body = await response.json() as { error?: string; message?: string };
+      if (!response.ok) throw new Error(body.error || 'Не удалось очистить базу');
+      setSelectedSkinId(null);
+      selectedSkinIdRef.current = null;
+      saveSelectedSkinId(null);
+      setAdminSaveNotice(body.message || 'База данных очищена');
+    } catch (error) {
+      setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось очистить базу');
+    }
+  }, [menuName, menuPassword]);
+
+  const handleRestartClassic = useCallback(() => {
     setAdminSettingsError(null);
     if (!mpRef.current || !isAdminRef.current) {
-      setAdminSettingsError('Очистка БД доступна только в активном подключении администратора');
+      setAdminSettingsError('Перезагрузка Classic доступна только в активном подключении администратора');
       return;
     }
-    mpRef.current.adminWipeDatabase();
+    mpRef.current.adminRestartClassic();
   }, []);
 
   const handleGetTelegramBotLogs = useCallback(() => {
@@ -1524,10 +1749,20 @@ export function App() {
   const menuOverLive = mode === 'menu' && sessionKind === 'multiplayer' && !!mpRef.current;
   // One always-on menu socket receives atomic occupancy for every room.
   const lobbyStats = useLobbySnapshot(showMenuOverlay);
+  const modeTops = useModeTops(showMenuOverlay);
   const roomStats = lobbyStats[playMode];
   const adminKeysEnabled = isAdmin && mode === 'playing' && !showEscapeMenu;
   const gameplayKeysEnabled = mode === 'playing' && !showEscapeMenu;
   const hudScale = hudSizeScale(playerPrefs.hudSize);
+  const levelSkinRewards: Record<number, SkinInfo[]> = {};
+  for (const [levelText, skin] of Object.entries(LEVEL_SKIN_REWARDS)) {
+    const level = Number(levelText);
+    levelSkinRewards[level] = [{ ...skin, url: resolveSkinUrl(skin.id) ?? '' }];
+  }
+  for (const skin of customSkins) {
+    if (skin.kind !== 'level' || !skin.level) continue;
+    (levelSkinRewards[skin.level] ??= []).push(skin);
+  }
 
   if (!ready || !hudState) {
     return (
@@ -1583,6 +1818,7 @@ export function App() {
         onForceMerge={handleForceMerge}
         onKickAt={handleKickAt}
         onSpawnBot={handleSpawnBot}
+        onSkipQuest={handleSkipQuest}
         adminKeysEnabled={adminKeysEnabled}
         gameplayKeysEnabled={gameplayKeysEnabled}
         onSpectateMove={mode === 'spectating' ? handleSpectatePick : undefined}
@@ -1600,6 +1836,10 @@ export function App() {
             setChatFocused(false);
           }
         }}
+        onToggleMobileChat={() => {
+          if (sessionKindRef.current === 'multiplayer') setChatOpen((open) => !open);
+        }}
+        centerLeader={centerLeader}
       />
 
       {showMenuOverlay && (
@@ -1629,7 +1869,9 @@ export function App() {
           roomBlueMembers={roomStats.blueMembers}
           roomRedMembers={roomStats.redMembers}
           lobbyStats={lobbyStats}
-          soloFightTop={[]}
+          modeTops={modeTops.tops}
+          weeklyTopEndsAt={modeTops.weeklyEndsAt}
+          weeklyTopPrizes={weeklyTopPrizes}
           skinPreviewUrl={selectedSkinUrl}
           accountLogin={accountLogin}
           registerError={registerError}
@@ -1640,6 +1882,23 @@ export function App() {
           passwordResetNotice={passwordResetNotice}
           passwordResetBusy={passwordResetBusy}
           passwordResetCodeSent={passwordResetCodeSent}
+          questLevel={questView?.level ?? 1}
+          questXpIntoLevel={questView?.xpIntoLevel ?? 0}
+          questXpPerLevel={questView?.xpPerLevel ?? 100}
+          questAgarviki={questView?.agarviki ?? 0}
+          questTitle={questView?.title ?? 'Задание загружается…'}
+          questProgressText={
+            questProgressText ?? 'Сыграйте, чтобы прогресс пошёл'
+          }
+          showQuestHud={playerPrefs.showQuestHud}
+          onToggleShowQuestHud={(next) => {
+            const prefs = sanitizePlayerPrefs({ ...playerPrefs, showQuestHud: next });
+            setPlayerPrefs(prefs);
+            savePlayerPrefs(prefs);
+          }}
+          claimedLevelRewards={questView?.claimedLevelRewards ?? []}
+          levelSkinRewards={levelSkinRewards}
+          telegramChannelUrl={telegramChannelUrl}
           onRegisterAccount={(login, password) => {
             setRegisterBusy(true);
             setRegisterError(null);
@@ -1805,20 +2064,58 @@ export function App() {
         onDownloadDb={handleDownloadDb}
         onUploadDb={handleUploadDb}
         onWipeDatabase={handleWipeDatabase}
+        onRestartClassic={handleRestartClassic}
         onGetBotLogs={handleGetTelegramBotLogs}
         botLogs={telegramBotLogs}
         customSkins={customSkins}
-        onUploadSkin={async (file, name) => {
+        telegramChannelUrl={telegramChannelUrl}
+        weeklyTopPrizes={weeklyTopPrizes}
+        onSaveWeeklyTopPrizes={async (prizes) => {
+          const wsUrl = new URL(resolveServerUrl());
+          wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+          wsUrl.pathname = '/api/admin/public-config'; wsUrl.search = '';
+          const response = await fetch(wsUrl.toString(), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+            adminNick: adminSettingsNameRef.current || menuName, adminPassword: adminPasswordRef.current || menuPassword,
+            telegramChannelUrl, weeklyTopPrizes: prizes,
+          }) });
+          const body = await response.json() as { error?: string; weeklyTopPrizes?: Record<PlayRoomMode, number> };
+          if (!response.ok) throw new Error(body.error || 'Не удалось сохранить награды');
+          if (body.weeklyTopPrizes) setWeeklyTopPrizes(body.weeklyTopPrizes);
+          setAdminSaveNotice('Недельные награды сохранены');
+        }}
+        onSaveTelegramChannel={async (url) => {
+          const wsUrl = new URL(resolveServerUrl());
+          wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+          wsUrl.pathname = '/api/admin/public-config';
+          wsUrl.search = '';
+          const response = await fetch(wsUrl.toString(), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              adminNick: adminSettingsNameRef.current || menuName,
+              adminPassword: adminPasswordRef.current || menuPassword,
+              telegramChannelUrl: url,
+            }),
+          });
+          const body = await response.json() as { error?: string; telegramChannelUrl?: string };
+          if (!response.ok) throw new Error(body.error || 'Не удалось сохранить канал');
+          setTelegramChannelUrl(body.telegramChannelUrl ?? '');
+          setAdminSaveNotice('Ссылка на Telegram-канал сохранена');
+        }}
+        onUploadSkin={async (file, name, kind, price, level) => {
           setAdminSettingsError(null);
           try {
             await uploadCustomSkin(
               file,
               name,
               adminSettingsNameRef.current || menuName,
-              adminPasswordRef.current || menuPassword
+              adminPasswordRef.current || menuPassword,
+              kind,
+              price,
+              level
             );
             await refreshCustomSkins();
-            setAdminSaveNotice('Скин добавлен и доступен всем игрокам');
+            setAdminSaveNotice(kind === 'shop' ? 'Скин добавлен в магазин' : kind === 'level' ? 'Скин добавлен как награда за уровень' : 'Скин добавлен и доступен всем игрокам');
           } catch (error) {
             setAdminSettingsError(error instanceof Error ? error.message : 'Не удалось добавить скин');
             throw error;
@@ -1849,9 +2146,43 @@ export function App() {
       <SkinPicker
         open={showSkinPicker}
         selectedId={selectedSkinId}
+        unlockedSkinIds={questView?.unlockedSkinIds ?? []}
+        agarviki={questView?.agarviki ?? 0}
+        onBuy={buyShopSkin}
         onSelect={handleSelectSkin}
         onClose={() => setShowSkinPicker(false)}
       />
+
+      {mode === 'menu' && levelRewardQueue.length > 0 && (() => {
+        const level = levelRewardQueue[0];
+        const skins = levelSkinRewards[level] ?? [];
+        return (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-950/95 p-5 pointer-events-auto">
+            <div className="relative w-full max-w-md overflow-hidden rounded-3xl border border-amber-300/40 bg-gradient-to-b from-amber-500/20 to-slate-950 p-8 text-center shadow-2xl">
+              <button
+                type="button"
+                aria-label="Закрыть"
+                onClick={() => acknowledgeLevelReward(level)}
+                className="absolute right-4 top-4 rounded-full bg-white/10 px-3 py-1 text-xl text-white hover:bg-white/20"
+              >×</button>
+              <div className="text-amber-200 text-sm font-bold uppercase tracking-[0.2em]">Новый уровень</div>
+              <h2 className="mt-2 text-4xl font-black text-white">Уровень {level}!</h2>
+              <div className="mt-5 text-2xl font-bold text-amber-300">+10 агарвиков</div>
+              {skins.length > 0 && (
+                <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  {skins.map((skin) => (
+                    <div key={skin.id}>
+                      {skin.url && <img src={skin.url} alt={skin.name} className="mx-auto h-28 w-28 rounded-full border-4 border-amber-200 object-cover shadow-xl" />}
+                      <div className="mt-3 text-lg font-bold text-white">Скин «{skin.name}»</div>
+                      <div className="text-sm text-slate-300">Добавлен в личные скины</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {(mode !== 'menu' || menuOverLive) && !showEscapeMenu && !isTouchDevice && (
         <div
@@ -1870,6 +2201,7 @@ export function App() {
                 entries={leaderboard}
                 currentPlayerName={currentPlayer?.name || playerNameRef.current}
                 onClickNick={sessionKind === 'multiplayer' ? handleMentionNick : undefined}
+                onPrivateMessage={sessionKind === 'multiplayer' ? handleOpenPrivateChat : undefined}
                 spectators={liveRoomSpectators}
               />
             )}
@@ -1902,10 +2234,11 @@ export function App() {
         </div>
       )}
 
-      {sessionKind === 'multiplayer' && (mode !== 'menu' || menuOverLive) && !showEscapeMenu && !isTouchDevice && (
+      {sessionKind === 'multiplayer' && (mode !== 'menu' || menuOverLive) && !showEscapeMenu && (
         <div style={{ zoom: hudScale } as React.CSSProperties}>
           <ChatPanel
             messages={chatMessages}
+            privateChats={privateChats}
             visible={
               mode === 'playing' ||
               mode === 'dead' ||
@@ -1922,17 +2255,37 @@ export function App() {
               setChatFocused(false);
             }}
             onSend={handleSendChat}
+            onSendPrivate={(name, text) => {
+              if (name.trim().toLocaleLowerCase() !== playerNameRef.current.trim().toLocaleLowerCase()) {
+                mpRef.current?.sendPrivateMessage(name, text);
+              }
+            }}
             onInputFocusChange={setChatFocused}
             onClickNick={handleMentionNick}
+            onPrivateMessage={handleOpenPrivateChat}
             mentionPrefix={chatMention}
             onMentionConsumed={() => setChatMention(null)}
+            openPrivateWith={openPrivateWith}
+            onPrivateOpened={() => setOpenPrivateWith(null)}
+            ownName={playerNameRef.current}
+            mobileLayout={isTouchDevice ? playerPrefs.mobileControls.chat : undefined}
           />
         </div>
       )}
 
       {mode === 'playing' && !showEscapeMenu && (
         <div style={{ zoom: hudScale } as React.CSSProperties}>
-          <HUD player={currentPlayer} fps={fps} pingMs={pingMs} onRespawn={handleRespawn} />
+          <HUD
+            player={currentPlayer}
+            fps={fps}
+            pingMs={pingMs}
+            onRespawn={handleRespawn}
+            showQuest={!!accountLogin && playerPrefs.showQuestHud && !!questView}
+            questTitle={questView?.title}
+            questProgressText={
+              questProgressText
+            }
+          />
         </div>
       )}
 

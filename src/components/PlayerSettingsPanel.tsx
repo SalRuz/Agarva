@@ -28,6 +28,7 @@ type BindTarget = BindKey | null;
 
 export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSettingsPanelProps) {
   const [listening, setListening] = useState<BindTarget>(null);
+  const [isTouch] = useState(() => typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window));
 
   useEffect(() => {
     if (!open) return;
@@ -138,6 +139,15 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
   const stopWheel: WheelEventHandler = (e) => {
     e.stopPropagation();
   };
+  const updateMobileControl = (id: keyof PlayerPrefs['mobileControls'], key: 'x' | 'y' | 'size', value: number) => {
+    onChange({
+      ...prefs,
+      mobileControls: {
+        ...prefs.mobileControls,
+        [id]: { ...prefs.mobileControls[id], [key]: value },
+      },
+    });
+  };
 
   return (
     <div
@@ -214,6 +224,50 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
           </label>
         </section>
 
+        <section className="space-y-2 mb-5">
+          <h3 className="text-white font-semibold">Курсор</h3>
+          <label className="flex items-center justify-between rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white text-sm">
+            <span>Системный курсор</span>
+            <input
+              type="checkbox"
+              checked={prefs.systemCursor}
+              onChange={(e) => toggle('systemCursor', e.target.checked)}
+            />
+          </label>
+        </section>
+
+        <section className="space-y-2 mb-5">
+          <h3 className="text-white font-semibold">Профиль</h3>
+          <label className="flex items-center justify-between rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white text-sm">
+            <span>Скрыть мой уровень в топе и чате</span>
+            <input
+              type="checkbox"
+              checked={prefs.hideLevel}
+              onChange={(e) => toggle('hideLevel', e.target.checked)}
+            />
+          </label>
+        </section>
+
+        {isTouch ? (
+          <section className="space-y-3">
+            <h3 className="text-white font-semibold">Мобильные бинды</h3>
+            <p className="text-xs text-slate-400">Настройте расположение и размер экранных кнопок. Значения сохраняются на этом устройстве.</p>
+            {(Object.entries(prefs.mobileControls) as [keyof PlayerPrefs['mobileControls'], { x: number; y: number; size: number }][]).map(([id, control]) => (
+              <div key={id} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-sm font-medium text-white">{{ joystick: 'Джойстик', split: 'Деление', eject: 'Выброс массы', chat: 'Чат' }[id]}</div>
+                <div className="grid grid-cols-3 gap-2 text-xs text-slate-300">
+                  {([['x', 'Горизонталь'], ['y', 'Вертикаль'], ['size', 'Размер']] as const).map(([key, label]) => (
+                    <label key={key} className="space-y-1">
+                      <span>{label}</span>
+                      <input type="range" min={key === 'size' ? 40 : 4} max={key === 'size' ? 160 : 96} value={control[key]} onChange={(e) => updateMobileControl(id, key, Number(e.target.value))} className="w-full" />
+                      <span className="block text-center text-slate-400">{control[key]}{key === 'size' ? 'px' : '%'}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </section>
+        ) : (
         <section className="space-y-2">
           <h3 className="text-white font-semibold">Клавиши и мышь</h3>
           <p className="text-xs text-slate-400 -mt-1 mb-1">
@@ -225,6 +279,7 @@ export function PlayerSettingsPanel({ open, prefs, onChange, onClose }: PlayerSe
           {bindRow('keyMultibox', 'keyMultiboxSecondary', 'Мультибокс', prefs.keyMultibox, prefs.keyMultiboxSecondary)}
           {bindRow('keyCoords', 'keyCoordsSecondary', 'Координаты в чат', prefs.keyCoords, prefs.keyCoordsSecondary)}
         </section>
+        )}
       </div>
     </div>
   );

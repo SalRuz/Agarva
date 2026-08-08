@@ -88,7 +88,7 @@ export function getPlayerViewRadius(
     sumR += cell.radius;
     if (cell.radius > maxR) maxR = cell.radius;
   }
-  return Math.min(
+  return config.foodViewScale * Math.min(
     config.foodViewMax,
     config.foodViewRadius + sumR * config.foodViewPerSumRadius + maxR * config.foodViewPerMaxRadius
   );

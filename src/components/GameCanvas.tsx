@@ -8,7 +8,6 @@ import {
   WORLD_WIDTH,
   WORLD_HEIGHT,
   getEntityViewRadius,
-  isWithinViewRadius,
   isEntityNearView,
 } from '../utils/gameUtils';
 import type { GameplayConfig } from '../../shared/gameConfig';
@@ -57,7 +56,8 @@ interface GameCanvasProps {
   onForceMerge?: () => void;
   onKickAt?: (x: number, y: number) => void;
   onSpawnBot?: (x: number, y: number) => void;
-  /** Admin hotkeys (1–6, Q) only when true — must be in-game as salruz */
+  onSkipQuest?: () => void;
+  /** Admin hotkeys (1–7, Q) only when true — must be in-game as salruz */
   adminKeysEnabled?: boolean;
   /** Gameplay keys (Space split) only when actively playing */
   gameplayKeysEnabled?: boolean;
@@ -73,6 +73,8 @@ interface GameCanvasProps {
   onSendCoords?: () => void;
   /** Clicking the world dismisses chat compose mode. */
   onWorldPointerDown?: () => void;
+  onToggleMobileChat?: () => void;
+  centerLeader?: { name: string; skin?: string; score: number } | null;
 }
 
 export function GameCanvas({
@@ -97,6 +99,7 @@ export function GameCanvas({
   onForceMerge,
   onKickAt,
   onSpawnBot,
+  onSkipQuest,
   adminKeysEnabled = false,
   gameplayKeysEnabled = false,
   onSpectateMove,
@@ -109,6 +112,8 @@ export function GameCanvas({
   onMultibox,
   onSendCoords,
   onWorldPointerDown,
+  onToggleMobileChat,
+  centerLeader = null,
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef({
@@ -138,6 +143,7 @@ export function GameCanvas({
   const onForceMergeRef = useRef(onForceMerge);
   const onKickAtRef = useRef(onKickAt);
   const onSpawnBotRef = useRef(onSpawnBot);
+  const onSkipQuestRef = useRef(onSkipQuest);
   const onFreezeRef = useRef(onFreeze);
   const adminKeysEnabledRef = useRef(adminKeysEnabled);
   const gameplayKeysEnabledRef = useRef(gameplayKeysEnabled);
@@ -148,6 +154,7 @@ export function GameCanvas({
   const skinImageRef = useRef<HTMLImageElement | null>(null);
   /** Cache remote skins by id for other players */
   const skinCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const centerLeaderRef = useRef(centerLeader);
   const onMultiboxRef = useRef(onMultibox);
   const onSendCoordsRef = useRef(onSendCoords);
   const onEjectRef = useRef(onEject);
@@ -167,6 +174,8 @@ export function GameCanvas({
   const lmbDownRef = useRef(false);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const pinchDistanceRef = useRef<number | null>(null);
+  const joystickRef = useRef<{ dx: number; dy: number; active: boolean }>({ dx: 0, dy: 0, active: false });
+  const [joystick, setJoystick] = useState({ dx: 0, dy: 0, active: false });
   const [touchControls] = useState(
     () => typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)
   );
@@ -202,6 +211,9 @@ export function GameCanvas({
   useEffect(() => {
     onSpawnBotRef.current = onSpawnBot;
   }, [onSpawnBot]);
+  useEffect(() => {
+    onSkipQuestRef.current = onSkipQuest;
+  }, [onSkipQuest]);
 
   useEffect(() => {
     onFreezeRef.current = onFreeze;
@@ -238,6 +250,9 @@ export function GameCanvas({
     img.src = skinUrl;
     skinImageRef.current = img;
   }, [skinUrl, prefs.disableSkins]);
+  useEffect(() => {
+    centerLeaderRef.current = centerLeader;
+  }, [centerLeader]);
 
   useEffect(() => {
     onMultiboxRef.current = onMultibox;
@@ -412,7 +427,8 @@ export function GameCanvas({
         targetX = center.x;
         targetY = center.y;
         const auto = computeAutoZoom(currentPlayer, width, height);
-        cameraRef.current.targetScale = auto * cameraRef.current.userZoom;
+        // Gameplay FOV is 1.5× wider: zoom the camera out by the same factor.
+        cameraRef.current.targetScale = (auto / 1.5) * cameraRef.current.userZoom;
         // Switching multibox ownership is a hard camera cut. Position updates for
         // the same player remain smooth below. Use physical radii here, not their
         // visual growth/shrink interpolation, so a small↔large switch cannot
@@ -420,7 +436,7 @@ export function GameCanvas({
         if (cameraPlayerIdRef.current !== currentPlayer.id) {
           cameraPlayerIdRef.current = currentPlayer.id;
           cameraRef.current.targetScale =
-            computeAutoZoom(currentPlayer, width, height, false) * cameraRef.current.userZoom;
+            (computeAutoZoom(currentPlayer, width, height, false) / 1.5) * cameraRef.current.userZoom;
           cameraRef.current.x = targetX;
           cameraRef.current.y = targetY;
           cameraRef.current.scale = cameraRef.current.targetScale;
@@ -476,14 +492,64 @@ export function GameCanvas({
       ctx.lineWidth = 10;
       ctx.strokeRect(0, 0, gameState.worldWidth, gameState.worldHeight);
 
+      // A deliberately quiet world-center monument: it is background art, not
+      // a physical entity, so it never affects visibility or collision physics.
+      const leader = centerLeaderRef.current;
+      if (leader) {
+        const cx = worldW / 2;
+        const cy = worldH / 2;
+        const radius = Math.min(worldW, worldH) * 0.055;
+        ctx.save();
+        ctx.globalAlpha = 0.22;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#facc15';
+        ctx.fill();
+        let leaderSkin: HTMLImageElement | null = null;
+        if (!prefsRef.current.disableSkins && leader.skin) {
+          leaderSkin = skinCacheRef.current.get(leader.skin) ?? null;
+          if (!leaderSkin) {
+            const url = resolveSkinUrl(leader.skin);
+            if (url) {
+              leaderSkin = new Image();
+              leaderSkin.decoding = 'async';
+              leaderSkin.src = url;
+              skinCacheRef.current.set(leader.skin, leaderSkin);
+            }
+          }
+          if (leaderSkin && (!leaderSkin.complete || leaderSkin.naturalWidth <= 0)) leaderSkin = null;
+        }
+        if (leaderSkin) {
+          ctx.beginPath();
+          ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+          ctx.clip();
+          ctx.drawImage(leaderSkin, cx - radius, cy - radius, radius * 2, radius * 2);
+        }
+        ctx.restore();
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.95)';
+        ctx.lineWidth = Math.max(4, radius * 0.09);
+        ctx.shadowColor = 'rgba(0,0,0,0.75)';
+        ctx.shadowBlur = 10;
+        ctx.stroke();
+        ctx.restore();
+        ctx.save();
+        ctx.font = `bold ${Math.max(16, radius * 0.28)}px Arial, Helvetica, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = 'rgba(255,255,255,0.65)';
+        ctx.fillText(`👑 ${leader.name}`, cx, cy + radius + Math.max(24, radius * 0.35));
+        ctx.restore();
+      }
+
       const viewerCenter =
         !spectating && currentPlayer && currentPlayer.cells.length > 0
           ? getPlayerCenter(currentPlayer)
           : { x: camera.x, y: camera.y };
       const viewMult = spectating ? cfg.spectateViewRadiusMult : cfg.playViewRadiusMult;
       const viewR = getEntityViewRadius(worldW, worldH, viewMult);
-      const inView = (x: number, y: number) =>
-        isWithinViewRadius(x, y, viewerCenter.x, viewerCenter.y, viewR);
       const entityInView = (x: number, y: number, r: number) =>
         isEntityNearView(x, y, r, viewerCenter.x, viewerCenter.y, viewR);
 
@@ -491,7 +557,7 @@ export function GameCanvas({
       // Use the entities' normal world radii instead of cosmetic screen-space
       // dots, so food density and scale match the classic renderer.
       for (const food of gameState.food) {
-        if (!inView(food.x, food.y)) continue;
+        if (!entityInView(food.x, food.y, food.radius)) continue;
         if (
           food.x < viewLeft - pad ||
           food.x > viewRight + pad ||
@@ -509,7 +575,7 @@ export function GameCanvas({
       // W uses its normal game radius too; snapshot selection already limits
       // this to real nearby ejects rather than cosmetic filler.
       for (const mass of gameState.ejectedMass) {
-        if (!inView(mass.x, mass.y)) continue;
+        if (!entityInView(mass.x, mass.y, mass.radius)) continue;
         if (
           mass.x < viewLeft - pad ||
           mass.x > viewRight + pad ||
@@ -786,6 +852,25 @@ export function GameCanvas({
           }
         }
       }
+      // A visible target makes touch steering predictable: it is only an aim
+      // marker and never changes the server-side movement physics.
+      if (joystickRef.current.active && currentPlayer?.cells.length) {
+        const center = getPlayerCenter(currentPlayer);
+        const joy = joystickRef.current;
+        const length = Math.hypot(joy.dx, joy.dy) || 1;
+        const aimDistance = 260;
+        const ax = center.x + (joy.dx / length) * aimDistance;
+        const ay = center.y + (joy.dy / length) * aimDistance;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+        ctx.fillStyle = 'rgba(56,189,248,0.35)';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([8, 8]);
+        ctx.beginPath(); ctx.moveTo(center.x, center.y); ctx.lineTo(ax, ay); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath(); ctx.arc(ax, ay, 16, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.restore();
+      }
 
       ctx.restore();
     };
@@ -1056,6 +1141,9 @@ export function GameCanvas({
         e.preventDefault();
         const m = mouseWorldRef.current;
         onSpawnBotRef.current?.(m.x, m.y);
+      } else if (e.code === 'Digit7' || e.code === 'Numpad7') {
+        e.preventDefault();
+        onSkipQuestRef.current?.();
       }
     },
     [onSplit, onEject, onAddMass]
@@ -1186,15 +1274,39 @@ export function GameCanvas({
           touchStartRef.current = null;
           pinchDistanceRef.current = null;
         }}
-        className="block cursor-crosshair touch-none"
+        className={`block touch-none ${prefs.systemCursor ? 'cursor-default' : 'cursor-crosshair'}`}
       />
       {touchControls && gameplayKeysEnabled && !isSpectating && !inputBlocked && (
-        <div className="absolute inset-x-0 bottom-5 z-30 flex items-end justify-between px-5 pointer-events-none">
-          <div className="h-24 w-24 rounded-full border-2 border-white/30 bg-black/25" aria-label="Сенсорный джойстик" />
-          <div className="flex gap-3 pointer-events-auto">
-            <button type="button" onTouchStart={(e) => { e.preventDefault(); onSplit(); }} className="h-16 w-16 rounded-full border border-white/35 bg-blue-600/80 text-xs font-bold text-white active:bg-blue-500">ДЕЛ</button>
-            <button type="button" onTouchStart={(e) => { e.preventDefault(); onEject(); }} className="h-16 w-16 rounded-full border border-white/35 bg-emerald-600/80 text-xs font-bold text-white active:bg-emerald-500">W</button>
+        <div className="absolute inset-0 z-30 pointer-events-none">
+          <div
+            className="absolute rounded-full border-2 border-white/35 bg-black/35 shadow-lg pointer-events-auto touch-none"
+            aria-label="Сенсорный джойстик"
+            style={{ width: prefs.mobileControls.joystick.size, height: prefs.mobileControls.joystick.size, left: `${prefs.mobileControls.joystick.x}%`, top: `${prefs.mobileControls.joystick.y}%`, transform: 'translate(-50%, -50%)' }}
+            onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); joystickRef.current.active = true; setJoystick({ ...joystickRef.current }); }}
+            onPointerMove={(e) => {
+              if (!joystickRef.current.active) return;
+              const rect = e.currentTarget.getBoundingClientRect(), max = rect.width * .36;
+              const dx = Math.max(-max, Math.min(max, e.clientX - (rect.left + rect.width / 2)));
+              const dy = Math.max(-max, Math.min(max, e.clientY - (rect.top + rect.height / 2)));
+              joystickRef.current = { dx, dy, active: true }; setJoystick({ dx, dy, active: true });
+              const player = currentPlayerRef.current;
+              if (player?.cells.length) {
+                const center = getPlayerCenter(player), length = Math.hypot(dx, dy);
+                if (length > 2) onMouseMoveRef.current(center.x + dx / length * 3500, center.y + dy / length * 3500);
+              }
+            }}
+            onPointerUp={() => { joystickRef.current = { dx: 0, dy: 0, active: false }; setJoystick(joystickRef.current); }}
+          >
+            <div className="absolute left-1/2 top-1/2 rounded-full border border-white/60 bg-sky-400/80 shadow" style={{ width: '42%', height: '42%', transform: `translate(calc(-50% + ${joystick.dx}px), calc(-50% + ${joystick.dy}px))` }} />
           </div>
+          {([
+            ['split', 'ДЕЛ', 'bg-blue-600/85', () => onSplit()],
+            ['eject', 'W', 'bg-emerald-600/85', () => onEject()],
+            ['chat', 'ЧАТ', 'bg-slate-700/90', () => onToggleMobileChat?.()],
+          ] as const).map(([id, label, color, action]) => {
+            const control = prefs.mobileControls[id];
+            return <button key={id} type="button" onPointerDown={(e) => { e.preventDefault(); action(); }} className={`absolute rounded-full border border-white/40 ${color} text-xs font-bold text-white shadow-lg pointer-events-auto touch-none active:scale-95`} style={{ width: control.size, height: control.size, left: `${control.x}%`, top: `${control.y}%`, transform: 'translate(-50%, -50%)' }}>{label}</button>;
+          })}
         </div>
       )}
       {frozen && !isSpectating && (

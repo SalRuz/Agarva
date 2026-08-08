@@ -1,4 +1,6 @@
 export type HudSizeMode = 'standard' | 'smaller' | 'evenSmaller';
+export type MobileControlId = 'joystick' | 'split' | 'eject' | 'chat';
+export type MobileControlLayout = Record<MobileControlId, { x: number; y: number; size: number }>;
 
 export interface PlayerPrefs {
   /** Show mass numbers on all cells (self / others / bots) */
@@ -6,6 +8,12 @@ export interface PlayerPrefs {
   hudSize: HudSizeMode;
   /** Disable skins for everyone (including self) */
   disableSkins: boolean;
+  /** Use the browser/OS cursor instead of the game crosshair. */
+  systemCursor: boolean;
+  /** Show active quest progress HUD while playing */
+  showQuestHud: boolean;
+  /** Do not show this account's level to other players. */
+  hideLevel: boolean;
   /** KeyboardEvent.code for split (default Space) */
   keySplit: string;
   /** Optional second binding for split */
@@ -26,12 +34,17 @@ export interface PlayerPrefs {
   keyCoords: string;
   /** Optional second binding for posting map sector */
   keyCoordsSecondary: string;
+  /** Screen-relative mobile control layout (percentages; button size in px). */
+  mobileControls: MobileControlLayout;
 }
 
 export const DEFAULT_PLAYER_PREFS: PlayerPrefs = {
   showMass: true,
   hudSize: 'standard',
   disableSkins: false,
+  systemCursor: false,
+  showQuestHud: false,
+  hideLevel: false,
   keySplit: 'Space',
   keySplitSecondary: '',
   keyEject: '',
@@ -42,6 +55,12 @@ export const DEFAULT_PLAYER_PREFS: PlayerPrefs = {
   keyMultiboxSecondary: '',
   keyCoords: 'KeyC',
   keyCoordsSecondary: '',
+  mobileControls: {
+    joystick: { x: 12, y: 82, size: 108 },
+    split: { x: 84, y: 78, size: 66 },
+    eject: { x: 72, y: 86, size: 58 },
+    chat: { x: 88, y: 58, size: 50 },
+  },
 };
 
 const STORAGE_KEY = 'agarPlayerPrefs';
@@ -92,10 +111,25 @@ export function sanitizePlayerPrefs(input: Partial<PlayerPrefs> | null | undefin
       : raw.showMassSelf !== undefined || raw.showMassOthers !== undefined || raw.showMassBots !== undefined
         ? !!(raw.showMassSelf ?? raw.showMassOthers ?? raw.showMassBots)
         : true;
+  const defaultControls = DEFAULT_PLAYER_PREFS.mobileControls;
+  const rawControls = (base.mobileControls ?? {}) as Partial<MobileControlLayout>;
+  const mobileControls = (Object.keys(defaultControls) as MobileControlId[]).reduce((result, id) => {
+    const candidate = rawControls[id];
+    const fallback = defaultControls[id];
+    result[id] = {
+      x: Number.isFinite(candidate?.x) ? Math.max(4, Math.min(96, Number(candidate!.x))) : fallback.x,
+      y: Number.isFinite(candidate?.y) ? Math.max(4, Math.min(96, Number(candidate!.y))) : fallback.y,
+      size: Number.isFinite(candidate?.size) ? Math.max(40, Math.min(160, Number(candidate!.size))) : fallback.size,
+    };
+    return result;
+  }, {} as MobileControlLayout);
   return {
     showMass,
     hudSize,
     disableSkins,
+    systemCursor: typeof base.systemCursor === 'boolean' ? base.systemCursor : false,
+    showQuestHud: typeof base.showQuestHud === 'boolean' ? base.showQuestHud : false,
+    hideLevel: typeof base.hideLevel === 'boolean' ? base.hideLevel : false,
     keySplit: typeof base.keySplit === 'string' && base.keySplit ? base.keySplit : 'Space',
     keySplitSecondary: typeof base.keySplitSecondary === 'string' ? base.keySplitSecondary : '',
     keyEject: typeof base.keyEject === 'string' ? base.keyEject : '',
@@ -109,6 +143,7 @@ export function sanitizePlayerPrefs(input: Partial<PlayerPrefs> | null | undefin
     keyCoords: typeof base.keyCoords === 'string' && base.keyCoords ? base.keyCoords : 'KeyC',
     keyCoordsSecondary:
       typeof base.keyCoordsSecondary === 'string' ? base.keyCoordsSecondary : '',
+    mobileControls,
   };
 }
 

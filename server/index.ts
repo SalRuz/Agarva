@@ -3,7 +3,7 @@ import { execSync } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomInt, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import 'dotenv/config';
 import { GameEngine } from '../shared/GameEngine';
@@ -20,11 +20,27 @@ import {
   CHAT_RATE_LIMIT_MS,
   ADMIN_PASSWORD,
 } from '../shared/constants';
-import { getPlayerCenter, isAdminName, createFood, getTotalMass } from '../shared/physics';
+import {
+  getPlayerCenter,
+  isAdminName,
+  createFood,
+  getTotalMass,
+} from '../shared/physics';
 import { getEntityViewRadius, isEntityNearView } from '../shared/sectors';
 import type { ClientMessage, ServerMessage, NetPlayer, StateMessage } from '../shared/protocol';
 import type { FightTeam } from '../shared/protocol';
 import type { Player } from '../shared/types';
+import {
+  applyQuestProgressValue,
+  createDefaultQuestProgress,
+  emptyQuestRunStats,
+  questValueFromRun,
+  sanitizeQuestProgress,
+  toQuestPublicView,
+  QUEST_DEFS,
+  type QuestProgress,
+  type QuestRunStats,
+} from '../shared/quests';
 import {
   type RoomMode,
   createSoloFightEngine,
@@ -60,18 +76,15 @@ import { startTelegramBot } from '../bot/index';
 const PORT = Number(process.env.PORT) || DEFAULT_SERVER_PORT;
 /** Physics stays at 30 Hz; mobile snapshots are sent at 10 Hz. */
 const STATE_SEND_MODULO = 3;
-/** Safety ceilings for admin-configurable per-snapshot entity limits. */
-const NETWORK_FOOD_MAX = 1000;
-const NETWORK_EJECT_MAX = 1000;
-/** Retain capped entities across snapshot boundaries so they do not pop in/out. */
+/** Retain virus snapshots briefly across a circular-FOV boundary. */
 const SNAPSHOT_STICKY_MS = 900;
 const SNAPSHOT_STICKY_VIEW_MULT = 1.28;
-const LOCAL_EJECT_PRIORITY_MS = 2_500;
 const CUSTOM_SKIN_MAX_BYTES = 10 * 1024 * 1024;
 const customSkinDir = join(process.cwd(), 'data', 'skins');
 const STATE_BACKPRESSURE_BYTES = 32_000;
 const BOT_CHAT_BUFFER_SIZE = 200;
 const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000;
+const QUEST_PROFILE_PUSH_MS = 10_000;
 
 interface ClientSession {
   ws: WebSocket;
@@ -108,14 +121,21 @@ interface ClientSession {
   lastSfHudKey: string;
   /** Last skin per entity sent to this client; removed when it leaves this FOV. */
   sentSkins: Map<string, string>;
-  /** Entity ids recently included in this client's capped snapshots. */
-  sentFoodUntil: Map<string, number>;
-  sentEjectUntil: Map<string, number>;
+  /** Virus ids recently included in this client's circular snapshots. */
   sentVirusUntil: Map<string, number>;
   /** Every entity id this client can still render until explicitly destroyed. */
   knownFoodIds: Set<string>;
   knownEjectIds: Set<string>;
   knownVirusIds: Set<string>;
+  /** Per-life quest counters while playing */
+  questRun: QuestRunStats | null;
+  /** In-memory quest state for the connected device (avoids reload lag). */
+  questProgress: QuestProgress | null;
+  lastQuestPushAt: number;
+  /** Last minute-quest condition sent to the client. */
+  questTimerRunning: boolean;
+  /** Account key for which this websocket is the quest-progress primary tab. */
+  questAccountKey: string | null;
 }
 
 interface BotChatLine {
@@ -220,6 +240,14 @@ function sanitizeChat(text: string): string {
 function startServer(attempt = 0) {
   const persistentStore = new PersistentStore();
   const botLogs = new BotLogBuffer();
+  const getCustomLevelSkinRewards = () => {
+    const rewards: Record<number, { id: string; name: string }[]> = {};
+    for (const skin of persistentStore.getCustomSkins()) {
+      if (skin.kind !== 'level' || !skin.level) continue;
+      (rewards[skin.level] ??= []).push({ id: skin.id, name: skin.name });
+    }
+    return rewards;
+  };
   let classicConfig: GameplayConfig = sanitizeGameplayConfig(
     persistentStore.getConfig() ?? defaultGameplayConfig
   );
@@ -262,6 +290,8 @@ function startServer(attempt = 0) {
   > = { duoFight: [], trioFight: [] };
 
   const clients = new Map<WebSocket, ClientSession>();
+  /** First connected websocket per account is allowed to advance quests. */
+  const questPrimaryByAccount = new Map<string, WebSocket>();
   const botChatLines: Record<RoomMode, BotChatLine[]> = {
     classic: [],
     soloFight: [],
@@ -272,6 +302,7 @@ function startServer(attempt = 0) {
   const botOutbox: BotOutboxMessage[] = [];
   let nextBotOutboxId = 1;
   const passwordResetCodes = new Map<string, PasswordResetCode>();
+  let lastClassicRecordAnnouncement = 0;
 
   function removePendingFightJoin(session: ClientSession) {
     for (let i = pendingSoloFightJoins.length - 1; i >= 0; i--) {
@@ -296,18 +327,51 @@ function startServer(attempt = 0) {
     return classicConfig;
   }
 
+  function sendSerialized(ws: WebSocket, serialized: string, bypassBackpressure = false) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    // Drop when client can't drain - prevents ping spikes from queue growth
+    if (!bypassBackpressure && ws.bufferedAmount > 128_000) return;
+    ws.send(serialized);
+  }
+
   function send(ws: WebSocket, msg: ServerMessage) {
-    if (ws.readyState === WebSocket.OPEN) {
-      // Drop when client can't drain - prevents ping spikes from queue growth
-      if (ws.bufferedAmount > 128_000) return;
-      ws.send(JSON.stringify(msg));
+    sendSerialized(ws, JSON.stringify(msg));
+  }
+
+  /** Pongs must not be discarded merely because a state packet is queued. */
+  function sendPong(ws: WebSocket, t: number) {
+    sendSerialized(ws, JSON.stringify({ type: 'pong', t }), true);
+  }
+
+  function claimQuestPrimary(session: ClientSession, accountLogin?: string): boolean {
+    const key = accountLogin?.trim().toLowerCase();
+    if (!key) {
+      session.questAccountKey = null;
+      return false;
     }
+    session.questAccountKey = key;
+    const current = questPrimaryByAccount.get(key);
+    if (!current || current.readyState !== WebSocket.OPEN) {
+      questPrimaryByAccount.set(key, session.ws);
+      return true;
+    }
+    return current === session.ws;
+  }
+
+  function isQuestPrimary(session: ClientSession, accountLogin?: string): boolean {
+    return claimQuestPrimary(session, accountLogin) && questPrimaryByAccount.get(session.questAccountKey!) === session.ws;
+  }
+
+  function beginQuestLife(session: ClientSession) {
+    session.questRun = emptyQuestRunStats();
+    session.questRun.startedFromZero = true;
   }
 
   function broadcastToRoom(room: RoomMode, msg: ServerMessage) {
+    const serialized = JSON.stringify(msg);
     for (const [ws, session] of clients) {
       if (session.room !== room) continue;
-      send(ws, msg);
+      sendSerialized(ws, serialized);
     }
   }
 
@@ -317,10 +381,54 @@ function startServer(attempt = 0) {
     if (queue.length > BOT_CHAT_BUFFER_SIZE) queue.splice(0, queue.length - BOT_CHAT_BUFFER_SIZE);
   }
 
-  function broadcastGameChat(room: RoomMode, name: string, text: string, color: string) {
+  function broadcastGameChat(
+    room: RoomMode,
+    name: string,
+    text: string,
+    color: string,
+    badge?: { level?: number; hideLevel?: boolean }
+  ) {
     const t = Date.now();
-    broadcastToRoom(room, { type: 'chat', name, text, t, color });
+    broadcastToRoom(room, { type: 'chat', name, text, t, color, ...badge });
     queueGameChat(room, name, text, t);
+  }
+
+  const weeklyEntries = (mode: RoomMode) =>
+    mode === 'classic'
+      ? persistentStore.getClassicRecords().map((record) => ({ name: record.name, score: record.mass }))
+      : [...persistentStore.getScores(mode).entries()]
+          .map(([name, score]) => ({ name, score }))
+          .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+          .slice(0, 20);
+
+  function centerLeaderFor(room: RoomMode): { name: string; skin?: string; score: number } | undefined {
+    if (room === 'classic') {
+      const record = persistentStore.getClassicRecords()[0];
+      if (record) return { name: record.name, skin: record.skin, score: record.mass };
+    }
+    return weeklyEntries(room)[0];
+  }
+
+  function processWeeklyTops(now = Date.now()) {
+    for (const mode of ['classic', 'soloFight', 'duoFight', 'trioFight'] as RoomMode[]) {
+      if (persistentStore.getWeeklyTopEndsAt(mode) > now) continue;
+      const winner = weeklyEntries(mode)[0];
+      let awarded = false;
+      if (winner) {
+        const deviceId = mode === 'classic'
+          ? persistentStore.getClassicRecords()[0]?.deviceId
+          : persistentStore.findAccountDeviceByNick(winner.name);
+        const prize = persistentStore.getWeeklyTopPrize(mode);
+        awarded = !!(deviceId && persistentStore.awardAgarviki(deviceId, prize));
+        if (awarded) {
+          broadcastGameChat(mode, '🏆 Система', `Игрок ${winner.name} получил ${prize} агарвиков за недельный топ!`, '#facc15');
+        }
+      }
+      persistentStore.resetWeeklyTop(mode, now);
+      if (!awarded && winner) {
+        broadcastGameChat(mode, '🏆 Система', `Недельный топ завершён. Награда не выдана: лидер без привязанного аккаунта.`, '#facc15');
+      }
+    }
   }
 
   function queueBotMessage(chatId: string, text: string) {
@@ -349,6 +457,33 @@ function startServer(attempt = 0) {
     };
     if (includeSkin) net.skin = p.skin || '';
     return net;
+  }
+
+  /**
+   * Leaderboard data is identical for every viewer in a room. Building it once
+   * per snapshot cycle avoids repeating the sort and profile lookup for every
+   * connected client without altering any state packet's contents.
+   */
+  function buildLeaderboardFor(engine: GameEngine): NonNullable<StateMessage['leaderboard']> {
+    const state = engine.getState();
+    return engine.getLeaderboard().map((row) => {
+      if (row.isBot) return row;
+      const pl = state.players.find((p) => p.name === row.name && p.cells.length > 0);
+      if (!pl) return row;
+      let level: number | undefined;
+      let hideLevel = false;
+      for (const s of clients.values()) {
+        if (!s.playerIds.includes(pl.id)) continue;
+        const profile = s.deviceId ? persistentStore.getPlayer(s.deviceId) : undefined;
+        hideLevel = profile?.prefs?.hideLevel === true;
+        if (!hideLevel) {
+          if (s.questProgress) level = toQuestPublicView(s.questProgress).level;
+          else if (profile?.accountLogin) level = toQuestPublicView(sanitizeQuestProgress(profile.quests)).level;
+        }
+        break;
+      }
+      return hideLevel ? { ...row, hideLevel: true } : level === undefined ? row : { ...row, level };
+    });
   }
 
   /**
@@ -428,7 +563,10 @@ function startServer(attempt = 0) {
     return removed;
   }
 
-  function buildStateFor(session: ClientSession, includeLeaderboard: boolean): StateMessage {
+  function buildStateFor(
+    session: ClientSession,
+    leaderboard?: NonNullable<StateMessage['leaderboard']>
+  ): StateMessage {
     const engine = engineFor(session.room);
     const cfg = configFor(session.room);
     const state = engine.getState();
@@ -460,24 +598,28 @@ function startServer(attempt = 0) {
     const viewR = getEntityViewRadius(ww, wh, viewMult);
     const cellInView = (x: number, y: number, r: number) =>
       isEntityNearView(x, y, r, center.x, center.y, viewR);
-    const removedFoodIds = collectDestroyedIds(session.knownFoodIds, state.food);
+    // A continuous camera-centered FOV replaces sector-neighborhood loading.
+    // Every entity class uses this same reach; client-side screen culling stays separate.
+    const particleInView = (x: number, y: number, radius = 0) =>
+      isEntityNearView(x, y, radius, center.x, center.y, viewR);
+    // Food is static and plentiful. In low-traffic mode send a complete
+    // sector snapshot every third state packet (about 3.3 Hz), while cells,
+    // viruses, and flying W remain authoritative at the normal 10 Hz.
+    const includeFood = cfg.lowTrafficMode < 0.5 || session.tickCount % 9 === 0;
+    const removedFoodIds = includeFood
+      ? collectDestroyedIds(session.knownFoodIds, state.food)
+      : [];
     const removedVirusIds = collectDestroyedIds(session.knownVirusIds, state.viruses);
     const removedEjectedIds = collectDestroyedIds(session.knownEjectIds, state.ejectedMass);
 
-    const food = collectStableInView(
-      state.food,
-      center.x,
-      center.y,
-      viewR,
-      Math.min(cfg.foodNetMax, NETWORK_FOOD_MAX),
-      session.sentFoodUntil
-    ).map((f) => ({
-        id: f.id,
-        x: Math.round(f.x),
-        y: Math.round(f.y),
-        c: f.color,
-      })
-    );
+    const food = includeFood
+      ? state.food.filter((f) => particleInView(f.x, f.y)).map((f) => ({
+          id: f.id,
+          x: Math.round(f.x),
+          y: Math.round(f.y),
+          c: f.color,
+        }))
+      : undefined;
 
     // Viruses are not part of the food cap, but still receive the same
     // expanded-FOV grace. A moving or boundary-adjacent spike must not vanish
@@ -498,27 +640,14 @@ function startServer(attempt = 0) {
         ch: v.charge,
       }));
 
-    const ejected = collectStableInView(
-      state.ejectedMass,
-      center.x,
-      center.y,
-      viewR,
-      Math.min(cfg.ejectNetMax, NETWORK_EJECT_MAX),
-      session.sentEjectUntil,
-      (eject) => {
-        const isLocalRecent = eject.ownerId === youId && Date.now() - eject.createdAt <= LOCAL_EJECT_PRIORITY_MS;
-        const isFlying = Math.hypot(eject.velocityX, eject.velocityY) > 2;
-        return (isLocalRecent ? 4 : 0) + (isFlying ? 2 : 0);
-      }
-    ).map((e) => ({
+    const ejected = state.ejectedMass.filter((e) => particleInView(e.x, e.y, e.radius)).map((e) => ({
         id: e.id,
         x: Math.round(e.x),
         y: Math.round(e.y),
         r: Math.round(e.radius * 2) / 2,
         c: e.color,
-      })
-    );
-    for (const entity of food) session.knownFoodIds.add(entity.id);
+      }));
+    for (const entity of food ?? []) session.knownFoodIds.add(entity.id);
     for (const entity of viruses) session.knownVirusIds.add(entity.id);
     for (const entity of ejected) session.knownEjectIds.add(entity.id);
 
@@ -555,10 +684,9 @@ function startServer(attempt = 0) {
       removedVirusIds: removedVirusIds.length > 0 ? removedVirusIds : undefined,
       removedEjectedIds: removedEjectedIds.length > 0 ? removedEjectedIds : undefined,
       ownedIds: session.playerIds.length > 0 ? [...session.playerIds] : undefined,
+      centerLeader: centerLeaderFor(session.room),
     };
-    if (includeLeaderboard) {
-      msg.leaderboard = engine.getLeaderboard();
-    }
+    if (leaderboard) msg.leaderboard = leaderboard;
     return msg;
   }
 
@@ -637,6 +765,17 @@ function startServer(attempt = 0) {
     teamStates.duoFight.scores = persistentStore.getScores('duoFight');
     teamStates.trioFight.scores = persistentStore.getScores('trioFight');
     passwordResetCodes.clear();
+    for (const session of clients.values()) {
+      session.questProgress = null;
+      // Prevent a browser-cached skin id from being synced back after a wipe.
+      send(session.ws, {
+        type: 'playerProfile',
+        deviceId: session.deviceId || '',
+        skinId: '',
+        accountLogin: null,
+        quest: toQuestPublicView(sanitizeQuestProgress(undefined)),
+      });
+    }
     broadcastToRoom('classic', { type: 'settings', settings: classicConfig, mode: 'classic' });
     broadcastToRoom('soloFight', { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
     for (const mode of ['duoFight', 'trioFight'] as TeamFightMode[]) {
@@ -645,6 +784,30 @@ function startServer(attempt = 0) {
     broadcastSoloFightTop();
     broadcastTeamMeta('duoFight');
     broadcastTeamMeta('trioFight');
+    broadcastRoomInfo();
+  }
+
+  /** Reset Classic only. Other rooms and persisted settings are untouched. */
+  function restartClassicRoom() {
+    const state = classicEngine.getState();
+    for (const session of clients.values()) {
+      if (session.room !== 'classic') continue;
+      const wasPlaying = session.joined || session.playerIds.length > 0;
+      session.playerIds = [];
+      session.activeIndex = 0;
+      session.joined = false;
+      session.spectating = !session.lobbyOnly;
+      session.sentVirusUntil.clear();
+      session.knownFoodIds.clear();
+      session.knownEjectIds.clear();
+      session.knownVirusIds.clear();
+      if (wasPlaying) send(session.ws, { type: 'died' });
+    }
+    state.players.splice(0);
+    state.food.splice(0);
+    state.viruses.splice(0);
+    state.ejectedMass.splice(0);
+    syncWorldAndPopulation(classicEngine, classicConfig);
     broadcastRoomInfo();
   }
 
@@ -788,6 +951,90 @@ function startServer(attempt = 0) {
 
   async function handleHttpApi(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (req.method === 'GET' && url.pathname === '/api/public-config') {
+      writeSkinApi(res, 200, { telegramChannelUrl: persistentStore.getTelegramChannelUrl(), weeklyTopPrizes: {
+        classic: persistentStore.getWeeklyTopPrize('classic'), soloFight: persistentStore.getWeeklyTopPrize('soloFight'),
+        duoFight: persistentStore.getWeeklyTopPrize('duoFight'), trioFight: persistentStore.getWeeklyTopPrize('trioFight'),
+      } });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/admin/public-config') {
+      try {
+        const body = JSON.parse((await readLimitedBody(req, 64 * 1024)).toString('utf8')) as {
+          adminNick?: unknown; adminPassword?: unknown; telegramChannelUrl?: unknown; weeklyTopPrizes?: Partial<Record<RoomMode, unknown>>;
+        };
+        if (!isSkinAdminAuthorized(body.adminNick, body.adminPassword)) {
+          writeSkinApi(res, 401, { error: 'Требуются права администратора' });
+          return;
+        }
+        const channel = String(body.telegramChannelUrl ?? '').trim();
+        if (channel && !/^https?:\/\/(t\.me|telegram\.me)\//i.test(channel)) {
+          writeSkinApi(res, 400, { error: 'Укажите корректную ссылку t.me или оставьте поле пустым' });
+          return;
+        }
+        persistentStore.setTelegramChannelUrl(channel);
+        for (const mode of ['classic', 'soloFight', 'duoFight', 'trioFight'] as RoomMode[]) {
+          if (body.weeklyTopPrizes?.[mode] !== undefined) persistentStore.setWeeklyTopPrize(mode, Number(body.weeklyTopPrizes[mode]));
+        }
+        writeSkinApi(res, 200, { ok: true, telegramChannelUrl: channel, weeklyTopPrizes: {
+          classic: persistentStore.getWeeklyTopPrize('classic'), soloFight: persistentStore.getWeeklyTopPrize('soloFight'),
+          duoFight: persistentStore.getWeeklyTopPrize('duoFight'), trioFight: persistentStore.getWeeklyTopPrize('trioFight'),
+        } });
+      } catch (error) {
+        writeSkinApi(res, 400, { error: error instanceof Error ? error.message : 'Не удалось сохранить ссылку' });
+      }
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/admin/wipe') {
+      try {
+        const body = JSON.parse((await readLimitedBody(req, 64 * 1024)).toString('utf8')) as {
+          adminNick?: unknown; adminPassword?: unknown; confirmation?: unknown;
+        };
+        if (!isSkinAdminAuthorized(body.adminNick, body.adminPassword)) {
+          writeSkinApi(res, 401, { error: 'Требуются права администратора' });
+          return;
+        }
+        if (!/^(confirm|конфирм)$/iu.test(String(body.confirmation ?? '').trim())) {
+          writeSkinApi(res, 400, { error: 'Подтверждение не принято' });
+          return;
+        }
+        wipePersistentGameData();
+        writeSkinApi(res, 200, { ok: true, message: 'Вся база данных стёрта и сброшена к значениям по умолчанию' });
+      } catch (error) {
+        writeSkinApi(res, 400, { error: error instanceof Error ? error.message : 'Не удалось очистить базу' });
+      }
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/shop/buy') {
+      try {
+        const body = JSON.parse((await readLimitedBody(req, 64 * 1024)).toString('utf8')) as { deviceId?: string; skinId?: string };
+        const result = persistentStore.purchaseShopSkin(String(body.deviceId || '').trim(), String(body.skinId || '').trim());
+        if (!result.ok) {
+          writeSkinApi(res, 400, result);
+          return;
+        }
+        writeSkinApi(res, 200, {
+          ok: true,
+          quest: toQuestPublicView(sanitizeQuestProgress(result.profile.quests), {
+            pendingLevelRewards: result.profile.pendingLevelRewards,
+          }),
+        });
+      } catch (error) {
+        writeSkinApi(res, 400, { error: error instanceof Error ? error.message : 'Не удалось купить скин' });
+      }
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/level-rewards/ack') {
+      try {
+        const body = JSON.parse((await readLimitedBody(req, 64 * 1024)).toString('utf8')) as { deviceId?: string; level?: number };
+        const level = Math.max(1, Math.floor(Number(body.level) || 0));
+        persistentStore.acknowledgeLevelReward(String(body.deviceId || '').trim(), level);
+        writeSkinApi(res, 200, { ok: true });
+      } catch {
+        writeSkinApi(res, 400, { error: 'Некорректное подтверждение награды' });
+      }
+      return;
+    }
     if (!url.pathname.startsWith('/api/skins')) {
       await handleBotApi(req, res);
       return;
@@ -809,14 +1056,16 @@ function startServer(attempt = 0) {
           id: skin.id,
           name: skin.name,
           url: `/api/skins/${encodeURIComponent(skin.fileName)}`,
+          kind: skin.kind ?? 'global',
+          price: skin.price,
+          level: skin.level,
         })),
       });
       return;
     }
     if (req.method === 'GET' && skinPath) {
-      const skin = persistentStore.getCustomSkins().find((item) => item.fileName === skinPath);
-      const path = skin ? join(customSkinDir, skin.fileName) : '';
-      if (!skin || !existsSync(path)) {
+      const skin = persistentStore.getSkin(skinPath);
+      if (!skin) {
         writeSkinApi(res, 404, { error: 'Скин не найден' });
         return;
       }
@@ -826,7 +1075,16 @@ function startServer(attempt = 0) {
         'x-content-type-options': 'nosniff',
         'access-control-allow-origin': '*',
       });
-      res.end(readFileSync(path));
+      if (skin.dataBase64) {
+        res.end(Buffer.from(skin.dataBase64, 'base64'));
+      } else {
+        const path = join(customSkinDir, skin.fileName);
+        if (!existsSync(path)) {
+          writeSkinApi(res, 404, { error: 'Изображение скина не найдено' });
+          return;
+        }
+        res.end(readFileSync(path));
+      }
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/skins') {
@@ -856,9 +1114,18 @@ function startServer(attempt = 0) {
           .replace(/[\u0000-\u001F<>]/g, '')
           .trim()
           .slice(0, 40) || 'Свой скин';
-        await mkdir(customSkinDir, { recursive: true });
-        await writeFile(join(customSkinDir, fileName), data);
-        persistentStore.addCustomSkin({ id, name, fileName, mime, createdAt: Date.now() });
+        const kindField = multipart.fields.get('kind');
+        const kind = kindField === 'shop' || kindField === 'level' ? kindField : 'global';
+        const price = Math.max(0, Math.floor(Number(multipart.fields.get('price')) || 0));
+        const level = Math.max(1, Math.floor(Number(multipart.fields.get('level')) || 1));
+        // DB owns the binary. This cache is deliberately optional and may be
+        // deleted without affecting exports/backups or future image serving.
+        persistentStore.addCustomSkin({
+          id, name, fileName, mime, dataBase64: data.toString('base64'), kind,
+          price: kind === 'shop' ? price : undefined,
+          level: kind === 'level' ? level : undefined,
+          createdAt: Date.now(),
+        });
         writeSkinApi(res, 201, { id, name, url: `/api/skins/${encodeURIComponent(fileName)}` });
       } catch (error) {
         writeSkinApi(res, 400, { error: error instanceof Error ? error.message : 'Не удалось загрузить скин' });
@@ -911,7 +1178,10 @@ function startServer(attempt = 0) {
     for await (const chunk of req) {
       const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += part.length;
-      if (bytes > 5_000_000) throw new Error('Body is too large');
+      // A portable DB embeds custom skin binaries as base64. One permitted
+      // 10 MB image expands past 13 MB, so the old 5 MB cap rejected valid
+      // full backups and bot skin approvals.
+      if (bytes > 50_000_000) throw new Error('Body is too large');
       chunks.push(part);
     }
     return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
@@ -965,8 +1235,30 @@ function startServer(attempt = 0) {
       writeBotApi(res, 200, { messages });
       return;
     }
+    if (req.method === 'GET' && url.pathname === '/api/bot/profile') {
+      const login = url.searchParams.get('login') || '';
+      const account = persistentStore.getAccount(login);
+      if (!account) {
+        writeBotApi(res, 404, { error: 'Аккаунт не найден' });
+        return;
+      }
+      const profile = account.deviceId ? persistentStore.getPlayer(account.deviceId) : undefined;
+      const quest = sanitizeQuestProgress(profile?.quests);
+      writeBotApi(res, 200, {
+        login: account.login,
+        deviceId: account.deviceId || null,
+        quest: toQuestPublicView(quest),
+      });
+      return;
+    }
     try {
       const body = await readBotApiBody(req);
+      if (req.method === 'POST' && url.pathname === '/api/bot/unlink-device') {
+        const login = String((body as { login?: unknown }).login || '');
+        const result = persistentStore.unlinkAccountDevice(login);
+        writeBotApi(res, result.ok ? 200 : 400, result);
+        return;
+      }
       if (req.method === 'POST' && url.pathname === '/api/bot/chat') {
         const input = body as { room?: string; name?: string; text?: string };
         const room = parseMode(input.room);
@@ -977,6 +1269,16 @@ function startServer(attempt = 0) {
           return;
         }
         broadcastToRoom(room, { type: 'chat', name, text, t: Date.now(), color: '#27a9ff', fromTg: true });
+        writeBotApi(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/bot/db/merge') {
+        const json = typeof (body as { json?: unknown }).json === 'string' ? (body as { json: string }).json : '';
+        const result = persistentStore.mergeBotSnapshot(json);
+        if (!result.ok) {
+          writeBotApi(res, 400, result);
+          return;
+        }
         writeBotApi(res, 200, { ok: true });
         return;
       }
@@ -1018,18 +1320,45 @@ function startServer(attempt = 0) {
       duoFight: getRoomInfo('duoFight'),
       trioFight: getRoomInfo('trioFight'),
     };
+    const lobbySnapshot = JSON.stringify({
+      type: 'lobbySnapshot',
+      rooms,
+      tops: {
+        classic: weeklyEntries('classic'),
+        soloFight: weeklyEntries('soloFight'),
+        duoFight: weeklyEntries('duoFight'),
+        trioFight: weeklyEntries('trioFight'),
+      },
+      weeklyTopEndsAt: {
+        classic: persistentStore.getWeeklyTopEndsAt('classic'),
+        soloFight: persistentStore.getWeeklyTopEndsAt('soloFight'),
+        duoFight: persistentStore.getWeeklyTopEndsAt('duoFight'),
+        trioFight: persistentStore.getWeeklyTopEndsAt('trioFight'),
+      },
+    } satisfies ServerMessage);
+    const roomInfo = {
+      classic: JSON.stringify(rooms.classic),
+      soloFight: JSON.stringify(rooms.soloFight),
+      duoFight: JSON.stringify(rooms.duoFight),
+      trioFight: JSON.stringify(rooms.trioFight),
+    };
+    const soloTop = JSON.stringify(makeSoloFightTop(sfState));
+    const teamTops = {
+      duoFight: JSON.stringify(makeTeamFightTop('duoFight', teamStates.duoFight)),
+      trioFight: JSON.stringify(makeTeamFightTop('trioFight', teamStates.trioFight)),
+    };
     for (const [ws, session] of clients) {
       if (ws.readyState !== WebSocket.OPEN) continue;
       // One snapshot is deliberately complete: one menu socket updates all
       // cards and cannot overwrite one mode with another observer's data.
-      send(ws, { type: 'lobbySnapshot', rooms });
+      sendSerialized(ws, lobbySnapshot);
       // Retained for the live room HUD / older clients.
-      send(ws, rooms[session.room]);
+      sendSerialized(ws, roomInfo[session.room]);
       if (session.room === 'soloFight') {
-        send(ws, makeSoloFightTop(sfState));
+        sendSerialized(ws, soloTop);
       }
       if (isTeamFight(session.room)) {
-        send(ws, makeTeamFightTop(session.room, teamStates[session.room]));
+        sendSerialized(ws, teamTops[session.room]);
       }
     }
   }
@@ -1074,7 +1403,8 @@ function startServer(attempt = 0) {
       const won = winnerName !== null && session.lastName === winnerName;
       sfState.streaks.set(session.lastName, won ? (sfState.streaks.get(session.lastName) ?? 0) + 1 : 0);
       if (won) {
-        sfState.scores.set(normalizeNick(session.lastName), persistentStore.recordWin('soloFight', session.lastName));
+        const score = persistentStore.recordWin('soloFight', session.deviceId, session.lastName);
+        if (score !== undefined) sfState.scores.set(normalizeNick(session.lastName), score);
       }
     }
 
@@ -1312,10 +1642,8 @@ function startServer(attempt = 0) {
       const won = winner !== null && session.team === winner;
       state.streaks.set(session.lastName, won ? (state.streaks.get(session.lastName) ?? 0) + 1 : 0);
       if (won) {
-        state.scores.set(
-          normalizeNick(session.lastName),
-          persistentStore.recordWin(mode as FightMode, session.lastName)
-        );
+        const score = persistentStore.recordWin(mode as FightMode, session.deviceId, session.lastName);
+        if (score !== undefined) state.scores.set(normalizeNick(session.lastName), score);
       }
     }
     freezeTeamFighters(mode, true);
@@ -1462,6 +1790,7 @@ function startServer(attempt = 0) {
     session.playerIds = [player.id];
     session.activeIndex = 0;
     session.joined = true;
+    beginQuestLife(session);
     session.lastName = name;
     session.lastColor = player.color;
     session.lastSkin = skin || '';
@@ -1545,7 +1874,7 @@ function startServer(attempt = 0) {
     session.viewY = st.worldHeight / 2;
     sendWelcome(session, `spec-${Date.now().toString(36)}`, soloFightEngine, false);
     send(session.ws, { type: 'settings', settings: soloFightConfig, mode: 'soloFight' });
-    send(session.ws, buildStateFor(session, true));
+    send(session.ws, buildStateFor(session, buildLeaderboardFor(soloFightEngine)));
     send(session.ws, makeSoloFightHud(sfState));
     send(session.ws, makeSoloFightTop(sfState));
     if (reason) send(session.ws, { type: 'error', message: reason });
@@ -1673,6 +2002,7 @@ function startServer(attempt = 0) {
       session.playerIds = [player.id];
       session.activeIndex = 0;
       session.joined = true;
+      beginQuestLife(session);
       session.lastName = name;
       session.lastColor = player.color;
       session.lastSkin = skin || '';
@@ -1750,14 +2080,191 @@ function startServer(attempt = 0) {
       if (teamStates.trioFight.phase !== 'waiting' && teamFighters.trioFight.length > 0) {
         trioFightEngine.update();
       }
+      processWeeklyTops();
+      // Classic records are tied to the stable device profile, not a transient
+      // websocket name. Guests may play normally but never enter prize records.
+      if (hasClassicSession) {
+        const state = classicEngine.getState();
+        for (const session of clients.values()) {
+          if (session.room !== 'classic' || !session.joined || !session.deviceId) continue;
+          const profile = persistentStore.getPlayer(session.deviceId);
+          if (!profile?.accountLogin) continue;
+          const score = session.playerIds.reduce((sum, id) => {
+            const player = state.players.find((candidate) => candidate.id === id);
+            return sum + (player?.cells.length ? getTotalMass(player) : 0);
+          }, 0);
+          const result = persistentStore.recordClassicMass(session.deviceId, session.lastName, score, session.lastSkin);
+          if (result.global && score >= lastClassicRecordAnnouncement + 100) {
+            lastClassicRecordAnnouncement = Math.floor(score);
+            broadcastGameChat('classic', '🏆 Система', `Игрок ${session.lastName} установил рекорд классика: ${Math.floor(score)} массы!`, '#facc15');
+          }
+        }
+      }
       tickSoloFightPhases();
       tickTeamFight('duoFight', Date.now());
       tickTeamFight('trioFight', Date.now());
+
+      const questEventsByPlayer = new Map<string, { kills: number; viruses: number }>();
+      const bumpQuestEvent = (playerId: string, kind: 'kill' | 'virus') => {
+        const cur = questEventsByPlayer.get(playerId) || { kills: 0, viruses: 0 };
+        if (kind === 'kill') cur.kills += 1;
+        else cur.viruses += 1;
+        questEventsByPlayer.set(playerId, cur);
+      };
+      const isFriendlyVictim = (hunter: ClientSession, victimId?: string) => {
+        if (!victimId) return false;
+        if (hunter.playerIds.includes(victimId)) return true;
+        const hunterLogin = hunter.deviceId
+          ? persistentStore.getPlayer(hunter.deviceId)?.accountLogin?.toLowerCase()
+          : undefined;
+        for (const other of clients.values()) {
+          if (!other.playerIds.includes(victimId)) continue;
+          if (hunter.deviceId && other.deviceId && hunter.deviceId === other.deviceId) return true;
+          if (hunterLogin) {
+            const login = other.deviceId
+              ? persistentStore.getPlayer(other.deviceId)?.accountLogin?.toLowerCase()
+              : undefined;
+            if (login && login === hunterLogin) return true;
+          }
+        }
+        return false;
+      };
+      for (const ev of [
+        ...(hasClassicSession ? classicEngine.consumeQuestEvents() : []),
+        ...(sfState.phase !== 'waiting' && sfDuelists.length > 0 ? soloFightEngine.consumeQuestEvents() : []),
+        ...(teamStates.duoFight.phase !== 'waiting' && teamFighters.duoFight.length > 0
+          ? duoFightEngine.consumeQuestEvents()
+          : []),
+        ...(teamStates.trioFight.phase !== 'waiting' && teamFighters.trioFight.length > 0
+          ? trioFightEngine.consumeQuestEvents()
+          : []),
+      ]) {
+        if (ev.kind === 'virus') {
+          bumpQuestEvent(ev.playerId, 'virus');
+          continue;
+        }
+        // Resolve hunter session to ignore multibox / same-account tabs.
+        let hunterSession: ClientSession | undefined;
+        for (const s of clients.values()) {
+          if (s.playerIds.includes(ev.playerId)) {
+            hunterSession = s;
+            break;
+          }
+        }
+        if (hunterSession && isFriendlyVictim(hunterSession, ev.victimId)) continue;
+        bumpQuestEvent(ev.playerId, 'kill');
+      }
+      const tickMs = getTickMs();
+      const leaderboardsByRoom = new Map<RoomMode, NonNullable<StateMessage['leaderboard']>>();
 
       for (const [ws, session] of clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
 
         const engine = engineFor(session.room);
+
+        if (session.joined && session.playerIds.length > 0 && session.deviceId) {
+          const profile = persistentStore.getPlayer(session.deviceId);
+          const accountOk = !!profile?.accountLogin;
+          if (accountOk && isQuestPrimary(session, profile.accountLogin)) {
+            if (!session.questRun) session.questRun = emptyQuestRunStats();
+            const run = session.questRun;
+            let massSum = 0;
+            const state = engine.getState();
+            const owned = new Set(session.playerIds);
+            for (const id of session.playerIds) {
+              const player = state.players.find((p) => p.id === id);
+              if (!player || player.cells.length === 0) continue;
+              massSum += getTotalMass(player);
+              const ev = questEventsByPlayer.get(id);
+              if (ev) {
+                run.kills += ev.kills;
+                run.viruses += ev.viruses;
+                if (ev.viruses > 0) run.touchedVirus = true;
+              }
+            }
+            const alive = massSum > 0;
+            // A profile/socket can remain connected while its owner is in the
+            // lobby or spectating. Time quests only advance for an active,
+            // living player in a real room.
+            const activelyPlaying = alive && session.joined && !session.spectating && !session.lobbyOnly;
+            if (activelyPlaying) run.surviveMs += tickMs;
+            if (massSum > run.peakMass) run.peakMass = massSum;
+            if (!run.touchedVirus && massSum > run.peakMassNoVirus) run.peakMassNoVirus = massSum;
+
+            const ranked = state.players
+              .filter((p) => p.cells.length > 0)
+              .sort((a, b) => b.score - a.score);
+            const rank = ranked.findIndex((p) => owned.has(p.id));
+            if (activelyPlaying && rank >= 0 && rank < 10) {
+              run.inTop10 = true;
+              run.topMs += tickMs;
+            } else if (run.inTop10) {
+              // Dropped out of top-10 — top quest progress restarts.
+              run.inTop10 = false;
+              run.topMs = 0;
+            }
+
+            if (!session.questProgress) {
+              session.questProgress = sanitizeQuestProgress(profile?.quests ?? createDefaultQuestProgress());
+            }
+            let quests = session.questProgress;
+            if (quests.currentTaskId === 'top' && !run.inTop10) {
+              quests.currentProgress = 0;
+            }
+            const previousTimeRunning =
+              quests.currentTaskId === 'survive'
+                ? activelyPlaying
+                : quests.currentTaskId === 'top'
+                  ? run.inTop10
+                  : false;
+            const value = questValueFromRun(quests.currentTaskId, run);
+            const before = quests.currentProgress;
+            const applied = applyQuestProgressValue(quests, value, getCustomLevelSkinRewards());
+            quests = applied.progress;
+            session.questProgress = quests;
+            if (applied.levelRewards.length) persistentStore.addPendingLevelRewards(session.deviceId, applied.levelRewards);
+            const timeRunning =
+              !applied.completed &&
+              (quests.currentTaskId === 'survive'
+                ? activelyPlaying
+                : quests.currentTaskId === 'top'
+                  ? run.inTop10
+                  : false);
+            const timerStateChanged = session.questTimerRunning !== timeRunning;
+            const nowPush = Date.now();
+            const discrete = QUEST_DEFS[quests.currentTaskId].unit === 'count';
+            const shouldPush =
+              applied.completed ||
+              nowPush - session.lastQuestPushAt > QUEST_PROFILE_PUSH_MS ||
+              (discrete && quests.currentProgress !== before) ||
+              (quests.currentTaskId === 'top' && before > 0 && quests.currentProgress === 0) ||
+              timerStateChanged ||
+              (applied.completed && previousTimeRunning);
+            if (shouldPush && (quests.currentProgress !== before || applied.completed || timerStateChanged)) {
+              persistentStore.upsertPlayer(session.deviceId, { quests });
+            }
+            if (shouldPush && (applied.completed || quests.currentProgress !== before || timerStateChanged)) {
+              const saved = persistentStore.getPlayer(session.deviceId) || profile!;
+              session.lastQuestPushAt = nowPush;
+              send(ws, {
+                type: 'playerProfile',
+                deviceId: session.deviceId,
+                lastNick: saved.lastNick,
+                skinId: saved.skinId,
+                prefs: saved.prefs,
+                accountLogin: saved.accountLogin,
+                quest: toQuestPublicView(quests, {
+                  timeRunning,
+                  pendingLevelRewards: persistentStore.getPlayer(session.deviceId)?.pendingLevelRewards,
+                }),
+              });
+              session.questTimerRunning = timeRunning;
+              if (applied.completed) {
+                session.questRun = emptyQuestRunStats();
+              }
+            }
+          }
+        }
 
         if (session.joined && session.playerIds.length > 0) {
           const state = engine.getState();
@@ -1783,6 +2290,33 @@ function startServer(attempt = 0) {
             session.activeIndex = idx >= 0 ? idx : 0;
           }
           if (session.playerIds.length === 0) {
+            if (
+              session.deviceId &&
+              session.questProgress &&
+              (session.questProgress.currentTaskId === 'top' ||
+                session.questProgress.currentTaskId === 'mass' ||
+                session.questProgress.currentTaskId === 'massNoVirus')
+            ) {
+              session.questProgress.currentProgress = 0;
+              persistentStore.upsertPlayer(session.deviceId, { quests: session.questProgress });
+              const saved = persistentStore.getPlayer(session.deviceId);
+              if (saved?.accountLogin) {
+                send(ws, {
+                  type: 'playerProfile',
+                  deviceId: session.deviceId,
+                  lastNick: saved.lastNick,
+                  skinId: saved.skinId,
+                  prefs: saved.prefs,
+                  accountLogin: saved.accountLogin,
+                  quest: toQuestPublicView(session.questProgress, {
+                    timeRunning: false,
+                    pendingLevelRewards: saved.pendingLevelRewards,
+                  }),
+                });
+                session.questTimerRunning = false;
+              }
+            }
+            session.questRun = emptyQuestRunStats();
             if (session.room === 'soloFight') {
               if (sfState.phase === 'fighting' && sfDuelists.includes(session)) {
                 handleSoloFightDeath(session);
@@ -1809,11 +2343,20 @@ function startServer(attempt = 0) {
         if (session.lobbyOnly) continue;
         session.tickCount = (session.tickCount + 1) | 0;
         if (ws.bufferedAmount > STATE_BACKPRESSURE_BYTES) continue;
-        // Physics/input stay at 30 Hz; clients interpolate 10 Hz snapshots.
-        if (session.tickCount % STATE_SEND_MODULO !== 0) continue;
+        // Physics 30 Hz; snapshots ~10 Hz.
+        const sendModulo = STATE_SEND_MODULO;
+        if (session.tickCount % sendModulo !== 0) continue;
         // Leaderboard is UI-only; refresh it once every three seconds.
-        const includeLb = session.tickCount % (STATE_SEND_MODULO * 50) === 0;
-        send(ws, buildStateFor(session, includeLb));
+        const includeLb = session.tickCount % (sendModulo * 50) === 0;
+        let leaderboard: NonNullable<StateMessage['leaderboard']> | undefined;
+        if (includeLb) {
+          leaderboard = leaderboardsByRoom.get(session.room);
+          if (!leaderboard) {
+            leaderboard = buildLeaderboardFor(engine);
+            leaderboardsByRoom.set(session.room, leaderboard);
+          }
+        }
+        send(ws, buildStateFor(session, leaderboard));
         if (session.room === 'soloFight') {
           const hud = makeSoloFightHud(sfState);
           const key = `${hud.phase}|${hud.countdown}|${hud.fightSecondsLeft ?? ''}|${hud.a.name}|${hud.a.score}|${hud.b.name}|${hud.b.score}`;
@@ -1902,12 +2445,15 @@ function startServer(attempt = 0) {
       tickCount: 0,
       lastSfHudKey: '',
       sentSkins: new Map(),
-      sentFoodUntil: new Map(),
-      sentEjectUntil: new Map(),
       sentVirusUntil: new Map(),
       knownFoodIds: new Set(),
       knownEjectIds: new Set(),
       knownVirusIds: new Set(),
+      questRun: null,
+      questProgress: null,
+      lastQuestPushAt: 0,
+      questTimerRunning: false,
+      questAccountKey: null,
     };
     clients.set(ws, session);
 
@@ -1917,6 +2463,13 @@ function startServer(attempt = 0) {
         msg = JSON.parse(String(raw)) as ClientMessage;
       } catch {
         send(ws, { type: 'error', message: 'Invalid JSON' });
+        return;
+      }
+
+      // Reply before allocating handlers or touching game state. A received
+      // ping therefore never waits behind a gameplay branch or snapshot work.
+      if (msg.type === 'ping') {
+        sendPong(ws, msg.t);
         return;
       }
 
@@ -1970,43 +2523,55 @@ function startServer(attempt = 0) {
         }
         case 'spectate': {
           const mode = parseMode(msg.mode);
-          // Spectating the room already occupied is a no-op. In particular,
-          // never tear down a live body just because the menu re-sent the
-          // currently active mode.
-          if (mode === session.room) break;
-          removePendingFightJoin(session);
-          if (session.room === 'soloFight' && sfDuelists.includes(session)) {
-            handleSoloFightLeave(session);
-            clearSessionPlayers(session, soloFightEngine);
-          } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
-            leaveTeamFight(session, session.room);
-          } else {
-            clearSessionPlayers(session, engine());
+          const alreadyHere =
+            mode === session.room && session.spectating && !session.lobbyOnly;
+          if (!alreadyHere) {
+            removePendingFightJoin(session);
+            if (session.room === 'soloFight' && sfDuelists.includes(session)) {
+              handleSoloFightLeave(session);
+              clearSessionPlayers(session, soloFightEngine);
+            } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+              leaveTeamFight(session, session.room);
+            } else {
+              clearSessionPlayers(session, engine());
+            }
+            session.room = mode;
+            session.lobbyOnly = false;
+            session.spectating = true;
+            session.joined = false;
+            const st = engineFor(mode).getState();
+            session.viewX = st.worldWidth / 2;
+            session.viewY = st.worldHeight / 2;
           }
-          session.room = mode;
-          session.lobbyOnly = false;
-          session.spectating = true;
-          session.joined = false;
-          const st = engineFor(mode).getState();
-          session.viewX = st.worldWidth / 2;
-          session.viewY = st.worldHeight / 2;
-          send(ws, {
-            type: 'welcome',
-            id: `spec-${Date.now().toString(36)}`,
-            world: { w: st.worldWidth, h: st.worldHeight },
-            isAdmin: false,
-          });
-          send(ws, { type: 'settings', settings: configFor(mode), mode });
-          send(ws, buildStateFor(session, true));
-          if (mode === 'soloFight') {
-            send(ws, makeSoloFightHud(sfState));
-            send(ws, makeSoloFightTop(sfState));
+          // Always re-ack spectate (menu → spectate again must refresh welcome/state).
+          {
+            const st = engineFor(session.room).getState();
+            send(ws, {
+              type: 'welcome',
+              id: `spec-${Date.now().toString(36)}`,
+              world: { w: st.worldWidth, h: st.worldHeight },
+              isAdmin: false,
+            });
+            send(ws, { type: 'settings', settings: configFor(session.room), mode: session.room });
+            send(ws, buildStateFor(session, buildLeaderboardFor(engineFor(session.room))));
+            if (session.room === 'soloFight') {
+              send(ws, makeSoloFightHud(sfState));
+              send(ws, makeSoloFightTop(sfState));
+            }
+            if (isTeamFight(session.room)) {
+              send(
+                ws,
+                makeTeamFightHud(
+                  session.room,
+                  teamStates[session.room],
+                  (team) => teamMembers(session.room as TeamFightMode, team),
+                  getRoomInfo(session.room).lobby
+                )
+              );
+              send(ws, makeTeamFightTop(session.room, teamStates[session.room]));
+            }
+            broadcastRoomInfo();
           }
-          if (isTeamFight(mode)) {
-            send(ws, makeTeamFightHud(mode, teamStates[mode], (team) => teamMembers(mode, team), getRoomInfo(mode).lobby));
-            send(ws, makeTeamFightTop(mode, teamStates[mode]));
-          }
-          broadcastRoomInfo();
           break;
         }
         case 'join': {
@@ -2057,7 +2622,13 @@ function startServer(attempt = 0) {
               skinId: profile.skinId,
               prefs: profile.prefs,
               accountLogin: profile.accountLogin,
+              quest: toQuestPublicView(sanitizeQuestProgress(profile.quests), {
+                followerOnly: !!profile.accountLogin && !isQuestPrimary(session, profile.accountLogin),
+                pendingLevelRewards: profile.pendingLevelRewards,
+              }),
             });
+            session.questRun = emptyQuestRunStats();
+            session.questProgress = sanitizeQuestProgress(profile.quests);
           }
 
           if (mode === 'soloFight') {
@@ -2076,6 +2647,7 @@ function startServer(attempt = 0) {
           session.playerIds = [player.id];
           session.activeIndex = 0;
           session.joined = true;
+          beginQuestLife(session);
           session.lastColor = player.color;
           refreshAdmin(session);
           sendWelcome(session, player.id, classicEngine, session.isAdmin);
@@ -2147,6 +2719,33 @@ function startServer(attempt = 0) {
           if (!session.isAdmin || !id) return;
           const amount = Math.max(1, Math.min(5000, Number(msg.amount) || cfg().adminMassBoost));
           engine().addMass(id, amount);
+          break;
+        }
+        case 'adminSkipQuest': {
+          refreshAdmin(session);
+          if (!session.isAdmin || !session.deviceId) return;
+          const profile = persistentStore.getPlayer(session.deviceId);
+          if (!profile?.accountLogin) return;
+          if (!session.questProgress) {
+            session.questProgress = sanitizeQuestProgress(profile.quests ?? createDefaultQuestProgress());
+          }
+          const req = session.questProgress.tasks[session.questProgress.currentTaskId].requirement;
+          const applied = applyQuestProgressValue(session.questProgress, req, getCustomLevelSkinRewards());
+          session.questProgress = applied.progress;
+          session.questRun = emptyQuestRunStats();
+          if (applied.levelRewards.length) persistentStore.addPendingLevelRewards(session.deviceId, applied.levelRewards);
+          const saved = persistentStore.upsertPlayer(session.deviceId, { quests: session.questProgress });
+          send(ws, {
+            type: 'playerProfile',
+            deviceId: session.deviceId,
+            lastNick: saved.lastNick,
+            skinId: saved.skinId,
+            prefs: saved.prefs,
+            accountLogin: saved.accountLogin,
+            quest: toQuestPublicView(session.questProgress, {
+              pendingLevelRewards: persistentStore.getPlayer(session.deviceId)?.pendingLevelRewards,
+            }),
+          });
           break;
         }
         case 'adminSpawnVirus': {
@@ -2226,6 +2825,7 @@ function startServer(attempt = 0) {
           const primary = primaryId ? state.players.find((p) => p.id === primaryId) : undefined;
           if (!primary || primary.cells.length === 0) return;
           if (session.playerIds.length >= 2) return;
+          if (primaryId) engine().cruisePlayerInLastAim(primaryId);
           const box = engine().addPlayer(primary.name, false, {
             color: primary.color,
             skin: primary.skin || session.lastSkin || undefined,
@@ -2237,6 +2837,8 @@ function startServer(attempt = 0) {
         case 'multiboxSwitch': {
           if (session.room !== 'classic') return;
           if (session.playerIds.length < 2) return;
+          const prevId = activePlayerId(session);
+          if (prevId) engine().cruisePlayerInLastAim(prevId);
           session.activeIndex = (session.activeIndex + 1) % session.playerIds.length;
           break;
         }
@@ -2257,7 +2859,56 @@ function startServer(attempt = 0) {
           }
           const name = live?.name || session.lastName || 'Player';
           const color = live?.color || session.lastColor || '#4ECDC4';
-          broadcastGameChat(session.room, name, text, color);
+          const profile = session.deviceId ? persistentStore.getPlayer(session.deviceId) : undefined;
+          const hideLevel = profile?.prefs?.hideLevel === true;
+          const level = hideLevel
+            ? undefined
+            : toQuestPublicView(session.questProgress ?? sanitizeQuestProgress(profile?.quests)).level;
+          broadcastGameChat(session.room, name, text, color, { level, hideLevel });
+          break;
+        }
+        case 'privateMessage': {
+          const now = Date.now();
+          if (now - session.lastChatAt < CHAT_RATE_LIMIT_MS) return;
+          const to = String(msg.to || '').trim().slice(0, 30);
+          const text = sanitizeChat(String(msg.text || ''));
+          if (!to || !text || !session.lastName) return;
+          if (/^(?:🏆\s*)?система$/iu.test(to)) {
+            send(ws, { type: 'error', message: 'Нельзя отправить личное сообщение Системе' });
+            break;
+          }
+          const liveId = activePlayerId(session);
+          const live = liveId ? engine().getState().players.find((p) => p.id === liveId) : undefined;
+          const name = live?.name || session.lastName || 'Player';
+          const color = live?.color || session.lastColor || '#4ECDC4';
+          const profile = session.deviceId ? persistentStore.getPlayer(session.deviceId) : undefined;
+          if (normalizeNick(to) === normalizeNick(name)) {
+            send(ws, { type: 'error', message: 'Нельзя отправить личное сообщение самому себе' });
+            break;
+          }
+          const hideLevel = profile?.prefs?.hideLevel === true;
+          const level = hideLevel
+            ? undefined
+            : toQuestPublicView(session.questProgress ?? sanitizeQuestProgress(profile?.quests)).level;
+          let delivered = false;
+          for (const [peerWs, peer] of clients) {
+            if (peer === session || peer.lastName.localeCompare(to, undefined, { sensitivity: 'accent' }) !== 0) continue;
+            if (
+              (session.deviceId && peer.deviceId === session.deviceId) ||
+              (profile?.accountLogin &&
+                persistentStore.getPlayer(peer.deviceId || '')?.accountLogin?.toLowerCase() === profile.accountLogin.toLowerCase())
+            ) {
+              continue;
+            }
+            send(peerWs, { type: 'privateChat', name, text, t: now, color, level, hideLevel });
+            delivered = true;
+          }
+          if (delivered) {
+            session.lastChatAt = now;
+            send(ws, { type: 'privateChat', name, text, t: now, color, level, hideLevel });
+          } else {
+            send(ws, { type: 'error', message: 'Игрок не в сети' });
+          }
           break;
         }
         case 'input': {
@@ -2282,7 +2933,8 @@ function startServer(attempt = 0) {
             return;
           }
           if (isTeamFight(session.room) && teamStates[session.room].phase !== 'fighting') return;
-          engine().splitPlayer(id);
+          const created = engine().splitPlayer(id);
+          if (session.questRun && created > 0) session.questRun.splits += 1;
           break;
         }
         case 'eject': {
@@ -2314,10 +2966,6 @@ function startServer(attempt = 0) {
           engine().setPlayerFrozen(id, next);
           break;
         }
-        case 'ping': {
-          send(ws, { type: 'pong', t: msg.t });
-          break;
-        }
         case 'syncProfile': {
           const deviceId =
             persistentStore.resolveDeviceId(msg.deviceId, msg.fingerprint) ||
@@ -2336,8 +2984,15 @@ function startServer(attempt = 0) {
             lastNick: profile.lastNick,
             skinId: profile.skinId,
             prefs: profile.prefs,
-            accountLogin: profile.accountLogin,
+            accountLogin: persistentStore.isAccountBoundToDevice(profile.accountLogin, deviceId)
+              ? profile.accountLogin
+              : null,
+            quest: toQuestPublicView(sanitizeQuestProgress(profile.quests), {
+              followerOnly: !!profile.accountLogin && !isQuestPrimary(session, profile.accountLogin),
+              pendingLevelRewards: profile.pendingLevelRewards,
+            }),
           });
+          session.questProgress = sanitizeQuestProgress(profile.quests);
           break;
         }
         case 'registerAccount': {
@@ -2370,7 +3025,12 @@ function startServer(attempt = 0) {
             skinId: result.profile.skinId,
             prefs: result.profile.prefs,
             accountLogin: result.profile.accountLogin,
+            quest: toQuestPublicView(sanitizeQuestProgress(result.profile.quests), {
+              followerOnly: !!result.profile.accountLogin && !isQuestPrimary(session, result.profile.accountLogin),
+              pendingLevelRewards: result.profile.pendingLevelRewards,
+            }),
           });
+          session.questProgress = sanitizeQuestProgress(result.profile.quests);
           break;
         }
         case 'loginAccount': {
@@ -2407,7 +3067,12 @@ function startServer(attempt = 0) {
             skinId: result.profile.skinId,
             prefs: result.profile.prefs,
             accountLogin: result.profile.accountLogin,
+            quest: toQuestPublicView(sanitizeQuestProgress(result.profile.quests), {
+              followerOnly: !!result.profile.accountLogin && !isQuestPrimary(session, result.profile.accountLogin),
+              pendingLevelRewards: result.profile.pendingLevelRewards,
+            }),
           });
+          session.questProgress = sanitizeQuestProgress(result.profile.quests);
           break;
         }
         case 'requestPasswordReset': {
@@ -2504,7 +3169,7 @@ function startServer(attempt = 0) {
             send(ws, { type: 'adminDbResult', ok: false, message: 'Только для администратора' });
             break;
           }
-          if (msg.confirmation !== 'CONFIRM') {
+          if (!/^(confirm|конфирм)$/iu.test(msg.confirmation.trim())) {
             send(ws, { type: 'adminDbResult', ok: false, message: 'Подтверждение не принято' });
             break;
           }
@@ -2519,6 +3184,20 @@ function startServer(attempt = 0) {
             break;
           }
           send(ws, { type: 'adminBotLogs', text: botLogs.getText() });
+          break;
+        }
+        case 'adminRestartClassic': {
+          refreshAdmin(session);
+          if (!session.isAdmin) {
+            send(ws, { type: 'adminDbResult', ok: false, message: 'Только для администратора' });
+            break;
+          }
+          restartClassicRoom();
+          send(ws, {
+            type: 'adminDbResult',
+            ok: true,
+            message: 'Классик сервер перезагружен: игровое поле очищено, игроки сброшены',
+          });
           break;
         }
         default:
@@ -2537,6 +3216,15 @@ function startServer(attempt = 0) {
         clearSessionPlayers(session, engineFor(session.room));
       }
       clients.delete(ws);
+      if (session.questAccountKey && questPrimaryByAccount.get(session.questAccountKey) === ws) {
+        const replacement = [...clients.values()].find(
+          (candidate) =>
+            candidate.questAccountKey === session.questAccountKey &&
+            candidate.ws.readyState === WebSocket.OPEN
+        );
+        if (replacement) questPrimaryByAccount.set(session.questAccountKey, replacement.ws);
+        else questPrimaryByAccount.delete(session.questAccountKey);
+      }
       broadcastRoomInfo();
     };
 
@@ -2545,6 +3233,7 @@ function startServer(attempt = 0) {
   });
 
   httpServer.listen(PORT, '0.0.0.0');
+  processWeeklyTops();
   restartTickLoop();
 
   const shutdown = () => {

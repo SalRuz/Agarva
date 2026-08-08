@@ -56,6 +56,8 @@ export interface GameplayConfig {
   foodRespawnThreshold: number;
   foodRespawnBatch: number;
   foodViewRadius: number;
+  /** Admin multiplier for the food/ejected-mass view radius. */
+  foodViewScale: number;
   foodViewPerSumRadius: number;
   foodViewPerMaxRadius: number;
   foodViewMax: number;
@@ -133,6 +135,13 @@ export interface GameplayConfig {
   cursorSlowdownFactor: number;
   /** Distance in cell radii within which slowdown applies (e.g. 1.05 = just past edge). */
   cursorSlowdownRadiusMult: number;
+  /** 1 = client prioritizes input responsiveness over some interpolation smoothness. */
+  /** 1 = aggressively reduce snapshot frequency and entity payloads. */
+  /**
+   * Network optimize: binary+delta snapshots, interest management already on,
+   * client prediction. Cuts traffic hard; does not change geography/ping physics.
+   */
+  lowTrafficMode: number;
 }
 
 /** Spawn mass for Solo Fight duelists only — not used in physics config. */
@@ -179,7 +188,9 @@ export const defaultGameplayConfig: GameplayConfig = {
   foodCountMp: 5400,
   foodRespawnThreshold: 1000,
   foodRespawnBatch: 60,
+  // Classic size-scaled food/W FOV (same formula as early shared/constants).
   foodViewRadius: 1600,
+  foodViewScale: 1,
   foodViewPerSumRadius: 5.5,
   foodViewPerMaxRadius: 4,
   foodViewMax: 9000,
@@ -230,7 +241,8 @@ export const defaultGameplayConfig: GameplayConfig = {
   spectatePanSpeed: 28,
   spectateMinZoom: 0.05,
   spectateMaxZoom: 250,
-  playViewRadiusMult: 1.2,
+  // Rounded continuous 3.5×3.5-sector FOV (half-width = 1.75 sectors).
+  playViewRadiusMult: 1.75,
   spectateViewRadiusMult: 1.2,
   squeezeThroughEnabled: 0,
   autoSplitEnabled: 1,
@@ -238,6 +250,7 @@ export const defaultGameplayConfig: GameplayConfig = {
   cursorSlowdownEnabled: 1,
   cursorSlowdownFactor: 0.55,
   cursorSlowdownRadiusMult: 1.05,
+  lowTrafficMode: 1,
 };
 
 const CONFIG_KEYS = Object.keys(defaultGameplayConfig) as (keyof GameplayConfig)[];
@@ -295,6 +308,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.foodRespawnThreshold = Math.max(0, Math.round(out.foodRespawnThreshold));
   out.foodRespawnBatch = Math.max(0, Math.round(out.foodRespawnBatch));
   out.foodViewRadius = Math.max(100, out.foodViewRadius);
+  out.foodViewScale = clampRange(out.foodViewScale, 0.5, 3);
   out.foodViewPerSumRadius = Math.max(0, out.foodViewPerSumRadius);
   out.foodViewPerMaxRadius = Math.max(0, out.foodViewPerMaxRadius);
   out.foodViewMax = Math.max(out.foodViewRadius, out.foodViewMax);
@@ -328,8 +342,8 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.ejectMaxCount = Math.max(1, Math.round(out.ejectMaxCount));
   // These are admin-controlled per-snapshot limits. Keep a practical ceiling
   // instead of the old 200 cap so dense food/W scenes can be configured.
-  out.foodNetMax = clampRange(Math.round(out.foodNetMax), 1, 1000);
-  out.ejectNetMax = clampRange(Math.round(out.ejectNetMax), 1, 1000);
+  out.foodNetMax = clampRange(Math.round(out.foodNetMax), 1, 1500);
+  out.ejectNetMax = clampRange(Math.round(out.ejectNetMax), 1, 1500);
   out.massDecayPerSec = Math.max(0, out.massDecayPerSec);
   out.massDecayMin = Math.max(0, out.massDecayMin);
   out.botAiIntervalMs = Math.max(10, Math.round(out.botAiIntervalMs));
@@ -353,6 +367,7 @@ export function sanitizeGameplayConfig(input: Partial<GameplayConfig> | Gameplay
   out.cursorSlowdownEnabled = out.cursorSlowdownEnabled >= 0.5 ? 1 : 0;
   out.cursorSlowdownFactor = clampRange(out.cursorSlowdownFactor, 0.05, 1);
   out.cursorSlowdownRadiusMult = Math.max(0.2, out.cursorSlowdownRadiusMult);
+  out.lowTrafficMode = out.lowTrafficMode >= 0.5 ? 1 : 0;
   return out;
 }
 

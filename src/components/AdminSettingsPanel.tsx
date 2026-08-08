@@ -29,8 +29,9 @@ const SECTIONS: SectionDef[] = [
         step: 100,
       },
       { key: 'serverTickHz', label: 'Tick rate сервера', help: 'Частота обновления сервера в секунду.', step: 1 },
-      { key: 'foodNetMax', label: 'Лимит еды в снапшоте', help: 'Сколько кусочков еды максимум отправлять клиенту (1–1000).', step: 1 },
-      { key: 'ejectNetMax', label: 'Макс. W в обзоре', help: 'Сколько W максимум отображать и отправлять клиенту в его обзоре (1–1000).', step: 1 },
+      { key: 'foodNetMax', label: 'Лимит еды в снапшоте', help: 'Сколько кусочков еды максимум отправлять клиенту (1–1500).', step: 1 },
+      { key: 'ejectNetMax', label: 'Макс. W в обзоре', help: 'Сколько W максимум отображать и отправлять клиенту в его обзоре (1–1500).', step: 1 },
+      { key: 'lowTrafficMode', label: 'Экономия трафика (0/1)', help: '1 = меньше трафика: еда обновляется реже, но клетки, вирусы и W остаются на обычной частоте.', step: 1 },
     ],
   },
   {
@@ -84,6 +85,7 @@ const SECTIONS: SectionDef[] = [
       { key: 'foodRespawnThreshold', label: 'Порог респавна еды', help: 'Когда еды меньше этого числа, сервер добавляет новую.', step: 1 },
       { key: 'foodRespawnBatch', label: 'Скорость спавна еды', help: 'Сколько пеллет сервер добавляет за тик, когда еды меньше порога. Больше = быстрее восстановление.', step: 1 },
       { key: 'foodViewRadius', label: 'Базовый FOV еды', help: 'Базовая дальность видимости еды.', step: 10 },
+      { key: 'foodViewScale', label: 'Множитель FOV частиц', help: '1 = обычный обзор; 1.5 = примерно в полтора раза дальше.', step: 0.1 },
       { key: 'foodViewPerSumRadius', label: 'FOV от суммы радиусов', help: 'Насколько обзор растёт от общей суммы клеток.', step: 0.1 },
       { key: 'foodViewPerMaxRadius', label: 'FOV от максимального радиуса', help: 'Насколько обзор растёт от самой большой клетки.', step: 0.1 },
       { key: 'foodViewMax', label: 'Максимальный FOV', help: 'Жёсткий максимум обзора.', step: 10 },
@@ -233,11 +235,16 @@ interface AdminSettingsPanelProps {
   onDownloadDb?: () => void;
   onUploadDb?: (text: string) => void;
   onWipeDatabase?: () => void;
+  onRestartClassic?: () => void;
   onGetBotLogs?: () => void;
   botLogs?: string;
   customSkins?: SkinInfo[];
-  onUploadSkin?: (file: File, name: string) => Promise<void>;
+  onUploadSkin?: (file: File, name: string, kind: 'global' | 'shop' | 'level', price: number, level: number) => Promise<void>;
   onDeleteSkin?: (skin: SkinInfo) => Promise<void>;
+  telegramChannelUrl?: string;
+  onSaveTelegramChannel?: (url: string) => Promise<void>;
+  weeklyTopPrizes?: Record<'classic' | 'soloFight' | 'duoFight' | 'trioFight', number>;
+  onSaveWeeklyTopPrizes?: (prizes: Record<'classic' | 'soloFight' | 'duoFight' | 'trioFight', number>) => Promise<void>;
 }
 
 export function AdminSettingsPanel({
@@ -255,11 +262,16 @@ export function AdminSettingsPanel({
   onDownloadDb,
   onUploadDb,
   onWipeDatabase,
+  onRestartClassic,
   onGetBotLogs,
   botLogs = '',
   customSkins = [],
   onUploadSkin,
   onDeleteSkin,
+  telegramChannelUrl = '',
+  onSaveTelegramChannel,
+  weeklyTopPrizes = { classic: 60, soloFight: 60, duoFight: 60, trioFight: 60 },
+  onSaveWeeklyTopPrizes,
 }: AdminSettingsPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dbFileInputRef = useRef<HTMLInputElement>(null);
@@ -269,6 +281,11 @@ export function AdminSettingsPanel({
   const skinFileInputRef = useRef<HTMLInputElement>(null);
   const [skinName, setSkinName] = useState('');
   const [skinBusy, setSkinBusy] = useState(false);
+  const [skinKind, setSkinKind] = useState<'global' | 'shop' | 'level'>('global');
+  const [skinPrice, setSkinPrice] = useState('0');
+  const [skinLevel, setSkinLevel] = useState('1');
+  const [telegramUrl, setTelegramUrl] = useState(telegramChannelUrl);
+  const [prizes, setPrizes] = useState(weeklyTopPrizes);
   const totalFields = useMemo(() => SECTIONS.reduce((sum, section) => sum + section.fields.length, 0), []);
 
   if (!open) return null;
@@ -369,6 +386,34 @@ export function AdminSettingsPanel({
             </div>
           </section>
 
+          <section className="rounded-2xl border border-sky-400/25 bg-sky-500/5 p-4">
+            <h3 className="text-xl font-semibold text-white mb-2">Сервер</h3>
+            <div className="space-y-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (window.confirm('Перезагрузить только Classic? Поле, еда, W, колючки и игроки Classic будут сброшены. Соло/Дуо/Трио не затрагиваются.')) onRestartClassic?.();
+                }}
+                className="mt-2 rounded-xl bg-red-700 px-4 py-2 text-white hover:bg-red-800 transition"
+              >
+                Перезагрузить классик сервер
+              </button>
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-amber-400/25 bg-amber-500/5 p-4">
+            <h3 className="text-xl font-semibold text-white mb-2">Недельные награды</h3>
+            <p className="mb-3 text-xs text-slate-400">Агарвики, которые получает #1 по итогам недели в каждом режиме.</p>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {([['classic', 'Классик'], ['soloFight', 'Соло'], ['duoFight', 'Дуо'], ['trioFight', 'Трио']] as const).map(([mode, label]) => (
+                <label key={mode} className="text-sm text-slate-200">{label}
+                  <input type="number" min="0" value={prizes[mode]} onChange={(e) => setPrizes((current) => ({ ...current, [mode]: Math.max(0, Number(e.target.value) || 0) }))} className="mt-1 w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white" />
+                </label>
+              ))}
+            </div>
+            <button type="button" onClick={() => void onSaveWeeklyTopPrizes?.(prizes)} className="mt-3 rounded-xl bg-amber-600 px-4 py-2 text-white">Сохранить награды</button>
+          </section>
+
           <section className="rounded-2xl border border-fuchsia-400/25 bg-fuchsia-500/5 p-4">
             <h3 className="text-xl font-semibold text-white mb-2">Пользовательские скины</h3>
             <p className="text-xs text-slate-400 mb-3">
@@ -385,6 +430,16 @@ export function AdminSettingsPanel({
                   placeholder="Например, мой скин"
                 />
               </label>
+              <label className="block">
+                <span className="mb-1 block text-xs text-slate-300">Раздел</span>
+                <select value={skinKind} onChange={(event) => setSkinKind(event.target.value as 'global' | 'shop' | 'level')} className="rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white">
+                  <option value="global">Глобальный</option>
+                  <option value="shop">Магазин</option>
+                  <option value="level">Награда за уровень</option>
+                </select>
+              </label>
+              {skinKind === 'shop' && <label className="block"><span className="mb-1 block text-xs text-slate-300">Цена, агарвики</span><input value={skinPrice} onChange={(e) => setSkinPrice(e.target.value)} inputMode="numeric" className="w-28 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white" /></label>}
+              {skinKind === 'level' && <label className="block"><span className="mb-1 block text-xs text-slate-300">Уровень</span><input value={skinLevel} onChange={(e) => setSkinLevel(e.target.value)} inputMode="numeric" className="w-28 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white" /></label>}
               <button
                 type="button"
                 disabled={skinBusy}
@@ -404,7 +459,7 @@ export function AdminSettingsPanel({
                   if (!file || !onUploadSkin) return;
                   setSkinBusy(true);
                   try {
-                    await onUploadSkin(file, skinName);
+                    await onUploadSkin(file, skinName, skinKind, Number(skinPrice), Number(skinLevel));
                     setSkinName('');
                   } finally {
                     setSkinBusy(false);
@@ -413,6 +468,21 @@ export function AdminSettingsPanel({
               />
             </div>
             {customSkins.length > 0 ? (
+              <>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <div className="rounded-xl border border-amber-300/25 bg-amber-500/5 p-3">
+                  <div className="text-sm font-semibold text-amber-100">Награды за уровни</div>
+                  {customSkins.filter((skin) => skin.kind === 'level').length ? customSkins.filter((skin) => skin.kind === 'level').map((skin) => (
+                    <div key={skin.id} className="mt-1 text-xs text-slate-200">Уровень {skin.level ?? 1} · {skin.name} · <span className="font-mono text-slate-400">{skin.id}</span></div>
+                  )) : <div className="mt-1 text-xs text-slate-500">Нет добавленных скинов.</div>}
+                </div>
+                <div className="rounded-xl border border-sky-300/25 bg-sky-500/5 p-3">
+                  <div className="text-sm font-semibold text-sky-100">Магазин</div>
+                  {customSkins.filter((skin) => skin.kind === 'shop').length ? customSkins.filter((skin) => skin.kind === 'shop').map((skin) => (
+                    <div key={skin.id} className="mt-1 text-xs text-slate-200">{skin.name} · {skin.price ?? 0} агарвиков · <span className="font-mono text-slate-400">{skin.id}</span></div>
+                  )) : <div className="mt-1 text-xs text-slate-500">Нет добавленных скинов.</div>}
+                </div>
+              </div>
               <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
                 {customSkins.map((skin) => (
                   <div key={skin.id} className="rounded-xl border border-white/10 bg-black/20 p-2">
@@ -437,9 +507,19 @@ export function AdminSettingsPanel({
                   </div>
                 ))}
               </div>
+              </>
             ) : (
               <p className="mt-4 text-sm text-slate-400">Пока нет загруженных скинов.</p>
             )}
+          </section>
+
+          <section className="rounded-2xl border border-sky-400/25 bg-sky-500/5 p-4">
+            <h3 className="text-xl font-semibold text-white mb-2">Telegram-канал</h3>
+            <p className="mb-3 text-xs text-slate-400">Пустая ссылка скрывает кнопку в главном меню.</p>
+            <div className="flex flex-wrap gap-3">
+              <input value={telegramUrl} onChange={(event) => setTelegramUrl(event.target.value)} placeholder="https://t.me/..." className="min-w-64 flex-1 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white" />
+              <button type="button" onClick={() => void onSaveTelegramChannel?.(telegramUrl)} className="rounded-xl bg-sky-600 px-4 py-2 text-white">Сохранить канал</button>
+            </div>
           </section>
 
           {SECTIONS.map((section) => (
@@ -508,20 +588,20 @@ export function AdminSettingsPanel({
             <h3 className="text-xl font-bold text-red-200">Стереть всю базу?</h3>
             <p className="mt-2 text-sm text-slate-300">
               Необратимо удалятся аккаунты, Telegram-привязки, профили устройств, топы и сохранённый админ-конфиг.
-              Введите <strong>CONFIRM</strong> для подтверждения.
+              Введите <strong>confirm</strong> или <strong>конфирм</strong> для подтверждения.
             </p>
             <input
               autoFocus
               value={wipeConfirmation}
               onChange={(event) => setWipeConfirmation(event.target.value)}
               className="mt-4 w-full rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-white"
-              placeholder="CONFIRM"
+              placeholder="confirm"
             />
             <div className="mt-4 flex justify-end gap-3">
               <button type="button" onClick={() => setWipeOpen(false)} className="rounded-xl bg-white/10 px-4 py-2 text-white">Отмена</button>
               <button
                 type="button"
-                disabled={wipeConfirmation !== 'CONFIRM'}
+                disabled={!/^(confirm|конфирм)$/iu.test(wipeConfirmation.trim())}
                 onClick={() => {
                   onWipeDatabase?.();
                   setWipeOpen(false);

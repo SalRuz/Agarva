@@ -8,7 +8,19 @@ import type { BotLogBuffer } from '../server/botLogs';
 type Mode = 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
 type FightMode = Exclude<Mode, 'classic'>;
 type AuthStep = { step: 'login' } | { step: 'password'; login: string };
-type GameDb = { accounts?: Record<string, { login: string; passwordHash: string }>; tgAccounts?: Record<string, string> };
+type SkinOrder = { chatId: string; login: string; status: string; dataBase64?: string; mime?: 'image/png' | 'image/jpeg' | 'image/webp'; createdAt: number };
+type GameDb = {
+  accounts?: Record<string, { login: string; passwordHash: string }>;
+  tgAccounts?: Record<string, string>;
+  players?: Record<string, { accountLogin?: string; quests?: { unlockedSkinIds?: string[] } }>;
+  customSkins?: Record<string, { id: string; name: string; fileName: string; mime: 'image/png' | 'image/jpeg' | 'image/webp'; dataBase64: string; kind: 'personal'; accountLogin: string; createdAt: number }>;
+  customSkinOrders?: Record<string, SkinOrder>;
+};
+type BotProfile = {
+  login: string;
+  deviceId: string | null;
+  quest: { level: number; xp: number; agarviki: number; title: string; progress: number; requirement: number };
+};
 type ChatLine = { id: number; room: Mode; name: string; text: string; t: number };
 type OutboxMessage = { id: number; chatId: string; text: string };
 
@@ -33,6 +45,7 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
   const bot = new TelegramBot(token, { polling: true });
   const selectedRoom = new Map<number, Mode>();
   const authFlow = new Map<number, AuthStep>();
+  const skinFlow = new Map<number, 'confirm' | 'photo'>();
   const chatCursor = new Map<Mode, number>();
   let dbCache: GameDb | null = null;
   const isDev = (chatId: number) => String(chatId) === process.env.TELEGRAM_DEV_ID?.trim();
@@ -51,7 +64,10 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     return dbCache;
   };
   const saveDb = async (db: GameDb) => {
-    await api('/api/bot/db', { method: 'POST', body: JSON.stringify({ json: JSON.stringify(db, null, 2) }) });
+    // The bot may have cached this snapshot while players earned progress.
+    // Merge only bot-owned changes on the server; never replace live profiles
+    // with this potentially stale full export.
+    await api('/api/bot/db/merge', { method: 'POST', body: JSON.stringify({ json: JSON.stringify(db, null, 2) }) });
     dbCache = db;
   };
   const loggedInLogin = async (chatId: number) => (dbCache ?? await loadDb()).tgAccounts?.[String(chatId)];
@@ -59,7 +75,7 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     const login = await loggedInLogin(chatId);
     const rows: { text: string }[][] = [
       modes.map((mode) => ({ text: labels[mode] })), [{ text: 'Онлайн' }, { text: 'Топы' }],
-      login ? [{ text: 'Профиль' }] : [{ text: 'Вход в аккаунт' }],
+      login ? [{ text: 'Профиль' }, { text: 'Отвязать от устройства' }, { text: 'Купить кастомный скин' }] : [{ text: 'Вход в аккаунт' }],
     ];
     if (isDev(chatId)) rows.push([{ text: 'Скачать БД' }, { text: 'Загрузить БД' }]);
     if (connected) rows.unshift([{ text: 'Выйти из чата' }]);
@@ -80,6 +96,19 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     const entries = await api<{ name: string; score: number }[]>(`/api/bot/tops?mode=${mode}`);
     return `${labels[mode]}\n${entries.slice(0, 10).map((x, i) => `${i + 1}. ${x.name} — ${x.score}`).join('\n') || 'Пока нет результатов'}`;
   }))).join('\n\n');
+  const profileText = async (login: string) => {
+    const profile = await api<BotProfile>(`/api/bot/profile?login=${encodeURIComponent(login)}`);
+    const device = profile.deviceId
+      ? `${profile.deviceId.slice(0, 6)}…${profile.deviceId.slice(-4)}`
+      : 'не привязан';
+    return [
+      `Профиль: ${profile.login}`,
+      `Уровень: ${profile.quest.level} · XP: ${profile.quest.xp}`,
+      `Агарвики: ${profile.quest.agarviki}`,
+      `Текущее задание: ${profile.quest.title} (${Math.floor(profile.quest.progress)} / ${Math.floor(profile.quest.requirement)})`,
+      `Устройство: ${device}`,
+    ].join('\n');
+  };
   const sendDbFile = async (chatId: number) => {
     if (!isDev(chatId)) return;
     const { json } = await api<{ json: string }>('/api/bot/db');
@@ -87,7 +116,34 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
     try { await writeFile(file, json, 'utf8'); await bot.sendDocument(chatId, file, { caption: 'Глобальная БД Agarva' }); }
     finally { await unlink(file).catch(() => {}); }
   };
+  const sendScheduledDbBackup = async () => {
+    const chatId = Number(process.env.TELEGRAM_DEV_ID?.trim());
+    if (!Number.isSafeInteger(chatId)) return;
+    await sendDbFile(chatId);
+    logs.write('info', 'Пятичасовой бэкап БД отправлен разработчику.');
+  };
   const passwordHash = (password: string) => createHash('sha256').update(`agarva:${password}`).digest('hex');
+  const imageMime = (data: Buffer): SkinOrder['mime'] | null => {
+    if (data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+    if (data[0] === 0xff && data[1] === 0xd8) return 'image/jpeg';
+    if (data.subarray(0, 4).toString() === 'RIFF' && data.subarray(8, 12).toString() === 'WEBP') return 'image/webp';
+    return null;
+  };
+  const orderFor = (db: GameDb, chatId: number, status: string) =>
+    Object.entries(db.customSkinOrders ?? {}).find(([, order]) => order.chatId === String(chatId) && order.status === status);
+  const finishPersonalSkin = async (db: GameDb, orderId: string, order: SkinOrder) => {
+    if (!order.dataBase64 || !order.mime) throw new Error('Изображение скина не найдено');
+    const ext = order.mime === 'image/png' ? 'png' : order.mime === 'image/jpeg' ? 'jpg' : 'webp';
+    const id = `personal-${orderId}`;
+    db.customSkins ??= {};
+    db.customSkins[id] = { id, name: `Кастомный скин ${order.login}`, fileName: `${id}.${ext}`, mime: order.mime, dataBase64: order.dataBase64, kind: 'personal', accountLogin: order.login, createdAt: Date.now() };
+    const player = Object.values(db.players ?? {}).find((item) => item.accountLogin?.toLowerCase() === order.login.toLowerCase());
+    if (!player) throw new Error('Игровой профиль не найден');
+    player.quests ??= {}; player.quests.unlockedSkinIds ??= [];
+    if (!player.quests.unlockedSkinIds.includes(id)) player.quests.unlockedSkinIds.push(id);
+    order.status = 'completed';
+    await saveDb(db);
+  };
   const pollGameChat = async () => {
     for (const room of new Set(selectedRoom.values())) {
       const response = await api<{ lines: ChatLine[]; lastId: number }>(`/api/bot/chat-out?room=${room}&since=${chatCursor.get(room) ?? 0}`);
@@ -108,6 +164,18 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
   bot.onText(/^\/tops$/, (msg) => void topsText().then((text) => bot.sendMessage(msg.chat.id, text)).catch((error) => sendError(msg.chat.id, error)));
   bot.onText(/^\/db$/, (msg) => void sendDbFile(msg.chat.id).catch((error) => sendError(msg.chat.id, error)));
   bot.on('document', (msg) => {
+    const pending = dbCache && orderFor(dbCache, msg.chat.id, 'approved');
+    if (pending && msg.document?.file_id) {
+      void (async () => {
+        const [orderId, order] = pending;
+        order.status = 'payment_sent'; await saveDb(dbCache!);
+        const devId = Number(process.env.TELEGRAM_DEV_ID);
+        await bot.forwardMessage(devId, msg.chat.id, msg.message_id);
+        await bot.sendMessage(devId, `Оплата кастомного скина ${order.login}`, { reply_markup: { inline_keyboard: [[{ text: 'Подтвердить оплату', callback_data: `skin:paid:${orderId}` }, { text: 'Отклонить', callback_data: `skin:reject:${orderId}` }]] } });
+        await bot.sendMessage(msg.chat.id, 'Чек отправлен на проверку.');
+      })().catch((error) => sendError(msg.chat.id, error));
+      return;
+    }
     if (!isDev(msg.chat.id) || !msg.document?.file_id) return;
     void (async () => {
       const json = await (await fetch(await bot.getFileLink(msg.document!.file_id))).text();
@@ -115,10 +183,53 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
       await bot.sendMessage(msg.chat.id, 'БД загружена на игровой хост.');
     })().catch((error) => sendError(msg.chat.id, error));
   });
+  bot.on('photo', (msg) => {
+    if (skinFlow.get(msg.chat.id) !== 'photo') return;
+    void (async () => {
+      const login = await loggedInLogin(msg.chat.id);
+      if (!login) throw new Error('Сначала войдите в аккаунт.');
+      const photo = msg.photo?.at(-1);
+      if (!photo) throw new Error('Фото не найдено');
+      const data = Buffer.from(await (await fetch(await bot.getFileLink(photo.file_id))).arrayBuffer());
+      const mime = imageMime(data);
+      if (!mime) throw new Error('Поддерживаются PNG, JPG и WEBP');
+      const db = await loadDb(), id = `order-${Date.now()}-${msg.chat.id}`;
+      db.customSkinOrders ??= {};
+      db.customSkinOrders[id] = { chatId: String(msg.chat.id), login, status: 'moderation', dataBase64: data.toString('base64'), mime, createdAt: Date.now() };
+      await saveDb(db); skinFlow.delete(msg.chat.id);
+      const devId = Number(process.env.TELEGRAM_DEV_ID);
+      await bot.forwardMessage(devId, msg.chat.id, msg.message_id);
+      await bot.sendMessage(devId, `Скин на модерацию: ${login}`, { reply_markup: { inline_keyboard: [[{ text: 'Одобрить', callback_data: `skin:approve:${id}` }, { text: 'Отклонить', callback_data: `skin:reject:${id}` }]] } });
+      await bot.sendMessage(msg.chat.id, 'Скин отправлен разработчику на модерацию.');
+    })().catch((error) => sendError(msg.chat.id, error));
+  });
+  bot.on('callback_query', (query) => {
+    if (!isDev(query.message?.chat.id ?? 0) || !query.data?.startsWith('skin:')) return;
+    void (async () => {
+      const [, action, orderId] = query.data!.split(':');
+      const db = await loadDb(), order = db.customSkinOrders?.[orderId];
+      if (!order) throw new Error('Заявка не найдена');
+      if (action === 'approve') {
+        order.status = 'approved'; await saveDb(db);
+        await bot.sendMessage(Number(order.chatId), `Скин одобрен. Стоимость — 200 рублей.\nРеквизиты: ${process.env.SKIN_PAYMENT_DETAILS?.trim() || 'укажите SKIN_PAYMENT_DETAILS в настройках сервера'}\nПришлите скриншот или документ с оплатой.`);
+      } else if (action === 'paid') {
+        await finishPersonalSkin(db, orderId, order);
+        await bot.sendMessage(Number(order.chatId), 'Оплата подтверждена. Скин готов и добавлен в личные скины игры.');
+      } else {
+        order.status = 'rejected'; await saveDb(db);
+        await bot.sendMessage(Number(order.chatId), action === 'reject' ? 'Заявка на кастомный скин отклонена.' : 'Оплата не подтверждена.');
+      }
+      await bot.answerCallbackQuery(query.id);
+    })().catch((error) => sendError(query.message?.chat.id ?? 0, error));
+  });
   bot.on('message', (msg) => {
     if (!msg.text || msg.text.startsWith('/')) return;
     void (async () => {
       const chatId = msg.chat.id, text = msg.text!.trim(), flow = authFlow.get(chatId);
+      if (skinFlow.get(chatId) === 'confirm') {
+        if (/^(да|yes)$/iu.test(text)) { skinFlow.set(chatId, 'photo'); return void bot.sendMessage(chatId, 'Отправьте фото будущего скина (PNG, JPG или WEBP).'); }
+        skinFlow.delete(chatId); return void bot.sendMessage(chatId, 'Покупка кастомного скина отменена.');
+      }
       if (flow?.step === 'login') {
         if (!/^[a-zA-Z0-9]{1,15}$/.test(text)) return void bot.sendMessage(chatId, 'Логин: латинские буквы и цифры (до 15).');
         authFlow.set(chatId, { step: 'password', login: text }); return void bot.sendMessage(chatId, 'Введите пароль (макс. 8 символов):');
@@ -132,7 +243,21 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
       if (text === 'Онлайн') return void bot.sendMessage(chatId, await onlineText());
       if (text === 'Топы') return void bot.sendMessage(chatId, await topsText());
       if (text === 'Вход в аккаунт') { if (await loggedInLogin(chatId)) return void bot.sendMessage(chatId, 'Вы уже вошли в аккаунт.'); authFlow.set(chatId, { step: 'login' }); return void bot.sendMessage(chatId, 'Введите логин аккаунта:'); }
-      if (text === 'Профиль') { const login = await loggedInLogin(chatId); return void bot.sendMessage(chatId, login ? `Профиль: ${login}` : 'Сначала войдите в аккаунт.'); }
+      if (text === 'Профиль') {
+        const login = await loggedInLogin(chatId);
+        return void bot.sendMessage(chatId, login ? await profileText(login) : 'Сначала войдите в аккаунт.');
+      }
+      if (text === 'Купить кастомный скин') {
+        if (!await loggedInLogin(chatId)) return void bot.sendMessage(chatId, 'Сначала войдите в аккаунт игры.');
+        skinFlow.set(chatId, 'confirm');
+        return void bot.sendMessage(chatId, 'Кастомный скин стоит 200 рублей. Продолжить? Ответьте «да» или «нет».');
+      }
+      if (text === 'Отвязать от устройства') {
+        const login = await loggedInLogin(chatId);
+        if (!login) return void bot.sendMessage(chatId, 'Сначала войдите в аккаунт.');
+        await api('/api/bot/unlink-device', { method: 'POST', body: JSON.stringify({ login }) });
+        return void bot.sendMessage(chatId, 'Устройство отвязано. На старом устройстве потребуется вход; на новом войдите логином и паролем.');
+      }
       if (text === 'Скачать БД') return void sendDbFile(chatId);
       if (text === 'Загрузить БД') return void bot.sendMessage(chatId, 'Пришлите JSON-файл БД документом.');
       if (text === 'Выйти из чата') { selectedRoom.delete(chatId); return void sendMenu(chatId, 'Вы вышли из игрового чата.'); }
@@ -147,6 +272,7 @@ export function startTelegramBot(logs: BotLogBuffer, gameApiUrl: string) {
   setInterval(() => void pollGameChat().catch((error) => logs.write('warn', `Чат: ${String(error)}`)), 2_000).unref();
   setInterval(() => void pollOutbox().catch((error) => logs.write('warn', `Outbox: ${String(error)}`)), 1_500).unref();
   setInterval(() => void loadDb().catch((error) => logs.write('warn', `Обновление БД: ${String(error)}`)), 60_000).unref();
+  setInterval(() => void sendScheduledDbBackup().catch((error) => logs.write('warn', `Бэкап БД: ${String(error)}`)), 5 * 60 * 60 * 1000).unref();
   void loadDb().catch((error) => logs.write('warn', `Начальная БД: ${String(error)}`));
   void pollOutbox().catch((error) => logs.write('warn', `Начальный outbox: ${String(error)}`));
   logs.write('info', `Бот запущен; игровой API: ${gameApiUrl}`);

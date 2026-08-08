@@ -71,6 +71,7 @@ export {
   getSectorLabel,
   getSectorLabelAt,
   getSectorSize,
+  isInSectorNeighborhood,
   getEntityViewRadius,
   isWithinViewRadius,
   isEntityNearView,

@@ -64,6 +64,8 @@ export class GameEngine {
   private cellPinnedUntil: Map<string, number> = new Map();
   /** Most recent non-central mouse direction, used for center-cursor split chains. */
   private lastMeaningfulAim: Map<string, { x: number; y: number }> = new Map();
+  /** Per-tick quest signals consumed by the multiplayer server. */
+  private questEvents: { kind: 'kill' | 'virus'; playerId: string; victimId?: string }[] = [];
   /** Players whose latest mouse input was on/very near their center. */
   private centerCursorAimPlayers: Set<string> = new Set();
   private lastUpdate: number = Date.now();
@@ -292,6 +294,12 @@ export class GameEngine {
     this.centerCursorAimPlayers.delete(playerId);
     if (player.isBot) this.botAI.cleanup(playerId);
     this.state.players.splice(idx, 1);
+  }
+
+  consumeQuestEvents(): { kind: 'kill' | 'virus'; playerId: string; victimId?: string }[] {
+    const events = this.questEvents;
+    this.questEvents = [];
+    return events;
   }
 
   addPlayer(
@@ -537,6 +545,33 @@ export class GameEngine {
     }
   }
 
+  /**
+   * Multibox: keep the deactivated player cruising in the last aim direction
+   * instead of stopping when input stops updating them.
+   */
+  cruisePlayerInLastAim(playerId: string) {
+    const player = this.state.players.find((p) => p.id === playerId);
+    if (!player || player.cells.length === 0) return;
+    const center = getPlayerCenter(player);
+    let aim = this.lastMeaningfulAim.get(playerId);
+    if (!aim) {
+      let vx = 0;
+      let vy = 0;
+      for (const cell of player.cells) {
+        vx += cell.velocityX;
+        vy += cell.velocityY;
+      }
+      const len = Math.hypot(vx, vy);
+      if (len < 0.05) return;
+      aim = { x: vx / len, y: vy / len };
+      this.lastMeaningfulAim.set(playerId, aim);
+    }
+    const cruise = 1_000_000;
+    player.targetX = center.x + aim.x * cruise;
+    player.targetY = center.y + aim.y * cruise;
+    this.centerCursorAimPlayers.delete(playerId);
+  }
+
   /** Admin: move all cells so player center lands on (x, y). */
   teleportPlayer(playerId: string, x: number, y: number) {
     const player = this.state.players.find((p) => p.id === playerId);
@@ -659,9 +694,9 @@ export class GameEngine {
     return bot;
   }
 
-  splitPlayer(playerId: string) {
+  splitPlayer(playerId: string): number {
     const player = this.state.players.find((p) => p.id === playerId);
-    if (!player || player.frozen || player.cells.length >= this.config.maxCellsPerPlayer) return;
+    if (!player || player.frozen || player.cells.length >= this.config.maxCellsPerPlayer) return 0;
     const now = Date.now();
     const splitTarget = this.getSplitTarget(player);
 
@@ -677,7 +712,8 @@ export class GameEngine {
       }
     }
     player.cells.push(...newCells);
-    player.lastSplit = now;
+    if (newCells.length > 0) player.lastSplit = now;
+    return newCells.length;
   }
 
   /**
@@ -1309,6 +1345,13 @@ export class GameEngine {
           this.addMassWithAutoSplit(hunter, hunterCell, getMass(candidate.cell.radius), now);
           preyCells.splice(preyIndex, 1);
           this.clearCellBirth(candidate.cell.id);
+          if (preyCells.length === 0 && !candidate.player.isBot) {
+            this.questEvents.push({
+              kind: 'kill',
+              playerId: hunter.id,
+              victimId: candidate.player.id,
+            });
+          }
         }
       }
     }
@@ -1326,6 +1369,7 @@ export class GameEngine {
           if (coversCell(cell, virus, this.config.virusAbsorbCoverage)) {
             this.popCellFromVirus(player, cell, this.config.virusBonusMass, now);
             virusesToRemove.add(virus.id);
+            this.questEvents.push({ kind: 'virus', playerId: player.id });
             break;
           }
         }
@@ -1541,6 +1585,7 @@ export class GameEngine {
           if (coversCell(cell, virus, this.config.virusAbsorbCoverage)) {
             this.popCellFromVirus(player, cell, this.config.virusBonusMass, now);
             virusesToRemove.add(virus.id);
+            this.questEvents.push({ kind: 'virus', playerId: player.id });
             hit = true;
             break;
           }

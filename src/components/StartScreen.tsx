@@ -2,10 +2,12 @@ import { useState, useEffect } from 'react';
 import { resolveServerUrl } from '../net/MultiplayerClient';
 import { isAdminName } from '../../shared/physics';
 import { ADMIN_PASSWORD } from '../../shared/constants';
+import type { SkinInfo } from '../skins/loadSkins';
 
 export type PlayRoomMode = 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
 
 export type SoloFightTopEntry = { name: string; score: number };
+export type ModeTopEntry = SoloFightTopEntry;
 export type LobbyRoomStats = {
   players: number | null;
   spectators: number | null;
@@ -47,8 +49,10 @@ interface StartScreenProps {
   roomRedMembers?: string[];
   /** Complete, server-authored snapshot for every mode preview card. */
   lobbyStats?: LobbyStatsByMode;
-  /** Fight total-wins leaderboard (shown beside menu) */
-  soloFightTop?: SoloFightTopEntry[];
+  /** Weekly rankings supplied for all game modes. */
+  modeTops?: Record<PlayRoomMode, ModeTopEntry[]>;
+  weeklyTopEndsAt?: Partial<Record<PlayRoomMode, number>>;
+  weeklyTopPrizes?: Partial<Record<PlayRoomMode, number>>;
   /** Selected skin preview URL (null = plain ball) */
   skinPreviewUrl?: string | null;
   /** Registered profile login (locked to device) */
@@ -65,6 +69,18 @@ interface StartScreenProps {
   passwordResetNotice?: string | null;
   passwordResetBusy?: boolean;
   passwordResetCodeSent?: boolean;
+  questLevel?: number;
+  questXpIntoLevel?: number;
+  questXpPerLevel?: number;
+  questAgarviki?: number;
+  questTitle?: string;
+  questProgressText?: string;
+  showQuestHud?: boolean;
+  onToggleShowQuestHud?: (next: boolean) => void;
+  claimedLevelRewards?: number[];
+  /** Built-in and admin-added skins awarded for each level. */
+  levelSkinRewards?: Record<number, SkinInfo[]>;
+  telegramChannelUrl?: string;
 }
 
 export function StartScreen({
@@ -93,7 +109,9 @@ export function StartScreen({
   roomBlueMembers = [],
   roomRedMembers = [],
   lobbyStats,
-  soloFightTop = [],
+  modeTops,
+  weeklyTopEndsAt,
+  weeklyTopPrizes,
   skinPreviewUrl = null,
   accountLogin = null,
   onRegisterAccount,
@@ -108,6 +126,17 @@ export function StartScreen({
   passwordResetNotice = null,
   passwordResetBusy = false,
   passwordResetCodeSent = false,
+  questLevel = 1,
+  questXpIntoLevel = 0,
+  questXpPerLevel = 100,
+  questAgarviki = 0,
+  questTitle = 'Задание',
+  questProgressText = '—',
+  showQuestHud = false,
+  onToggleShowQuestHud,
+  claimedLevelRewards = [],
+  levelSkinRewards = {},
+  telegramChannelUrl = '',
 }: StartScreenProps) {
   const [localError, setLocalError] = useState<string | null>(null);
   const [regOpen, setRegOpen] = useState(false);
@@ -123,7 +152,15 @@ export function StartScreen({
   const [resetCode, setResetCode] = useState('');
   const [resetPassword, setResetPassword] = useState('');
   const [resetLocalError, setResetLocalError] = useState<string | null>(null);
+  const [showLevelRewards, setShowLevelRewards] = useState(false);
   const adminName = isAdminName(name);
+  const questXpPercent = questXpPerLevel > 0 ? (questXpIntoLevel / questXpPerLevel) * 100 : 0;
+  const levelReward = (level: number) => {
+    const skins = levelSkinRewards[level] ?? [];
+    return skins.length
+      ? `10 агарвиков + ${skins.map((skin) => `скин «${skin.name}»`).join(', ')}`
+      : '10 агарвиков';
+  };
   const statsFor = (mode: PlayRoomMode): LobbyRoomStats =>
     lobbyStats?.[mode] ?? {
       players: mode === playMode ? roomPlayers : null,
@@ -133,6 +170,15 @@ export function StartScreen({
       blueMembers: mode === playMode ? roomBlueMembers : [],
       redMembers: mode === playMode ? roomRedMembers : [],
     };
+  const topFor = (mode: PlayRoomMode) => modeTops?.[mode] ?? [];
+  const formatUntilReset = (endsAt?: number) => {
+    if (!endsAt) return '—';
+    const seconds = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+    const days = Math.floor(seconds / 86_400);
+    const hours = Math.floor((seconds % 86_400) / 3_600);
+    const minutes = Math.floor((seconds % 3_600) / 60);
+    return `${days}д ${String(hours).padStart(2, '0')}ч ${String(minutes).padStart(2, '0')}м`;
+  };
 
   useEffect(() => {
     if (passwordResetCodeSent) setResetOpen(true);
@@ -217,13 +263,24 @@ export function StartScreen({
   };
 
   return (
-    <div className="absolute inset-0 flex items-center justify-center p-4 pointer-events-none z-50">
-      <div className="flex items-stretch justify-center gap-4 max-w-full">
-        <div className="pointer-events-auto w-[172px] shrink-0 flex flex-col items-center gap-3 self-start mt-4">
-          <div className="w-[100px] h-[100px] rounded-full overflow-hidden border-2 border-white/25 bg-gradient-to-br from-emerald-400 to-sky-500 shadow-lg">
-            {skinPreviewUrl ? (
-              <img src={skinPreviewUrl} alt="" className="w-full h-full object-cover" />
-            ) : null}
+    <div className="absolute inset-0 overflow-y-auto flex items-start sm:items-center justify-center p-3 sm:p-4 pointer-events-none z-50">
+      <div className="flex w-full max-w-5xl flex-col items-stretch justify-center gap-3 sm:gap-4 lg:flex-row">
+        <div className="pointer-events-auto w-full lg:w-[172px] shrink-0 flex flex-col items-center gap-3 self-start lg:mt-4 rounded-2xl border border-white/20 bg-black/70 backdrop-blur-lg p-3 shadow-lg">
+          <div className="relative w-[112px] h-[112px] flex items-center justify-center">
+            <div
+              className="absolute inset-0 rounded-full"
+              style={{
+                background: `conic-gradient(#38bdf8 ${Math.max(0, Math.min(100, questXpPercent))}%, rgba(255,255,255,0.12) 0)`,
+                WebkitMask: 'radial-gradient(farthest-side, transparent calc(100% - 7px), #000 calc(100% - 6px))',
+                mask: 'radial-gradient(farthest-side, transparent calc(100% - 7px), #000 calc(100% - 6px))',
+              }}
+              title={`Опыт: ${questXpIntoLevel}/${questXpPerLevel}`}
+            />
+            <div className="w-[100px] h-[100px] rounded-full overflow-hidden border-2 border-white/25 bg-gradient-to-br from-emerald-400 to-sky-500 shadow-lg relative z-[1]">
+              {skinPreviewUrl ? (
+                <img src={skinPreviewUrl} alt="" className="w-full h-full object-cover" />
+              ) : null}
+            </div>
           </div>
           {accountLogin ? (
             <div className="text-center text-amber-300 font-bold text-sm tracking-wide drop-shadow px-1 break-all">
@@ -394,17 +451,59 @@ export function StartScreen({
               >
                 Вход
               </button>
+              <button
+                type="button"
+                onClick={() => setShowLevelRewards(true)}
+                className="mt-2 w-full py-1.5 rounded-lg text-[10px] font-semibold border bg-amber-500/15 border-amber-300/30 text-amber-100 hover:bg-amber-500/25"
+              >
+                Просмотр награждений за уровни
+              </button>
             </div>
+          )}
+          <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2 text-center">
+            <div className="text-white text-xs font-semibold">Уровень {questLevel}</div>
+            <div className="text-amber-200/90 text-[11px] mt-0.5">Агарвики: {questAgarviki}</div>
+          </div>
+          {accountLogin ? (
+            <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2">
+              <div className="text-[10px] text-slate-300 uppercase tracking-wide mb-1">Задание</div>
+              <div className="text-white text-[11px] font-medium leading-snug">{questTitle}</div>
+              <div className="text-sky-200 text-[11px] mt-1 leading-snug">{questProgressText}</div>
+              <button
+                type="button"
+                onClick={() => onToggleShowQuestHud?.(!showQuestHud)}
+                className={`mt-2 w-full py-1.5 rounded-lg text-[10px] font-semibold border transition ${
+                  showQuestHud
+                    ? 'bg-emerald-600/80 border-emerald-300/40 text-white'
+                    : 'bg-white/10 border-white/15 text-slate-200 hover:bg-white/15'
+                }`}
+              >
+                {showQuestHud ? 'Задание в игре: вкл' : 'Отображать задание'}
+              </button>
+            </div>
+          ) : (
+            <div className="w-full rounded-xl border border-white/10 bg-black/30 px-2 py-2 text-[10px] text-slate-400 leading-snug">
+              Войдите в аккаунт, чтобы получать задания, опыт и Агарвики.
+            </div>
+          )}
+          {accountLogin && (
+            <button
+              type="button"
+              onClick={() => setShowLevelRewards(true)}
+              className="w-full py-2 rounded-lg text-[10px] font-semibold border bg-amber-500/15 border-amber-300/30 text-amber-100 hover:bg-amber-500/25"
+            >
+              Просмотр награждений за уровни
+            </button>
           )}
         </div>
 
         <div
-          className="bg-black/70 backdrop-blur-lg rounded-2xl p-8 max-w-md w-full border border-white/20 pointer-events-auto"
+          className="bg-black/70 backdrop-blur-lg rounded-2xl p-4 sm:p-8 max-w-md w-full border border-white/20 pointer-events-auto"
           onKeyDown={stopKeys}
           onKeyUp={stopKeys}
         >
           <div className="text-center mb-6">
-            <h1 className="text-6xl font-bold text-white mb-2 tracking-wider">
+            <h1 className="text-4xl sm:text-6xl font-bold text-white mb-2 tracking-wider">
               <span className="text-red-500">А</span>
               <span className="text-yellow-500">Г</span>
               <span className="text-green-500">А</span>
@@ -441,7 +540,7 @@ export function StartScreen({
               className={`py-2 rounded-lg font-semibold transition-all ${playMode === 'duoFight' ? 'bg-blue-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'}`}
             >
               Дуо файт
-              <span className="block text-xs font-normal text-blue-100/90 mt-0.5">Бой: {statsFor('duoFight').players ?? '—'} / 4</span>
+              <span className="block text-xs font-normal text-blue-100/90 mt-0.5">Бой: {statsFor('duoFight').players ?? '—'} / 4 · Спеки: {statsFor('duoFight').spectators ?? '—'}</span>
             </button>
             <button
               type="button"
@@ -449,7 +548,7 @@ export function StartScreen({
               className={`py-2 rounded-lg font-semibold transition-all ${playMode === 'trioFight' ? 'bg-violet-600 text-white' : 'bg-white/10 text-gray-300 hover:bg-white/15'}`}
             >
               Трио файт
-              <span className="block text-xs font-normal text-violet-100/90 mt-0.5">Бой: {statsFor('trioFight').players ?? '—'} / 6</span>
+              <span className="block text-xs font-normal text-violet-100/90 mt-0.5">Бой: {statsFor('trioFight').players ?? '—'} / 6 · Спеки: {statsFor('trioFight').spectators ?? '—'}</span>
             </button>
           </div>
 
@@ -575,6 +674,16 @@ export function StartScreen({
                 На весь экран
               </button>
             </div>
+            {telegramChannelUrl.trim() && (
+              <a
+                href={telegramChannelUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-2 block w-full rounded-lg border border-sky-200/50 bg-gradient-to-r from-sky-500 to-blue-600 px-3 py-3 text-center text-sm font-bold text-white shadow-lg transition hover:from-sky-400 hover:to-blue-500"
+              >
+                ✈ Перейти в телеграм канал игры
+              </a>
+            )}
 
             {onAdminSettings && adminName && (
               <button
@@ -594,15 +703,15 @@ export function StartScreen({
           </form>
         </div>
 
-        {playMode !== 'classic' && (
-          <div className="bg-black/70 backdrop-blur-lg rounded-2xl p-5 w-56 shrink-0 border border-rose-500/30 pointer-events-auto flex flex-col">
-            <div className="text-rose-300 font-bold text-sm tracking-wide mb-1">ТОП {playMode === 'soloFight' ? 'СОЛО' : playMode === 'duoFight' ? 'ДУО' : 'ТРИО'} ФАЙТ</div>
-            <div className="text-slate-400 text-xs mb-3">Всего побед</div>
+        <div className="bg-black/70 backdrop-blur-lg rounded-2xl p-4 sm:p-5 w-full lg:w-56 shrink-0 border border-rose-500/30 pointer-events-auto flex flex-col">
+            <div className="text-rose-300 font-bold text-sm tracking-wide mb-1">ТОП {playMode === 'classic' ? 'КЛАССИКА' : playMode === 'soloFight' ? 'СОЛО' : playMode === 'duoFight' ? 'ДУО' : 'ТРИО'} </div>
+            <div className="text-slate-400 text-xs mb-1">{playMode === 'classic' ? 'Лучший рекорд массы' : 'Всего побед'}</div>
+            <div className="text-amber-200 text-[10px] mb-3">Сброс и награда {weeklyTopPrizes?.[playMode] ?? 60} агарвиков: {formatUntilReset(weeklyTopEndsAt?.[playMode])}</div>
             <ul className="space-y-1 overflow-y-auto max-h-[420px] text-sm">
-              {soloFightTop.length === 0 ? (
+              {topFor(playMode).length === 0 ? (
                 <li className="text-slate-500 text-xs py-2">Пока нет результатов</li>
               ) : (
-                soloFightTop.map((entry, index) => (
+                topFor(playMode).map((entry, index) => (
                   <li
                     key={`${entry.name}-${index}`}
                     className="flex items-center justify-between gap-2 text-white px-2 py-1 rounded bg-white/5"
@@ -616,9 +725,44 @@ export function StartScreen({
                 ))
               )}
             </ul>
-          </div>
-        )}
+        </div>
       </div>
+      {showLevelRewards && (
+        <div className="absolute inset-0 z-[60] flex items-center justify-center bg-black/75 p-4 pointer-events-auto">
+          <div className="w-full max-w-xl rounded-2xl border border-amber-300/30 bg-slate-950 p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-bold text-white">Награды за уровни</h2>
+                <p className="mt-1 text-xs text-slate-300">Ближайшие 10 уровней: окно сдвигается после каждого нового уровня.</p>
+              </div>
+              <button type="button" onClick={() => setShowLevelRewards(false)} className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white">Закрыть</button>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {Array.from({ length: 10 }, (_, i) => questLevel + i + 1).map((level) => {
+                const claimed = claimedLevelRewards.includes(level);
+                const skins = levelSkinRewards[level] ?? [];
+                return (
+                  <div key={level} className={`min-h-24 rounded-xl border p-3 text-xs ${claimed ? 'border-emerald-400/40 bg-emerald-500/10' : 'border-white/15 bg-white/5'}`}>
+                    <div className="font-bold text-white">Уровень {level}</div>
+                    <div className="mt-2 text-amber-200">{levelReward(level)}</div>
+                    {skins.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {skins.map((skin) => (
+                          <div key={skin.id} className="flex items-center gap-1 text-[10px] text-slate-200">
+                            {skin.url && <img src={skin.url} alt="" className="h-6 w-6 rounded-full object-cover" />}
+                            <span className="max-w-20 truncate" title={skin.name}>{skin.name}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className={`mt-2 text-[10px] ${claimed ? 'text-emerald-300' : 'text-slate-400'}`}>{claimed ? 'Получено' : 'Впереди'}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -661,6 +805,40 @@ export function useLobbySnapshot(active: boolean): LobbyStatsByMode {
     };
   }, [active]);
   return stats;
+}
+
+/** Single menu observer for weekly rankings and server reset deadlines. */
+export function useModeTops(active: boolean): {
+  tops: Record<PlayRoomMode, ModeTopEntry[]>;
+  weeklyEndsAt: Partial<Record<PlayRoomMode, number>>;
+} {
+  const empty = (): Record<PlayRoomMode, ModeTopEntry[]> => ({
+    classic: [], soloFight: [], duoFight: [], trioFight: [],
+  });
+  const [tops, setTops] = useState(empty);
+  const [weeklyEndsAt, setWeeklyEndsAt] = useState<Partial<Record<PlayRoomMode, number>>>({});
+  useEffect(() => {
+    if (!active) return;
+    let socket: WebSocket | null = null;
+    try {
+      socket = new WebSocket(resolveServerUrl());
+      socket.onopen = () => socket?.send(JSON.stringify({ type: 'lobby', mode: 'classic' }));
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(String(event.data)) as {
+            type?: string;
+            tops?: Record<PlayRoomMode, ModeTopEntry[]>;
+            weeklyTopEndsAt?: Partial<Record<PlayRoomMode, number>>;
+          };
+          if (message.type !== 'lobbySnapshot') return;
+          if (message.tops) setTops({ ...empty(), ...message.tops });
+          if (message.weeklyTopEndsAt) setWeeklyEndsAt(message.weeklyTopEndsAt);
+        } catch { /* malformed frame */ }
+      };
+    } catch { /* unavailable server leaves empty rankings */ }
+    return () => socket?.close();
+  }, [active]);
+  return { tops, weeklyEndsAt };
 }
 
 function toLobbyStats(room: { players: number; lobby: number; blue?: number; red?: number; blueMembers?: string[]; redMembers?: string[] }): LobbyRoomStats {

@@ -9,16 +9,29 @@ interface HUDProps {
   onRespawn: () => void;
   onSpectate?: () => void;
   onBackToMenu?: () => void;
+  questTitle?: string;
+  questProgressText?: string;
+  showQuest?: boolean;
 }
 
-export function HUD({ player, fps, pingMs, onRespawn, onSpectate, onBackToMenu }: HUDProps) {
+export function HUD({
+  player,
+  fps,
+  pingMs,
+  onRespawn,
+  onSpectate,
+  onBackToMenu,
+  questTitle,
+  questProgressText,
+  showQuest = false,
+}: HUDProps) {
   const isDead = player && player.cells.length === 0;
   const mass = player ? getTotalMass(player) : 0;
 
   return (
     <>
       {player && !isDead && (
-        <div className="absolute top-4 left-4 z-30">
+        <div className="absolute top-4 left-4 z-30 flex items-start gap-3">
           <HudPanel id="status" title="Статус" className="bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2">
             <div className="text-white font-bold text-lg">
               Масса: <span className="text-green-400">{Math.floor(mass)}</span>
@@ -29,10 +42,16 @@ export function HUD({ player, fps, pingMs, onRespawn, onSpectate, onBackToMenu }
                 FPS: <span className="text-sky-300">{fps ?? '--'}</span>
               </span>
               <span>
-                Ping: <span className="text-amber-300">{pingMs ?? '--'}</span> ms
+                Ping: <span className="text-amber-300">{pingMs == null ? '--' : Math.round(pingMs)}</span> ms
               </span>
             </div>
           </HudPanel>
+          {showQuest && questTitle && (
+            <HudPanel id="quest" title="Задание" className="bg-black/70 backdrop-blur-sm rounded-lg px-4 py-2 max-w-[240px]">
+              <div className="text-white text-sm font-semibold leading-snug">{questTitle}</div>
+              <div className="text-sky-200 text-xs mt-1 leading-snug">{questProgressText}</div>
+            </HudPanel>
+          )}
         </div>
       )}
 

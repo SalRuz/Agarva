@@ -27,6 +27,26 @@ export function getSectorAt(x: number, y: number, worldW: number, worldH: number
   };
 }
 
+/**
+ * True when a point is in the viewer's sector or one of its bordering sectors.
+ * At map edges this naturally becomes a 2×3, 3×2, or 2×2 block.
+ */
+export function isInSectorNeighborhood(
+  x: number,
+  y: number,
+  centerX: number,
+  centerY: number,
+  worldW: number,
+  worldH: number
+): boolean {
+  const pointSector = getSectorAt(x, y, worldW, worldH);
+  const centerSector = getSectorAt(centerX, centerY, worldW, worldH);
+  return (
+    Math.abs(pointSector.row - centerSector.row) <= 1 &&
+    Math.abs(pointSector.col - centerSector.col) <= 1
+  );
+}
+
 export function getSectorLabel(row: number, col: number): string {
   const letter = SECTOR_ROW_LABELS[clampIndex(row, SECTOR_ROWS - 1)] ?? 'A';
   return `${letter}${clampIndex(col, SECTOR_COLS - 1) + 1}`;
@@ -38,20 +58,18 @@ export function getSectorLabelAt(x: number, y: number, worldW: number, worldH: n
 }
 
 /**
- * Entity draw/sync FOV: same reach as old "1 sector + 70% neighbors",
- * but as a circle that follows the player (not grid-locked).
- * Default mult 1.2 ≈ sectorSize × (0.5 + 0.7).
- * Sector contribution is capped so large maps (20k+) don't explode
- * bandwidth/CPU while keeping ~classic 15k FOV feel.
+ * Entity draw/sync FOV: a rounded 3.5×3.5 sector neighbourhood which follows
+ * the viewer continuously, rather than snapping when a sector boundary is
+ * crossed. A multiplier of 1.75 reaches 1.75 sector widths in each
+ * cardinal direction from the centre sector.
  */
 export function getEntityViewRadius(
   worldW: number,
   worldH: number,
-  mult: number = 1.2
+  mult: number = 1.75
 ): number {
   const { sw, sh } = getSectorSize(worldW, worldH);
-  const sector = Math.min(Math.max(sw, sh), 3200);
-  return sector * Math.max(0.05, mult);
+  return Math.max(sw, sh) * Math.max(0.05, mult);
 }
 
 export function isWithinViewRadius(

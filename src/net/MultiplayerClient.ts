@@ -5,6 +5,7 @@ import type {
   StateMessage,
   NetPlayer,
   ChatBroadcastMessage,
+  PrivateChatMessage,
   LeaderboardEntry,
 } from '../../shared/protocol';
 import { getFoodRadius, WORLD_WIDTH, WORLD_HEIGHT } from '../../shared/physics';
@@ -15,13 +16,20 @@ import { isAdminName } from '../../shared/physics';
 
 export type MultiplayerStatus = 'connecting' | 'connected' | 'disconnected' | 'error' | 'died';
 
+interface ConnectionOptions {
+  spectate?: boolean;
+  mode?: 'classic' | 'soloFight' | 'duoFight' | 'trioFight';
+  team?: 'blue' | 'red';
+}
+
 export interface MultiplayerCallbacks {
   onWelcome?: (id: string, world: { w: number; h: number }, isAdmin?: boolean) => void;
   onState?: (
     state: GameState,
     you: Player | undefined,
     leaderboard: LeaderboardEntry[],
-    ownedIds?: string[]
+    ownedIds?: string[],
+    centerLeader?: { name: string; skin?: string; score: number }
   ) => void;
   onDied?: () => void;
   onError?: (message: string) => void;
@@ -29,6 +37,7 @@ export interface MultiplayerCallbacks {
   onWorld?: (w: number, h: number) => void;
   onAdminStatus?: (ok: boolean) => void;
   onChat?: (msg: ChatBroadcastMessage) => void;
+  onPrivateChat?: (msg: PrivateChatMessage) => void;
   onSettings?: (settings: GameplayConfig, mode?: 'classic' | 'soloFight' | 'duoFight' | 'trioFight') => void;
   onSoloFightHud?: (hud: {
     phase: 'waiting' | 'countdown' | 'fighting' | 'between' | 'ended' | 'resetting';
@@ -49,7 +58,8 @@ export interface MultiplayerCallbacks {
     lastNick?: string;
     skinId?: string;
     prefs?: Record<string, unknown>;
-    accountLogin?: string;
+    accountLogin?: string | null;
+    quest?: import('../../shared/quests').QuestPublicView;
   }) => void;
   onRegisterAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
   onLoginAccountResult?: (ok: boolean, message: string, accountLogin?: string) => void;
@@ -273,6 +283,9 @@ export class MultiplayerClient {
   private worldH = WORLD_HEIGHT;
   private isAdmin = false;
   private lastPingMs: number | null = null;
+  /** Monotonic send times keyed by an opaque ping id echoed by the server. */
+  private pendingPings = new Map<number, number>();
+  private nextPingId = 1;
   /** Render one snapshot behind latest data; leaves enough history for smooth motion. */
   private interpDelayMs = 90;
   private config: GameplayConfig = defaultGameplayConfig;
@@ -294,6 +307,11 @@ export class MultiplayerClient {
   private foodSeenAt = new Map<string, number>();
   private virusSeenAt = new Map<string, number>();
   private ejectSeenAt = new Map<string, number>();
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+  private manuallyDisconnected = false;
+  private connectUrl = '';
+  private connectOptions: ConnectionOptions | undefined;
 
   constructor(name: string, callbacks: MultiplayerCallbacks = {}, password?: string, skin?: string) {
     this.name = name;
@@ -404,16 +422,28 @@ export class MultiplayerClient {
     return interpolateStates(this.snapPrev, this.snapCurr, alpha);
   }
 
-  connect(url: string, opts?: { spectate?: boolean; mode?: 'classic' | 'soloFight' | 'duoFight' | 'trioFight'; team?: 'blue' | 'red' }) {
+  connect(url: string, opts?: ConnectionOptions) {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.manuallyDisconnected = false;
+    this.connectUrl = url;
+    this.connectOptions = opts;
     this.spectateOnly = !!opts?.spectate;
     if (opts?.mode) this.roomMode = opts.mode;
     if (opts?.team) this.roomTeam = opts.team;
+    // Pongs from a prior socket must never be measured against this connection.
+    this.pendingPings.clear();
     this.skinCache.clear();
     this.lastLeaderboard = [];
     this.callbacks.onStatus?.('connecting');
-    this.ws = new WebSocket(url);
+    const ws = new WebSocket(url);
+    this.ws = ws;
 
-    this.ws.onopen = () => {
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      this.reconnectAttempts = 0;
       this.callbacks.onStatus?.('connected');
       this.send({ type: 'adminAuth', token: resolveAdminToken() });
       if (this.spectateOnly) {
@@ -423,7 +453,8 @@ export class MultiplayerClient {
       }
     };
 
-    this.ws.onmessage = (ev) => {
+    ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
       let msg: ServerMessage;
       try {
         msg = JSON.parse(String(ev.data)) as ServerMessage;
@@ -433,25 +464,42 @@ export class MultiplayerClient {
       this.handleMessage(msg);
     };
 
-    this.ws.onclose = () => {
+    ws.onclose = () => {
+      if (this.ws !== ws) return;
       this.callbacks.onStatus?.('disconnected');
+      this.ws = null;
+      this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
+    ws.onerror = () => {
+      if (this.ws !== ws) return;
       this.callbacks.onError?.('Ошибка WebSocket соединения');
       this.callbacks.onStatus?.('error');
     };
   }
 
+  private scheduleReconnect() {
+    if (this.manuallyDisconnected || !this.connectUrl || this.reconnectTimer) return;
+    const delay = Math.min(8_000, 500 * 2 ** this.reconnectAttempts++);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.manuallyDisconnected) this.connect(this.connectUrl, this.connectOptions);
+    }, delay);
+  }
+
   private buildStateFromMsg(msg: StateMessage): { state: GameState; you: Player | undefined } {
     const foodR = getFoodRadius(this.config);
-    const food: Food[] = msg.food.map((f) => ({
+    // Low-traffic snapshots intentionally omit food between full snapshots.
+    // Keep the previous complete view instead of treating omission as removal.
+    const food: Food[] = msg.food
+      ? msg.food.map((f) => ({
       id: f.id,
       x: f.x,
       y: f.y,
       radius: foodR,
       color: f.c,
-    }));
+        }))
+      : this.snapCurr?.state.food ?? [];
     const viruses: Virus[] = msg.viruses.map((v) => ({
       id: v.id,
       x: v.x,
@@ -554,7 +602,9 @@ export class MultiplayerClient {
     // The server distinguishes a capped/FOV omission from destruction. Only
     // omitted live entities get a grace period; consumed/despawned ones vanish
     // in this snapshot without waiting for the anti-flicker timeout.
-    state.food = this.retainBriefly(state.food, previous.food, this.foodSeenAt, now, msg.removedFoodIds);
+    if (msg.food) {
+      state.food = this.retainBriefly(state.food, previous.food, this.foodSeenAt, now, msg.removedFoodIds);
+    }
     state.viruses = this.retainBriefly(state.viruses, previous.viruses, this.virusSeenAt, now, msg.removedVirusIds);
     state.ejectedMass = this.retainBriefly(
       state.ejectedMass,
@@ -599,6 +649,9 @@ export class MultiplayerClient {
       case 'chat':
         this.callbacks.onChat?.(msg);
         break;
+      case 'privateChat':
+        this.callbacks.onPrivateChat?.(msg);
+        break;
       case 'settings':
         this.config = sanitizeGameplayConfig(msg.settings);
         this.callbacks.onSettings?.(msg.settings, msg.mode);
@@ -619,7 +672,7 @@ export class MultiplayerClient {
         this.callbacks.onTeamFightTop?.(msg.mode, msg.entries);
         break;
       case 'playerProfile':
-        this.callbacks.onPlayerProfile?.(msg);
+        this.callbacks.onPlayerProfile?.(msg as typeof msg & { quest?: import('../../shared/quests').QuestPublicView });
         if (msg.deviceId) {
           this.deviceId = msg.deviceId;
           try {
@@ -692,7 +745,7 @@ export class MultiplayerClient {
           ownedIds: msg.ownedIds ?? (you ? [you.id] : []),
         };
         this.ownedIds = this.snapCurr.ownedIds;
-        this.callbacks.onState?.(state, you, this.lastLeaderboard, this.ownedIds);
+        this.callbacks.onState?.(state, you, this.lastLeaderboard, this.ownedIds, msg.centerLeader);
         break;
       }
       case 'died':
@@ -703,7 +756,14 @@ export class MultiplayerClient {
         this.callbacks.onError?.(msg.message);
         break;
       case 'pong':
-        this.lastPingMs = Math.max(0, Date.now() - msg.t);
+        {
+          const sentAt = this.pendingPings.get(msg.t);
+          if (sentAt === undefined) break;
+          this.pendingPings.delete(msg.t);
+          // Date.now() can jump forward/backward when the OS synchronizes its
+          // clock. RTT must use the browser's monotonic clock instead.
+          this.lastPingMs = Math.max(0, performance.now() - sentAt);
+        }
         break;
     }
   }
@@ -714,15 +774,21 @@ export class MultiplayerClient {
     }
   }
 
+  isConnected() {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
   sendInput(mx: number, my: number) {
     if (!Number.isFinite(mx) || !Number.isFinite(my)) return;
     const now = performance.now();
-    if (now - this.lastInputSentAt < MultiplayerClient.INPUT_MIN_INTERVAL_MS) return;
+    const minInterval = MultiplayerClient.INPUT_MIN_INTERVAL_MS;
+    const minDelta = MultiplayerClient.INPUT_MIN_DELTA;
+    if (now - this.lastInputSentAt < minInterval) return;
     const dx = mx - this.lastInputMx;
     const dy = my - this.lastInputMy;
     if (
       Number.isFinite(this.lastInputMx) &&
-      dx * dx + dy * dy < MultiplayerClient.INPUT_MIN_DELTA ** 2
+      dx * dx + dy * dy < minDelta ** 2
     ) {
       return;
     }
@@ -750,6 +816,7 @@ export class MultiplayerClient {
 
   enterSpectate() {
     this.spectateOnly = true;
+    this.connectOptions = { ...this.connectOptions, spectate: true, mode: this.roomMode };
     this.send({ type: 'spectate', mode: this.roomMode });
   }
 
@@ -757,6 +824,7 @@ export class MultiplayerClient {
     this.roomMode = mode;
     this.roomTeam = team;
     this.spectateOnly = false;
+    this.connectOptions = { ...this.connectOptions, spectate: false, mode, team };
     // One socket lets the server vacate the old room before assigning the new
     // one, so team slots and lobby snapshots never overlap during a switch.
     this.send(this.joinPayload());
@@ -788,8 +856,16 @@ export class MultiplayerClient {
     this.send({ type: 'chat', text });
   }
 
+  sendPrivateMessage(to: string, text: string) {
+    this.send({ type: 'privateMessage', to, text });
+  }
+
   adminAddMass(amount?: number) {
     this.send({ type: 'adminAddMass', amount });
+  }
+
+  adminSkipQuest() {
+    this.send({ type: 'adminSkipQuest' });
   }
 
   adminIdentify(name: string, password?: string) {
@@ -853,6 +929,10 @@ export class MultiplayerClient {
     this.send({ type: 'adminGetBotLogs' });
   }
 
+  adminRestartClassic() {
+    this.send({ type: 'adminRestartClassic' });
+  }
+
   registerAccount(login: string, password: string) {
     this.send({
       type: 'registerAccount',
@@ -892,15 +972,25 @@ export class MultiplayerClient {
   }
 
   ping() {
-    this.send({ type: 'ping', t: Date.now() });
+    const id = this.nextPingId++;
+    // Keep this bounded if a connection is stalled and cannot return pongs.
+    if (this.pendingPings.size >= 8) this.pendingPings.clear();
+    this.pendingPings.set(id, performance.now());
+    this.send({ type: 'ping', t: id });
   }
 
   disconnect() {
+    this.manuallyDisconnected = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
     this.clearSnapshotState();
+    this.pendingPings.clear();
     this.playerId = null;
     this.isAdmin = false;
     this.spectateOnly = false;

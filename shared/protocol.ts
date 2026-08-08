@@ -62,6 +62,10 @@ export interface AdminAddMassMessage {
   amount?: number;
 }
 
+export interface AdminSkipQuestMessage {
+  type: 'adminSkipQuest';
+}
+
 export interface AdminIdentifyMessage {
   type: 'adminIdentify';
   name: string;
@@ -133,6 +137,12 @@ export interface ChatSendMessage {
   text: string;
 }
 
+export interface PrivateMessage {
+  type: 'privateMessage';
+  to: string;
+  text: string;
+}
+
 export interface LobbyMessage {
   type: 'lobby';
   mode?: RoomMode;
@@ -194,6 +204,10 @@ export interface AdminGetBotLogsMessage {
   type: 'adminGetBotLogs';
 }
 
+export interface AdminRestartClassicMessage {
+  type: 'adminRestartClassic';
+}
+
 export type ClientMessage =
   | JoinMessage
   | InputMessage
@@ -205,6 +219,7 @@ export type ClientMessage =
   | AdminAuthMessage
   | AdminIdentifyMessage
   | AdminAddMassMessage
+  | AdminSkipQuestMessage
   | AdminGetSettingsMessage
   | AdminUpdateSettingsMessage
   | AdminSpawnVirusMessage
@@ -217,6 +232,7 @@ export type ClientMessage =
   | MultiboxSpawnMessage
   | MultiboxSwitchMessage
   | ChatSendMessage
+  | PrivateMessage
   | LobbyMessage
   | SyncProfileMessage
   | RegisterAccountMessage
@@ -226,7 +242,8 @@ export type ClientMessage =
   | AdminDownloadDbMessage
   | AdminUploadDbMessage
   | AdminWipeDatabaseMessage
-  | AdminGetBotLogsMessage;
+  | AdminGetBotLogsMessage
+  | AdminRestartClassicMessage;
 
 export interface WelcomeMessage {
   type: 'welcome';
@@ -282,6 +299,10 @@ export interface LeaderboardEntry {
   name: string;
   score: number;
   isBot: boolean;
+  /** Account level for badge (humans only). */
+  level?: number;
+  /** The player chose not to expose their level. */
+  hideLevel?: boolean;
 }
 
 export interface StateMessage {
@@ -289,17 +310,28 @@ export interface StateMessage {
   t: number;
   you: NetPlayer | null;
   players: NetPlayer[];
-  food: NetFood[];
+  /**
+   * Omitted on intermediate low-traffic snapshots. The client keeps its last
+   * full food view until the next food snapshot.
+   */
+  food?: NetFood[];
   viruses: NetVirus[];
   ejected: NetEjected[];
   /** Entity ids that existed in an earlier snapshot but were destroyed server-side. */
   removedFoodIds?: string[];
   removedVirusIds?: string[];
   removedEjectedIds?: string[];
+  /**
+   * When 1, `food` contains only newly visible pellets; client merges into its
+   * food cache. Removals use removedFoodIds (destroyed or left FOV).
+   */
+  foodDelta?: 1;
   /** Omitted on some ticks — client should keep last leaderboard */
   leaderboard?: LeaderboardEntry[];
   /** All player ids owned by this session (multibox); active is `you` */
   ownedIds?: string[];
+  /** Weekly-mode leader used by the map-center emblem. */
+  centerLeader?: { name: string; skin?: string; score: number };
 }
 
 export interface DiedMessage {
@@ -333,8 +365,20 @@ export interface ChatBroadcastMessage {
   text: string;
   t: number;
   color?: string;
+  level?: number;
+  hideLevel?: boolean;
   /** Message was injected from the linked Telegram bot. */
   fromTg?: boolean;
+}
+
+export interface PrivateChatMessage {
+  type: 'privateChat';
+  name: string;
+  text: string;
+  t: number;
+  color?: string;
+  level?: number;
+  hideLevel?: boolean;
 }
 
 export interface SettingsMessage {
@@ -363,6 +407,10 @@ export interface RoomInfoMessage {
 export interface LobbySnapshotMessage {
   type: 'lobbySnapshot';
   rooms: Record<RoomMode, Omit<RoomInfoMessage, 'type' | 'mode'>>;
+  /** Current weekly rankings shown in the menu for every mode. */
+  tops?: Record<RoomMode, { name: string; score: number }[]>;
+  /** Server-authoritative weekly reset deadlines (Unix milliseconds). */
+  weeklyTopEndsAt?: Record<RoomMode, number>;
 }
 
 export interface SoloFightHudMessage {
@@ -406,7 +454,27 @@ export interface PlayerProfileMessage {
   lastNick?: string;
   skinId?: string;
   prefs?: Record<string, unknown>;
-  accountLogin?: string;
+  accountLogin?: string | null;
+  quest?: {
+    level: number;
+    xp: number;
+    xpIntoLevel: number;
+    xpPerLevel: number;
+    agarviki: number;
+    taskId: string;
+    title: string;
+    progress: number;
+    requirement: number;
+    unit: 'mass' | 'minutes' | 'count';
+    remainingMs?: number;
+    condition: string;
+    timeRunning?: boolean;
+    hint?: string;
+    followerOnly?: boolean;
+    claimedLevelRewards: number[];
+    unlockedSkinIds: string[];
+    pendingLevelRewards?: number[];
+  };
 }
 
 export interface RegisterAccountResultMessage {
@@ -456,6 +524,7 @@ export type ServerMessage =
   | AdminStatusMessage
   | SettingsMessage
   | ChatBroadcastMessage
+  | PrivateChatMessage
   | RoomInfoMessage
   | LobbySnapshotMessage
   | SoloFightHudMessage
