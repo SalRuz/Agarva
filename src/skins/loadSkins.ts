@@ -112,6 +112,11 @@ export async function uploadCustomSkin(
   }
   if (!response.ok) {
     const detail = body.error || raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (response.status === 405) {
+      throw new Error(
+        'Сервер отклонил загрузку (HTTP 405). Проверьте nginx: location /api/ должен проксировать POST /api/skins в игровой Node-сервер.'
+      );
+    }
     throw new Error(detail || `Не удалось загрузить скин (HTTP ${response.status})`);
   }
 }

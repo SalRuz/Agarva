@@ -178,6 +178,8 @@ export function GameCanvas({
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const pinchDistanceRef = useRef<number | null>(null);
   const joystickRef = useRef<{ dx: number; dy: number; active: boolean }>({ dx: 0, dy: 0, active: false });
+  /** Joystick writes a target; the visible/game cursor follows it smoothly. */
+  const joystickTargetScreenRef = useRef({ x: 0, y: 0, valid: false });
   const [joystick, setJoystick] = useState({ dx: 0, dy: 0, active: false });
   const [touchControls] = useState(
     () => typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)
@@ -858,16 +860,12 @@ export function GameCanvas({
       // The touch stick moves the same screen cursor as a mouse. The server
       // receives the resulting world coordinate, without any mobile physics.
       if (joystickRef.current.active && currentPlayer?.cells.length) {
-        const center = getPlayerCenter(currentPlayer);
         const ax = mouseWorldRef.current.x;
         const ay = mouseWorldRef.current.y;
         ctx.save();
         ctx.strokeStyle = 'rgba(255,255,255,0.9)';
         ctx.fillStyle = 'rgba(56,189,248,0.35)';
         ctx.lineWidth = 3;
-        ctx.setLineDash([8, 8]);
-        ctx.beginPath(); ctx.moveTo(center.x, center.y); ctx.lineTo(ax, ay); ctx.stroke();
-        ctx.setLineDash([]);
         ctx.beginPath(); ctx.arc(ax, ay, 16 / Math.max(cameraRef.current.scale, 0.001), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
         ctx.restore();
       }
@@ -893,6 +891,13 @@ export function GameCanvas({
       ) {
         const canvas = canvasRef.current;
         if (canvas) {
+          if (joystickRef.current.active && joystickTargetScreenRef.current.valid) {
+            const cursor = mouseScreenRef.current;
+            const target = joystickTargetScreenRef.current;
+            // Keep full-screen stick range, but avoid an abrupt direction snap.
+            cursor.x += (target.x - cursor.x) * 0.16;
+            cursor.y += (target.y - cursor.y) * 0.16;
+          }
           const cam = cameraRef.current;
           const sx = mouseScreenRef.current.x;
           const sy = mouseScreenRef.current.y;
@@ -1282,7 +1287,17 @@ export function GameCanvas({
             className="absolute rounded-full border-2 border-white/35 bg-black/35 shadow-lg pointer-events-auto touch-none"
             aria-label="Сенсорный джойстик"
             style={{ width: prefs.mobileControls.joystick.size, height: prefs.mobileControls.joystick.size, left: `${prefs.mobileControls.joystick.x}%`, top: `${prefs.mobileControls.joystick.y}%`, transform: 'translate(-50%, -50%)' }}
-            onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); joystickRef.current.active = true; setJoystick({ ...joystickRef.current }); }}
+            onPointerDown={(e) => {
+              e.currentTarget.setPointerCapture(e.pointerId);
+              joystickRef.current.active = true;
+              const canvas = canvasRef.current;
+              if (canvas) {
+                const center = { x: canvas.width / 2, y: canvas.height / 2, valid: true };
+                mouseScreenRef.current = center;
+                joystickTargetScreenRef.current = center;
+              }
+              setJoystick({ ...joystickRef.current });
+            }}
             onPointerMove={(e) => {
               if (!joystickRef.current.active) return;
               const rect = e.currentTarget.getBoundingClientRect(), max = rect.width * .36;
@@ -1291,13 +1306,12 @@ export function GameCanvas({
               joystickRef.current = { dx, dy, active: true }; setJoystick({ dx, dy, active: true });
               const canvas = canvasRef.current;
               if (!canvas) return;
-              const length = Math.hypot(dx, dy);
               const range = Math.max(1, rect.width * .36);
               // Cursor spans the full canvas (not a small circle around center).
-              mouseScreenRef.current = {
+              joystickTargetScreenRef.current = {
                 x: canvas.width / 2 + (dx / range) * (canvas.width * 0.48),
                 y: canvas.height / 2 + (dy / range) * (canvas.height * 0.48),
-                valid: length > 2,
+                valid: true,
               };
             }}
             onPointerUp={() => { joystickRef.current = { dx: 0, dy: 0, active: false }; setJoystick(joystickRef.current); }}

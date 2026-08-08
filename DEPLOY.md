@@ -149,7 +149,16 @@ sudo certbot --nginx -d YOUR_DOMAIN
 
 Certbot спросит email и согласие с ToS — это ручной шаг. После успеха откройте сайт по **https://**.
 
-Убедитесь, что в HTTPS-сервере есть блок `location /ws` (certbot обычно копирует locations; если пропал — скопируйте из `deploy/nginx.conf`).
+Убедитесь, что в HTTPS-сервере есть блоки `location /ws` и `location /api/`
+(certbot обычно копирует locations; если пропали — скопируйте из `deploy/nginx.conf`).
+`/api/` обязателен для загрузки и удаления скинов: он проксирует `POST`/`DELETE`
+`/api/skins` в Node, а не отдаёт запрос статическому `index.html`. После изменения:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+curl -i http://127.0.0.1:3001/api/skins
+curl -i https://YOUR_DOMAIN/api/skins
+```
 
 ---
 

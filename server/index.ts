@@ -85,6 +85,8 @@ const STATE_BACKPRESSURE_BYTES = 32_000;
 const BOT_CHAT_BUFFER_SIZE = 200;
 const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000;
 const QUEST_PROFILE_PUSH_MS = 10_000;
+/** A dropped socket may reclaim all of its cells during this window. */
+const RECONNECT_GRACE_MS = 5 * 60 * 1000;
 
 interface ClientSession {
   ws: WebSocket;
@@ -136,6 +138,10 @@ interface ClientSession {
   questTimerRunning: boolean;
   /** Account key for which this websocket is the quest-progress primary tab. */
   questAccountKey: string | null;
+  /** Set after an unexpected socket close while its player entities remain alive. */
+  disconnectAt: number | null;
+  reconnectGraceUntil: number | null;
+  cleanupHandled: boolean;
 }
 
 interface BotChatLine {
@@ -290,6 +296,8 @@ function startServer(attempt = 0) {
   > = { duoFight: [], trioFight: [] };
 
   const clients = new Map<WebSocket, ClientSession>();
+  /** Closed sessions retained temporarily so a matching device can reclaim its cells. */
+  const orphanedSessions = new Map<string, ClientSession>();
   /** First connected websocket per account is allowed to advance quests. */
   const questPrimaryByAccount = new Map<string, WebSocket>();
   const botChatLines: Record<RoomMode, BotChatLine[]> = {
@@ -311,6 +319,13 @@ function startServer(attempt = 0) {
     for (const mode of ['duoFight', 'trioFight'] as TeamFightMode[]) {
       pendingTeamFightJoins[mode] = pendingTeamFightJoins[mode].filter((entry) => entry.session !== session);
     }
+  }
+
+  function isSessionActiveOrRecoverable(session: ClientSession): boolean {
+    return (
+      session.ws.readyState === WebSocket.OPEN ||
+      (session.reconnectGraceUntil !== null && session.reconnectGraceUntil > Date.now())
+    );
   }
 
   function engineFor(room: RoomMode): GameEngine {
@@ -1383,7 +1398,7 @@ function startServer(attempt = 0) {
   }
 
   function syncSfMetaFromDuelists() {
-    sfDuelists = sfDuelists.filter((s) => s.ws.readyState === WebSocket.OPEN);
+    sfDuelists = sfDuelists.filter(isSessionActiveOrRecoverable);
     sfState.names = sfDuelists.map((s) => s.lastName);
     sfState.fighterPlayerIds = sfDuelists.flatMap((s) => s.playerIds);
   }
@@ -1602,7 +1617,7 @@ function startServer(attempt = 0) {
           !s.lobbyOnly &&
           !s.spectating &&
           s.team === team &&
-          s.ws.readyState === WebSocket.OPEN
+          isSessionActiveOrRecoverable(s)
       )
       .map((s) => ({
         name: s.lastName,
@@ -1723,7 +1738,7 @@ function startServer(attempt = 0) {
 
   function joinTeamFight(session: ClientSession, mode: TeamFightMode, name: string, skin: string, team?: FightTeam) {
     let state = teamStates[mode];
-    let fighters = teamFighters[mode].filter((s) => s.ws.readyState === WebSocket.OPEN);
+    let fighters = teamFighters[mode].filter(isSessionActiveOrRecoverable);
     teamFighters[mode] = fighters;
     const size = teamSizeFor(mode);
     if (!team || (team !== 'blue' && team !== 'red')) {
@@ -1877,6 +1892,85 @@ function startServer(attempt = 0) {
     });
   }
 
+  function replaceFightSessionReferences(previous: ClientSession, next: ClientSession) {
+    sfDuelists = sfDuelists.map((fighter) => fighter === previous ? next : fighter);
+    for (const mode of ['duoFight', 'trioFight'] as TeamFightMode[]) {
+      teamFighters[mode] = teamFighters[mode].map((fighter) => fighter === previous ? next : fighter);
+    }
+  }
+
+  /** Move a still-live orphaned body from its closed socket to this socket. */
+  function reclaimOrphanedSession(session: ClientSession, requestedMode: RoomMode): boolean {
+    if (!session.deviceId) return false;
+    const orphan = orphanedSessions.get(session.deviceId);
+    if (
+      !orphan ||
+      orphan.reconnectGraceUntil === null ||
+      orphan.reconnectGraceUntil < Date.now() ||
+      orphan.room !== requestedMode ||
+      orphan.playerIds.length === 0
+    ) {
+      return false;
+    }
+
+    orphanedSessions.delete(session.deviceId);
+    clients.delete(orphan.ws);
+    replaceFightSessionReferences(orphan, session);
+
+    session.playerIds = [...orphan.playerIds];
+    session.activeIndex = Math.min(orphan.activeIndex, Math.max(0, session.playerIds.length - 1));
+    session.joined = orphan.joined;
+    session.lobbyOnly = false;
+    session.spectating = false;
+    session.room = orphan.room;
+    session.team = orphan.team;
+    session.spawnSlot = orphan.spawnSlot;
+    session.viewX = orphan.viewX;
+    session.viewY = orphan.viewY;
+    session.lastColor = orphan.lastColor;
+    session.lastSkin = orphan.lastSkin || session.lastSkin;
+    session.joinAnnouncedRoom = orphan.joinAnnouncedRoom;
+    session.questRun = orphan.questRun;
+    session.questProgress = orphan.questProgress;
+    session.disconnectAt = null;
+    session.reconnectGraceUntil = null;
+    refreshAdmin(session);
+
+    const gameEngine = engineFor(session.room);
+    sendWelcome(session, activePlayerId(session) ?? session.playerIds[0], gameEngine, session.isAdmin);
+    send(session.ws, { type: 'settings', settings: configFor(session.room), mode: session.room });
+    send(session.ws, buildStateFor(session, buildLeaderboardFor(gameEngine)));
+    if (session.room === 'soloFight') {
+      syncSfMetaFromDuelists();
+      send(session.ws, makeSoloFightHud(sfState));
+      send(session.ws, makeSoloFightTop(sfState));
+    } else if (isTeamFight(session.room)) {
+      broadcastTeamMeta(session.room);
+    }
+    broadcastRoomInfo();
+    return true;
+  }
+
+  /** Remove bodies whose owner did not reconnect before the grace deadline. */
+  function expireOrphanedSessions(now: number) {
+    for (const [deviceId, session] of orphanedSessions) {
+      if (session.reconnectGraceUntil === null || now < session.reconnectGraceUntil) continue;
+      orphanedSessions.delete(deviceId);
+      clients.delete(session.ws);
+      if (session.room === 'soloFight' && sfDuelists.includes(session)) {
+        handleSoloFightLeave(session);
+        clearSessionPlayers(session, soloFightEngine);
+      } else if (isTeamFight(session.room) && teamFighters[session.room].includes(session)) {
+        leaveTeamFight(session, session.room);
+      } else {
+        clearSessionPlayers(session, engineFor(session.room));
+      }
+      session.joined = false;
+      session.disconnectAt = null;
+      session.reconnectGraceUntil = null;
+    }
+  }
+
   function spectateSoloFight(session: ClientSession, reason?: string) {
     session.room = 'soloFight';
     session.lobbyOnly = false;
@@ -1915,23 +2009,23 @@ function startServer(attempt = 0) {
     if (!nick) return false;
     if (mode === 'soloFight') {
       for (const s of sfDuelists) {
-        if (s === except || s.ws.readyState !== WebSocket.OPEN || !s.joined) continue;
+        if (s === except || !isSessionActiveOrRecoverable(s) || !s.joined) continue;
         if (normalizeNick(s.lastName) === nick) return true;
       }
       for (const entry of pendingSoloFightJoins) {
         if (entry.session === except) continue;
-        if (entry.session.ws.readyState !== WebSocket.OPEN) continue;
+        if (!isSessionActiveOrRecoverable(entry.session)) continue;
         if (normalizeNick(entry.name) === nick) return true;
       }
       return false;
     }
     for (const s of teamFighters[mode]) {
-      if (s === except || s.ws.readyState !== WebSocket.OPEN || !s.joined) continue;
+      if (s === except || !isSessionActiveOrRecoverable(s) || !s.joined) continue;
       if (normalizeNick(s.lastName) === nick) return true;
     }
     for (const entry of pendingTeamFightJoins[mode]) {
       if (entry.session === except) continue;
-      if (entry.session.ws.readyState !== WebSocket.OPEN) continue;
+      if (!isSessionActiveOrRecoverable(entry.session)) continue;
       if (normalizeNick(entry.name) === nick) return true;
     }
     return false;
@@ -1959,7 +2053,7 @@ function startServer(attempt = 0) {
   }
 
   function joinSoloFight(session: ClientSession, name: string, skin: string) {
-    const openDuelists = sfDuelists.filter((s) => s.ws.readyState === WebSocket.OPEN);
+    const openDuelists = sfDuelists.filter(isSessionActiveOrRecoverable);
     sfDuelists = openDuelists;
 
     // Rematch during post-win timer: clear arena immediately and join as waiting.
@@ -2077,6 +2171,7 @@ function startServer(attempt = 0) {
     let roomInfoAcc = 0;
     tickTimer = setInterval(() => {
       if (!listening) return;
+      expireOrphanedSessions(Date.now());
       // The two rooms have independent engines. Updating the 20-bot, 5400-food
       // classic world during a Solo Fight wastes a full simulation tick per frame.
       let hasClassicSession = false;
@@ -2468,6 +2563,9 @@ function startServer(attempt = 0) {
       lastQuestPushAt: 0,
       questTimerRunning: false,
       questAccountKey: null,
+      disconnectAt: null,
+      reconnectGraceUntil: null,
+      cleanupHandled: false,
     };
     clients.set(ws, session);
 
@@ -2643,6 +2741,10 @@ function startServer(attempt = 0) {
             });
             session.questRun = emptyQuestRunStats();
             session.questProgress = sanitizeQuestProgress(profile.quests);
+          }
+
+          if (reclaimOrphanedSession(session, mode)) {
+            break;
           }
 
           if (mode === 'soloFight') {
@@ -3220,7 +3322,24 @@ function startServer(attempt = 0) {
     });
 
     const cleanup = () => {
+      if (session.cleanupHandled) return;
+      session.cleanupHandled = true;
       removePendingFightJoin(session);
+      // A real player body is deliberately retained for a short reconnect
+      // window. The closed session stays in `clients` so room/physics/account
+      // bookkeeping can still find ownership; it is never sent packets.
+      if (session.joined && session.playerIds.length > 0 && session.deviceId) {
+        const previous = orphanedSessions.get(session.deviceId);
+        if (previous && previous !== session) {
+          clearSessionPlayers(previous, engineFor(previous.room));
+          clients.delete(previous.ws);
+        }
+        session.disconnectAt = Date.now();
+        session.reconnectGraceUntil = session.disconnectAt + RECONNECT_GRACE_MS;
+        orphanedSessions.set(session.deviceId, session);
+        broadcastRoomInfo();
+        return;
+      }
       if (session.room === 'soloFight' && sfDuelists.includes(session)) {
         handleSoloFightLeave(session);
         clearSessionPlayers(session, soloFightEngine);
@@ -3230,6 +3349,9 @@ function startServer(attempt = 0) {
         clearSessionPlayers(session, engineFor(session.room));
       }
       clients.delete(ws);
+      if (session.deviceId && orphanedSessions.get(session.deviceId) === session) {
+        orphanedSessions.delete(session.deviceId);
+      }
       if (session.questAccountKey && questPrimaryByAccount.get(session.questAccountKey) === ws) {
         const replacement = [...clients.values()].find(
           (candidate) =>
